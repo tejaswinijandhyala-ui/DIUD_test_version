@@ -1741,302 +1741,389 @@ class ChatRequest(BaseModel):
 
 _CLICKHOUSE_SCHEMA = """
 =================================================================
-CLICKHOUSE TOOL — FULL ACCESS PIPELINE DATABASE
+CLICKHOUSE DIRECT ACCESS — RAW TABLES
 =================================================================
 
 You have access to a tool called query_clickhouse.
 Use it when the pre-built PIPELINE DATA block cannot answer the question.
 
-HOW TO QUERY:
-  The pipe_gen CTE is already defined — always write:
-    SELECT ... FROM pipe_gen WHERE ...
+Query the RAW tables directly. No CTEs, no pipe_gen.
 
 =================================================================
-AVAILABLE COLUMNS IN pipe_gen
+TABLES
 =================================================================
 
-── IDENTIFIERS ──────────────────────────────────────────────────
-  deal_id               INT      — unique deal identifier
-  deal_name             STRING   — name of the deal
-  deal_owner_name       STRING   — full name of AE/deal owner
-  deal_url              STRING   — HubSpot deal URL
-  Team                  STRING   — team name
-  job_title             STRING   — contact job title
+── TABLE 1: hs_analytics.deals ──────────────────────────────────
+Primary table. One row per deal.
+Always use FINAL keyword: FROM hs_analytics.deals FINAL
 
-── DATES ─────────────────────────────────────────────────────────
-  create_date           DATE     — deal creation date
-  close_date            DATE     — expected or actual close date
-  became_5_deal_date    DATE     — date entered 5% IQM Held
-  became_10_deal_date   DATE     — date entered 10% Discovery
-  became_20_deal_date   DATE     — date entered 20% Solution
-  became_30_deal_date   DATE     — date entered 30% Proof
-  became_40_deal_date   DATE     — date entered 40% Proposal
-  became_60_deal_date   DATE     — date entered 60% Price Negotiation
-  became_75_deal_date   DATE     — date entered 75% Contract Review
-  last_contacted        DATE     — last contact date
+KEY COLUMNS:
+  deal_id                    STRING  — unique deal identifier
+  deal_name                  STRING  — name of the deal
+  deal_owner                 STRING  — owner ID (join to hs_analytics.owners on o.id)
+  deal_stage                 STRING  — current stage (see STAGE LIST below)
+  deal_type                  STRING  — deal type (NULL = 'Not Assigned')
+  pipeline                   STRING  — always filter: pipeline = 'default'
+  amount                     FLOAT   — deal value in USD
+  region                     STRING  — raw values (see REGION MAP below)
+  deal_source_rollup         STRING  — raw source (see SOURCE MAP below)
+  20_snapshot_deal_source_rollup STRING — source at time of 20% qualification
+  ai_for_x                   STRING  — AI use case category
+  kore_primary_industry      STRING  — raw industry (see INDUSTRY MAP below)
+  account_priority_level     STRING  — 'P1','P2'...'P10' (raw, not grouped)
+  hubspot_team               STRING  — team ID (join to kore_ai_hubspot.gs_Teams)
 
-  IMPORTANT: All date columns use '1900-01-01' as null sentinel.
-  Always filter with: date_col <> '1900-01-01'
+  -- DATE COLUMNS (stored as strings, cast to DATE)
+  create_date                STRING  — deal creation date
+  close_date                 STRING  — expected/actual close date
+  became_5_deal_date         STRING  — entered 5% IQM Held
+  became_10_deal_date        STRING  — entered 10% Discovery
+  became_20_deal_date        STRING  — entered 20% Solution
+  became_30_deal_date        STRING  — entered 30% Proof
+  became_40_deal_date        STRING  — entered 40% Proposal
+  became_60_deal_date        STRING  — entered 60% Price Negotiation
+  became_75_deal_date        STRING  — entered 75% Contract Review
+  last_contacted             STRING  — last contact date
 
-── DEAL INFO ─────────────────────────────────────────────────────
-  deal_stage            STRING   — current deal stage (see STAGE LIST)
-  deal_type             STRING   — deal type ('Not Assigned' when null)
-  amount                FLOAT    — deal value in USD
+  -- QUALIFICATION
+  is_there_a_confirmation_of_budget  STRING  — 'Yes'/'No'
+  who_is_the_decision_maker          STRING  — decision maker name
+  use_case                           STRING  — use case description
+  what_is_the_estimated_timeline     STRING  — timeline string
+  is_this_a_deal_with_inception      STRING  — 'Yes'/'No'
 
-── CLASSIFICATION ────────────────────────────────────────────────
-  region                STRING   — 'North America','APAC','EMEA','ISEA',
-                                   'JAPAC','Middle East','India'
+  -- WON/LOST
+  primary_closed_won_reason_         STRING  — win reason
+  primary_closed_lost_reason         STRING  — loss reason
+  won_loss_notes                     STRING  — freeform notes
+  competitors                        STRING  — competitor names
+  competition                        STRING  — competition notes
 
-  deal_source_rollup    STRING   — 'BDR','Marketing','Customer Success',
-                                   'Executive Outreach','AE Outbound',
-                                   'Inception','Hyperscaler',
-                                   'Partner - Non Hyperscaler','Other'
-
-  20_snapshot_deal_source_rollup  STRING — source at time of 20% qualification
-
-  ai_for_x              STRING   — AI use case ('N/A' when null)
-                                   e.g. 'AI for Work','AI for CX','AI for IT'
-
-  kore_primary_industry STRING   — 'Financial Services','Manufacturing','TMT',
-                                   'Healthcare','Retail',
-                                   'Travel & Transportation','Other'
-
-  account_priority_level STRING  — 'P1-P4','P5-P7','P8-P10','No Priority'
-
-── FISCAL YEAR & QUARTER ─────────────────────────────────────────
-  create_fy             INT      — FY based on cohort entry date (Apr start)
-                                   FY27 = 2027 (Apr 2026 – Mar 2027)
-                                   FY26 = 2026 (Apr 2025 – Mar 2026)
-  create_quarter        STRING   — 'Q1','Q2','Q3','Q4'
-  create_month          STRING   — 3-letter month e.g. 'Apr'
-  close_fy              INT      — FY of close date
-  close_quarter         STRING   — quarter of close date
-  close_month           STRING   — month of close date
-  qualified_in          STRING   — e.g. '2027 | Q1'
-  closing_in            STRING   — e.g. '2027 | Q2'
-
-── STAGE CATEGORY (derived) ──────────────────────────────────────
-  stage_category        STRING   — high-level grouping:
-    'Active Pipeline'   → 20% / 30% / 40% / 60% / 75% stages
-    'Fallen Out'        → Prospect Disengaged / Closed Lost / Didn't Qualify
-    'Closed Won'        → 90% Deal Desk Review / Closed Won
-    'Pre-Qualification' → 1% / 5% / 10% / Deal on Hold
-
-── VELOCITY & HEALTH ─────────────────────────────────────────────
-  days_in_current_stage INT      — days in current stage (NULL for terminal stages)
-  Avg_Days_in_Stage_HC  INT      — benchmark days: 1%=7, 5%=21, 10%=28,
-                                   20%=41, 30%=15, 40%=29, 60%=27, 75%=34
-  avg_days_in_stage     FLOAT    — actual cohort average for this FY + stage
-  deal_category         STRING   — health vs benchmark:
-                                   'Green'  = days < benchmark × 1.5
-                                   'Yellow' = days < benchmark × 2
-                                   'Red'    = days ≥ benchmark × 2
-                                   NULL for terminal/exited stages
-  deal_stage_rank       INT      — 5%=1, 10%=2, 20%=3, 30%=4, 40%=5,
-                                   60%=6, 75%=7, 90%=8, Won=9, Hold=10,
-                                   Disengaged=11, Lost=12, DQ=13
-
-── STAGE TRANSITION TIMES ────────────────────────────────────────
-  1_to_5    INT  — days: create_date → became_5_deal_date (1% cohort)
-  5_to_10   INT  — days: became_5 → became_10
-  10_to_20  INT  — days: became_10 → became_20
-  20_to_30  INT  — days: became_20 → became_30
-  30_to_40  INT  — days: became_30 → became_40
-  40_to_60  INT  — days: became_40 → became_60
-  60_to_75  INT  — days: became_60 → became_75
-  (all clamped to 0 if negative or > 10000)
-
-── QUALIFICATION ─────────────────────────────────────────────────
-  BANT                        STRING — 'Yes' / 'No'
-  is_this_a_deal_with_inception STRING — 'Yes' / 'No'
-
-── DEAL APPROVALS (20%+ cohort) ──────────────────────────────────
-  cs_deal_approval_status_level_1      STRING
-  cs_deal_approval_status_level_2      STRING
-  direct_deal_approval_status_level_1  STRING
-  direct_deal_approval_status_level_2  STRING
-  deal_approval_status_level_1         STRING
-  deal_approval_status_level_2         STRING
+  -- APPROVALS
+  cs_deal_approval_status_level_1    STRING
+  cs_deal_approval_status_level_2    STRING
+  direct_deal_approval_status_level_1 STRING
+  direct_deal_approval_status_level_2 STRING
+  deal_approval_status_level_1       STRING
+  deal_approval_status_level_2       STRING
   deal_approval_status_level_3_cs_only STRING
+
+── TABLE 2: hs_analytics.owners ─────────────────────────────────
+Always use FINAL keyword: FROM hs_analytics.owners FINAL
+
+  id           STRING  — owner ID (join to deals.deal_owner)
+  firstName    STRING  — first name
+  lastName     STRING  — last name
+  email        STRING  — owner email
+
+── TABLE 3: hs_analytics.companies ──────────────────────────────
+Always use FINAL keyword: FROM hs_analytics.companies FINAL
+
+  company_id   STRING  — unique company ID
+  name         STRING  — company name
+  domain       STRING  — website domain
+  industry     STRING  — company industry
+  country      STRING  — company country
+  city         STRING  — company city
+
+── HELPER TABLES ─────────────────────────────────────────────────
+  kore_ai_hubspot.gs_deal_ids_hs   — valid deal IDs whitelist
+    deal_id_hs  STRING
+
+  kore_ai_hubspot.gs_Teams         — team names
+    team_id     STRING
+    name        STRING
+
+=================================================================
+MANDATORY BASE FILTERS (apply to EVERY query on deals)
+=================================================================
+Always include ALL of these in every deals query:
+
+  WHERE pipeline = 'default'
+  AND CASE WHEN deal_type IS NULL THEN 'Not Assigned' ELSE deal_type END
+      NOT IN ('Partner-Led SMB')
+  AND toInt64(deal_id) IN (
+      SELECT DISTINCT toInt64(deal_id_hs)
+      FROM kore_ai_hubspot.gs_deal_ids_hs
+  )
+
+=================================================================
+FISCAL YEAR CALCULATION
+=================================================================
+FY is computed from a date column:
+  toYear(CAST(LEFT(coalesce(date_col, '1900-01-01'), 10) AS DATE))
+  + if(toMonth(CAST(LEFT(coalesce(date_col, '1900-01-01'), 10) AS DATE)) >= 4, 1, 0)
+
+FY27 = result = 2027  (Apr 2026 – Mar 2027)
+FY26 = result = 2026  (Apr 2025 – Mar 2026)
+
+Shorthand macro (replace date_col):
+  toYear(toDate(LEFT(coalesce(date_col,'1900-01-01'),10)))
+  + if(toMonth(toDate(LEFT(coalesce(date_col,'1900-01-01'),10))) >= 4, 1, 0)
+
+For FY27 5% cohort: became_5_deal_date >= '2026-04-01'
+For FY26 5% cohort: became_5_deal_date >= '2025-04-01' AND < '2026-04-01'
+
+=================================================================
+COMPUTED COLUMNS — write these inline in your queries
+=================================================================
+
+-- Deal owner full name (requires JOIN to owners):
+  concat(o.firstName, ' ', o.lastName) AS deal_owner_name
+
+-- Region (mapped):
+  CASE
+    WHEN d.region = 'japac'       THEN 'JAPAC'
+    WHEN d.region = 'Africa'      THEN 'Middle East'
+    WHEN d.region = 'india___sea' THEN 'ISEA'
+    ELSE d.region
+  END AS region
+
+REGION MAP (raw → display):
+  'japac'       → 'JAPAC'
+  'Africa'      → 'Middle East'
+  'india___sea' → 'ISEA'
+  'North America', 'EMEA', 'APAC', 'India', 'Latin America' → unchanged
+
+-- Deal source (mapped):
+  CASE
+    WHEN d.deal_source_rollup IN ('Executive Outreach','Investor') THEN 'Executive Outreach'
+    WHEN d.deal_source_rollup IN ('BDR Outbound')                  THEN 'BDR'
+    WHEN d.deal_source_rollup IN ('Partner')                       THEN 'Partner - Non Hyperscaler'
+    WHEN d.deal_source_rollup IN ('Marketing','Customer Success',
+         'AE Outbound','Inception','Hyperscaler')                  THEN d.deal_source_rollup
+    ELSE 'Other'
+  END AS deal_source_rollup
+
+-- Industry (mapped):
+  CASE
+    WHEN d.kore_primary_industry IN ('Financial Services','Banking','Insurance')
+         THEN 'Financial Services'
+    WHEN d.kore_primary_industry IN ('Manufacturing Discreet','Manufacturing Process','CPG')
+         THEN 'Manufacturing'
+    WHEN d.kore_primary_industry IN ('Hi-Tech','Telecom / Media / Entertainment')
+         THEN 'TMT'
+    WHEN d.kore_primary_industry IS NULL
+      OR d.kore_primary_industry IN ('Business Services','Government','Energy & Utilities',
+         'Education','Restaurants','null','Energy')
+         THEN 'Other'
+    ELSE d.kore_primary_industry
+  END AS industry
+
+-- Stage category:
+  CASE
+    WHEN d.deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
+         '60% - Price Negotiation','75% - Contract Review')
+         THEN 'Active Pipeline'
+    WHEN d.deal_stage IN ('Prospect Disengaged','Closed Lost','Didn''t Qualify')
+         THEN 'Fallen Out'
+    WHEN d.deal_stage IN ('90% - Deal Desk Review','Closed Won')
+         THEN 'Closed Won'
+    ELSE 'Pre-Qualification'
+  END AS stage_category
+
+-- BANT:
+  CASE
+    WHEN d.is_there_a_confirmation_of_budget = 'Yes'
+     AND d.who_is_the_decision_maker IS NOT NULL
+     AND d.use_case IS NOT NULL
+     AND d.what_is_the_estimated_timeline IS NOT NULL
+    THEN 'Yes' ELSE 'No'
+  END AS BANT
+
+-- Account priority grouped:
+  CASE
+    WHEN d.account_priority_level IN ('P1','P2','P3','P4') THEN 'P1-P4'
+    WHEN d.account_priority_level IN ('P5','P6','P7')      THEN 'P5-P7'
+    WHEN d.account_priority_level IN ('P8','P9','P10')     THEN 'P8-P10'
+    ELSE 'No Priority'
+  END AS account_priority_level
+
+-- Fiscal year from became_5_deal_date:
+  toYear(toDate(LEFT(coalesce(d.became_5_deal_date,'1900-01-01'),10)))
+  + if(toMonth(toDate(LEFT(coalesce(d.became_5_deal_date,'1900-01-01'),10))) >= 4, 1, 0)
+  AS fy_5
+
+-- Days in current stage (example for 10% Discovery):
+  DATE_DIFF('Day',
+    toDate(LEFT(coalesce(d.became_10_deal_date,'1900-01-01'),10)),
+    CURRENT_DATE()
+  ) AS days_in_stage
 
 =================================================================
 DEAL STAGE LIST (funnel order)
 =================================================================
-  '1% - IQM Scheduled'       benchmark: 7d    → Pre-Qualification
-  '5% - IQM Held'            benchmark: 21d   → Pre-Qualification
-  '10% - Discovery'          benchmark: 28d   → Pre-Qualification
-  '20% - Solution'           benchmark: 41d   → Active Pipeline 
-  '30% - Proof'              benchmark: 15d   → Active Pipeline 
-  '40% - Proposal'           benchmark: 29d   → Active Pipeline 
-  '60% - Price Negotiation'  benchmark: 27d   → Active Pipeline 
-  '75% - Contract Review'    benchmark: 34d   → Active Pipeline 
-  '90% - Deal Desk Review'                    → Closed Won
-  'Closed Won'                                → Closed Won
-  'Closed Lost'                               → Fallen Out
-  "Didn't Qualify"                            → Fallen Out
-  'Prospect Disengaged'                       → Fallen Out
-  'Deal on Hold'                              → Pre-Qualification
-
-=================================================================
-COHORT LOGIC — IMPORTANT
-=================================================================
-Each dashboard uses a different cohort base date:
-  1% cohort  → create_fy based on create_date
-  5% cohort  → create_fy based on became_5_deal_date  (DEFAULT in pipe_gen)
-  10% cohort → create_fy based on became_10_deal_date
-  20% cohort → create_fy based on became_20_deal_date
-
-pipe_gen in BASE_CTE is the 5% cohort (became_5_deal_date >= '2026-04-01').
-For 20%+ deals: also filter became_20_deal_date <> '1900-01-01'
-All cohorts exclude: deal_type = 'Partner-Led SMB'
+  '1% - IQM Scheduled'       → Pre-Qualification  (benchmark 7d)
+  '5% - IQM Held'            → Pre-Qualification  (benchmark 21d)
+  '10% - Discovery'          → Pre-Qualification  (benchmark 28d)
+  '20% - Solution'           → Active Pipeline    (benchmark 41d)
+  '30% - Proof'              → Active Pipeline    (benchmark 15d)
+  '40% - Proposal'           → Active Pipeline    (benchmark 29d)
+  '60% - Price Negotiation'  → Active Pipeline    (benchmark 27d)
+  '75% - Contract Review'    → Active Pipeline    (benchmark 34d)
+  '90% - Deal Desk Review'   → Closed Won
+  'Closed Won'               → Closed Won
+  'Closed Lost'              → Fallen Out
+  "Didn't Qualify"           → Fallen Out
+  'Prospect Disengaged'      → Fallen Out
+  'Deal on Hold'             → Pre-Qualification
 
 =================================================================
 QUERY RULES
 =================================================================
 1. SELECT only — never INSERT, UPDATE, DELETE, DROP, ALTER
-2. Always LIMIT for row-level queries (max 100)
-3. countDistinct(deal_id) for unique deal counts
-4. round(sum(amount)/1e6, 1) for $M amounts
-5. ILIKE for case-insensitive text matching
-6. date_col <> '1900-01-01' to exclude null dates
-7. Default FY is 2027 unless user specifies otherwise
+2. Always use FINAL on all hs_analytics tables
+3. Always apply the 3 mandatory base filters on deals
+4. Always LIMIT for row-level queries (max 100)
+5. Use countDistinct(deal_id) for unique deal counts
+6. Use round(sum(amount)/1e6, 1) for $M amounts
+7. Use ILIKE for case-insensitive text matching
+8. Dates are stored as strings — always cast: toDate(LEFT(coalesce(col,'1900-01-01'),10))
+9. Null date sentinel is '1900-01-01' — filter with: col <> '1900-01-01' AND col IS NOT NULL
+10. Default FY is 2027 unless user specifies otherwise
 
 =================================================================
 BUSINESS DEFINITIONS
 =================================================================
-"Active pipeline"        → stage_category = 'Active Pipeline'
-"Qualified / 20%+ deals" → became_20_deal_date <> '1900-01-01'
-"Fallen out / lost"      → stage_category = 'Fallen Out', 
-"Closed won"             → deal_stage IN ('Closed Won','90% - Deal Desk Review')
-"Red / at-risk deals"    → deal_category = 'Red'
-"Stalled deals"          → deal_category IN ('Yellow','Red')
-"BANT qualified"         → BANT = 'Yes'
-"High priority accounts" → account_priority_level = 'P1-P4'
-"Current FY (FY27)"      → create_fy = 2027
+"Active pipeline"    → deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
+                       '60% - Price Negotiation','75% - Contract Review')
+"Qualified deals"    → became_20_deal_date <> '1900-01-01'
+"Fallen out"         → deal_stage IN ('Prospect Disengaged','Closed Lost','Didn''t Qualify')
+"Closed won"         → deal_stage IN ('Closed Won','90% - Deal Desk Review')
+"BANT qualified"     → all 4 BANT fields confirmed (see BANT formula above)
+"High priority"      → account_priority_level IN ('P1','P2','P3','P4')
+"FY27 5% cohort"     → became_5_deal_date >= '2026-04-01'
+"FY27 20% cohort"    → became_20_deal_date >= '2026-04-01'
 
 =================================================================
-SAMPLE Q&A — CORRECT QUERY PATTERNS
+SAMPLE QUERIES
 =================================================================
 
-Q: "How many deals are currently in active pipeline?"
-SQL:
-  SELECT countDistinct(deal_id) AS active_deals
-  FROM pipe_gen
-  WHERE stage_category = 'Active Pipeline'
-    AND create_fy = 2027
+-- Q: How many deals are currently in active pipeline?
+SELECT countDistinct(d.deal_id) AS active_deals,
+       round(sum(d.amount)/1e6, 1) AS pipeline_m
+FROM hs_analytics.deals d FINAL
+WHERE d.pipeline = 'default'
+  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
+      NOT IN ('Partner-Led SMB')
+  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
+  AND d.deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
+                       '60% - Price Negotiation','75% - Contract Review')
+  AND d.became_5_deal_date >= '2026-04-01'
 
-Q: "Which region has most active pipeline by value?"
-SQL:
-  SELECT region,
-         countDistinct(deal_id) AS deals
-  FROM pipe_gen
-  WHERE stage_category = 'Active Pipeline' AND create_fy = 2027
-  GROUP BY region
+-- Q: Top 10 deals by value in active pipeline with owner name
+SELECT d.deal_name,
+       concat(o.firstName,' ',o.lastName) AS owner,
+       CASE WHEN d.region='japac' THEN 'JAPAC'
+            WHEN d.region='Africa' THEN 'Middle East'
+            WHEN d.region='india___sea' THEN 'ISEA'
+            ELSE d.region END AS region,
+       d.deal_stage,
+       round(d.amount/1e6, 2) AS amt_m,
+       toDate(LEFT(coalesce(d.close_date,'1900-01-01'),10)) AS close_date
+FROM hs_analytics.deals d FINAL
+LEFT JOIN hs_analytics.owners o FINAL ON d.deal_owner = CAST(o.id AS VARCHAR)
+WHERE d.pipeline = 'default'
+  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
+      NOT IN ('Partner-Led SMB')
+  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
+  AND d.deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
+                       '60% - Price Negotiation','75% - Contract Review')
+  AND d.became_5_deal_date >= '2026-04-01'
+ORDER BY d.amount DESC LIMIT 10
 
-Q: "Show me all red deals above $500K"
-SQL:
-  SELECT deal_name, deal_owner_name, region, deal_stage,
-         round(amount/1e6, 2) AS amt_m, days_in_current_stage
-  FROM pipe_gen
-  WHERE deal_category = 'Red' AND amount >= 500000
-    AND create_fy = 2027
-  ORDER BY amount DESC LIMIT 50
+-- Q: Which AE has most stalled deals?
+SELECT concat(o.firstName,' ',o.lastName) AS owner,
+       countDistinct(d.deal_id) AS stalled_deals,
+       round(sum(d.amount)/1e6,1) AS at_risk_m
+FROM hs_analytics.deals d FINAL
+LEFT JOIN hs_analytics.owners o FINAL ON d.deal_owner = CAST(o.id AS VARCHAR)
+WHERE d.pipeline = 'default'
+  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
+      NOT IN ('Partner-Led SMB')
+  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
+  AND d.deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
+                       '60% - Price Negotiation','75% - Contract Review')
+  AND d.became_5_deal_date >= '2026-04-01'
+GROUP BY owner ORDER BY stalled_deals DESC LIMIT 10
 
-Q: "Which AE has most stalled deals?"
-SQL:
-  SELECT deal_owner_name,
-         countDistinct(deal_id) AS stalled_deals,
-         round(sum(amount)/1e6, 1) AS at_risk_m
-  FROM pipe_gen
-  WHERE deal_category IN ('Yellow','Red') AND create_fy = 2027
-  GROUP BY deal_owner_name ORDER BY stalled_deals DESC LIMIT 10
+-- Q: Lost deals mentioning a competitor
+SELECT d.deal_name,
+       concat(o.firstName,' ',o.lastName) AS owner,
+       round(d.amount/1e6,2) AS amt_m,
+       d.primary_closed_lost_reason,
+       d.competitors,
+       d.won_loss_notes
+FROM hs_analytics.deals d FINAL
+LEFT JOIN hs_analytics.owners o FINAL ON d.deal_owner = CAST(o.id AS VARCHAR)
+WHERE d.pipeline = 'default'
+  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
+      NOT IN ('Partner-Led SMB')
+  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
+  AND d.deal_stage = 'Closed Lost'
+  AND d.competitors ILIKE '%salesforce%'
+ORDER BY d.amount DESC LIMIT 20
 
-Q: "How many deals fell out this FY by stage?"
-SQL:
-  SELECT deal_stage,
-         countDistinct(deal_id) AS deals,
-         round(sum(amount)/1e6, 1) AS lost_m
-  FROM pipe_gen
-  WHERE stage_category = 'Fallen Out' AND create_fy = 2027
-  GROUP BY deal_stage ORDER BY deals DESC
-
-Q: "Average time at each stage"
-SQL:
-  SELECT deal_stage, Avg_Days_in_Stage_HC AS benchmark,
-         round(avg(days_in_current_stage), 0) AS current_avg
-  FROM pipe_gen
-  WHERE create_fy = 2027 AND days_in_current_stage IS NOT NULL
-  GROUP BY deal_stage, Avg_Days_in_Stage_HC, deal_stage_rank
-  ORDER BY deal_stage_rank
-
-Q: "BDR sourced deals by stage"
-SQL:
-  SELECT deal_stage, countDistinct(deal_id) AS deals,
-         round(sum(amount)/1e6, 1) AS pipeline_m
-  FROM pipe_gen
-  WHERE deal_source_rollup = 'BDR' AND create_fy = 2027
-  GROUP BY deal_stage ORDER BY deal_stage_rank
-
-Q: "Deals closing this quarter with no BANT"
-SQL:
-  SELECT deal_name, deal_owner_name, region, deal_stage,
-         round(amount/1e6, 2) AS amt_m, close_date, closing_in
-  FROM pipe_gen
-  WHERE BANT = 'No' AND stage_category = 'Active Pipeline'
-    AND close_fy = 2027
-  ORDER BY close_date ASC LIMIT 50
-
-Q: "Top 10 deals by value in active pipeline"
-SQL:
-  SELECT deal_name, deal_owner_name, region, deal_stage,
-         round(amount/1e6, 2) AS amt_m, close_date, deal_category
-  FROM pipe_gen
-  WHERE stage_category = 'Active Pipeline' AND create_fy = 2027
-  ORDER BY amount DESC LIMIT 10
-
-Q: "Pipeline by industry at 20%+"
-SQL:
-  SELECT kore_primary_industry,
-         countDistinct(deal_id) AS deals,
-         round(sum(amount)/1e6, 1) AS pipeline_m
-  FROM pipe_gen
-  WHERE became_20_deal_date <> '1900-01-01' AND create_fy = 2027
-  GROUP BY kore_primary_industry ORDER BY pipeline_m DESC
-
-Q: "Which teams have deals stuck in approval?"
-SQL:
-  SELECT Team, deal_stage, deal_approval_status_level_1,
-         countDistinct(deal_id) AS deals,
-         round(sum(amount)/1e6, 1) AS pipeline_m
-  FROM pipe_gen
-  WHERE deal_approval_status_level_1 IS NOT NULL
-    AND stage_category = 'Active Pipeline'
-    AND create_fy = 2027
-  GROUP BY Team, deal_stage, deal_approval_status_level_1
-  ORDER BY pipeline_m DESC LIMIT 20
+-- Q: Pipeline by industry at 20%+ (FY27)
+SELECT
+  CASE
+    WHEN d.kore_primary_industry IN ('Financial Services','Banking','Insurance')
+         THEN 'Financial Services'
+    WHEN d.kore_primary_industry IN ('Manufacturing Discreet','Manufacturing Process','CPG')
+         THEN 'Manufacturing'
+    WHEN d.kore_primary_industry IN ('Hi-Tech','Telecom / Media / Entertainment')
+         THEN 'TMT'
+    ELSE 'Other'
+  END AS industry,
+  countDistinct(d.deal_id) AS deals,
+  round(sum(d.amount)/1e6,1) AS pipeline_m
+FROM hs_analytics.deals d FINAL
+WHERE d.pipeline = 'default'
+  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
+      NOT IN ('Partner-Led SMB')
+  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
+  AND d.became_20_deal_date >= '2026-04-01'
+  AND d.became_20_deal_date <> '1900-01-01'
+GROUP BY industry ORDER BY pipeline_m DESC
 =================================================================
 """
 
 
-def run_clickhouse_query(sql: str, ch_client) -> str:
+import requests as http_requests
+
+def run_clickhouse_query(sql: str) -> str:
     """
-    Execute a read-only SELECT using the existing ClickHouse client.
-    Returns results as a formatted table string for Claude to read.
+    Execute a read-only SELECT directly against ClickHouse HTTP API.
+    Queries raw tables — no CTE dependency.
     """
+    api_url   = os.getenv("CLICKHOUSE_API_URL")
+    api_token = os.getenv("CLICKHOUSE_API_TOKEN")
+
+    if not api_url or not api_token:
+        return "ClickHouse API not configured. Set CLICKHOUSE_API_URL and CLICKHOUSE_API_TOKEN."
+
     stripped = sql.strip().upper()
     if not stripped.startswith("SELECT") and not stripped.startswith("WITH"):
-        return "Error: Only SELECT queries are permitted."
+        return "Error: Only SELECT/WITH queries are permitted."
 
     try:
-        result  = ch_client.query(sql)
-        columns = result.column_names
-        rows    = result.result_rows
+        response = http_requests.post(
+            api_url,
+            params={"query": sql + " FORMAT JSONCompact"},
+            headers={"Authorization": f"Bearer {api_token}"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        columns = [c["name"] for c in data.get("meta", [])]
+        rows    = data.get("data", [])
 
         if not rows:
             return "Query returned 0 rows."
 
         capped  = rows[:100]
-        header  = " | ".join(str(c) for c in columns)
+        header  = " | ".join(columns)
         divider = "-" * min(len(header), 120)
         lines   = [header, divider]
         for row in capped:
@@ -2047,6 +2134,10 @@ def run_clickhouse_query(sql: str, ch_client) -> str:
 
         return "\n".join(lines)
 
+    except http_requests.exceptions.Timeout:
+        return "Query timed out — simplify the query or add more filters."
+    except http_requests.exceptions.HTTPError as e:
+        return f"HTTP error: {e.response.status_code} — {e.response.text[:300]}"
     except Exception as e:
         return f"Query error: {e}"
         
@@ -2154,6 +2245,7 @@ def chat(payload: ChatRequest):
     chat_messages.append({"role": "user", "content": payload.message})
 
     try:
+        print(f"💬 [chat] Q: {payload.message[:120]}")
         # ── 6. First Claude call ──────────────────────────────────────────────
         response = client_ai.messages.create(
             model=_CLAUDE_MODEL,
@@ -2163,7 +2255,8 @@ def chat(payload: ChatRequest):
             temperature=0,
             max_tokens=1500,
         )
-
+        
+        print(f"{'🗄️  [chat] DB QUERY TRIGGERED' if response.stop_reason == 'tool_use' else '📊 [chat] ANSWERED FROM PRE-BUILT DATA'}")
         # ── 7. Tool use loop (up to 3 rounds) ────────────────────────────────
         rounds = 0
         while response.stop_reason == "tool_use" and rounds < 3:
@@ -2176,7 +2269,7 @@ def chat(payload: ChatRequest):
                 break
 
             sql          = tool_use_block.input.get("sql", "")
-            query_result = run_clickhouse_query(sql, ch_client)
+            query_result = run_clickhouse_query(sql)
 
             print(f"🔍 [chat tool] Round {rounds} SQL: {sql[:120]}...")
             print(f"📊 [chat tool] Result: {query_result[:200]}")
@@ -2203,7 +2296,8 @@ def chat(payload: ChatRequest):
                 temperature=0,
                 max_tokens=1500,
             )
-
+        
+        print(f"✅ [chat] Done — {rounds} DB call(s) made")
         # ── 8. Extract final reply ────────────────────────────────────────────
         reply = next(
             (b.text for b in response.content if hasattr(b, "text") and b.text),
