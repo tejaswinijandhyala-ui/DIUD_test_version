@@ -1750,7 +1750,6 @@ Use it when the pre-built PIPELINE DATA block cannot answer the question.
 HOW TO QUERY:
   The pipe_gen CTE is already defined — always write:
     SELECT ... FROM pipe_gen WHERE ...
-  Never reference hs_analytics.deals directly.
 
 =================================================================
 AVAILABLE COLUMNS IN pipe_gen
@@ -1866,11 +1865,11 @@ DEAL STAGE LIST (funnel order)
   '1% - IQM Scheduled'       benchmark: 7d    → Pre-Qualification
   '5% - IQM Held'            benchmark: 21d   → Pre-Qualification
   '10% - Discovery'          benchmark: 28d   → Pre-Qualification
-  '20% - Solution'           benchmark: 41d   → Active Pipeline ✓
-  '30% - Proof'              benchmark: 15d   → Active Pipeline ✓
-  '40% - Proposal'           benchmark: 29d   → Active Pipeline ✓
-  '60% - Price Negotiation'  benchmark: 27d   → Active Pipeline ✓
-  '75% - Contract Review'    benchmark: 34d   → Active Pipeline ✓
+  '20% - Solution'           benchmark: 41d   → Active Pipeline 
+  '30% - Proof'              benchmark: 15d   → Active Pipeline 
+  '40% - Proposal'           benchmark: 29d   → Active Pipeline 
+  '60% - Price Negotiation'  benchmark: 27d   → Active Pipeline 
+  '75% - Contract Review'    benchmark: 34d   → Active Pipeline 
   '90% - Deal Desk Review'                    → Closed Won
   'Closed Won'                                → Closed Won
   'Closed Lost'                               → Fallen Out
@@ -1921,8 +1920,7 @@ SAMPLE Q&A — CORRECT QUERY PATTERNS
 
 Q: "How many deals are currently in active pipeline?"
 SQL:
-  SELECT countDistinct(deal_id) AS active_deals,
-         round(sum(amount)/1e6, 1) AS pipeline_m
+  SELECT countDistinct(deal_id) AS active_deals
   FROM pipe_gen
   WHERE stage_category = 'Active Pipeline'
     AND create_fy = 2027
@@ -1930,11 +1928,10 @@ SQL:
 Q: "Which region has most active pipeline by value?"
 SQL:
   SELECT region,
-         countDistinct(deal_id) AS deals,
-         round(sum(amount)/1e6, 1) AS pipeline_m
+         countDistinct(deal_id) AS deals
   FROM pipe_gen
   WHERE stage_category = 'Active Pipeline' AND create_fy = 2027
-  GROUP BY region ORDER BY pipeline_m DESC
+  GROUP BY region
 
 Q: "Show me all red deals above $500K"
 SQL:
@@ -2084,8 +2081,7 @@ def chat(payload: ChatRequest):
     """
     filters = payload.filters
 
-    # Fetch live data (same path as /summary)
-    # Fetch live data (same path as /summary)
+    # ── 1. Fetch pre-built data block ────────────────────────────────────────
     try:
         ch_client   = get_click_client()
         raw_metrics = fetch_pipeline_data(filters, ch_client)
@@ -2098,7 +2094,7 @@ def chat(payload: ChatRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Metric computation error: {exc}")
 
-    # If a rendered summary was sent by the client, include it as additional context
+    # ── 2. Summary context ────────────────────────────────────────────────────
     summary_section = ""
     if payload.summary:
         summary_section = (
@@ -2110,35 +2106,116 @@ def chat(payload: ChatRequest):
             "but always prefer the raw numbers in PIPELINE DATA below for accuracy.\n"
         )
 
+    # ── 3. System prompt ──────────────────────────────────────────────────────
     system_prompt = (
         "You are a pipeline intelligence assistant for Kore.ai. "
-        "Answer questions strictly from the data below. "
-        "Never invent numbers. If something is not in the data, say so."
+        "First try to answer from the PIPELINE DATA block below. "
+        "If the question needs more detail — individual deal names, AE-level "
+        "breakdowns, competitor analysis, or any field not in the pre-built data "
+        "— use the query_clickhouse tool to fetch it directly. "
+        "Never invent numbers. If data is unavailable even after querying, say so."
         + summary_section
         + "\n\n"
         + data_block
+        + "\n\n"
+        + _CLICKHOUSE_SCHEMA
     )
 
+    # ── 4. Tool definition ────────────────────────────────────────────────────
+    tools = [
+        {
+            "name": "query_clickhouse",
+            "description": (
+                "Run a SELECT query against the Kore.ai pipeline ClickHouse database. "
+                "Use this when the pre-built PIPELINE DATA block does not have enough "
+                "detail — e.g. specific deal lookup, AE breakdown, competitor analysis, "
+                "custom date ranges, won/loss notes, or any field not in aggregated data."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": (
+                            "A valid ClickHouse SELECT query using the pipe_gen CTE. "
+                            "Always include LIMIT for detail queries."
+                        )
+                    }
+                },
+                "required": ["sql"]
+            }
+        }
+    ]
+
+    # ── 5. Build message list ─────────────────────────────────────────────────
     chat_messages = []
     for turn in payload.history:
         chat_messages.append({"role": turn.role, "content": turn.content})
     chat_messages.append({"role": "user", "content": payload.message})
 
     try:
+        # ── 6. First Claude call ──────────────────────────────────────────────
         response = client_ai.messages.create(
             model=_CLAUDE_MODEL,
             system=system_prompt,
             messages=chat_messages,
+            tools=tools,
             temperature=0,
-            max_tokens=1000,
+            max_tokens=1500,
         )
-        reply = response.content[0].text
+
+        # ── 7. Tool use loop (up to 3 rounds) ────────────────────────────────
+        rounds = 0
+        while response.stop_reason == "tool_use" and rounds < 3:
+            rounds += 1
+
+            tool_use_block = next(
+                (b for b in response.content if b.type == "tool_use"), None
+            )
+            if not tool_use_block:
+                break
+
+            sql          = tool_use_block.input.get("sql", "")
+            query_result = run_clickhouse_query(sql, ch_client)
+
+            print(f"🔍 [chat tool] Round {rounds} SQL: {sql[:120]}...")
+            print(f"📊 [chat tool] Result: {query_result[:200]}")
+
+            chat_messages = chat_messages + [
+                {"role": "assistant", "content": response.content},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_block.id,
+                            "content": query_result,
+                        }
+                    ],
+                },
+            ]
+
+            response = client_ai.messages.create(
+                model=_CLAUDE_MODEL,
+                system=system_prompt,
+                messages=chat_messages,
+                tools=tools,
+                temperature=0,
+                max_tokens=1500,
+            )
+
+        # ── 8. Extract final reply ────────────────────────────────────────────
+        reply = next(
+            (b.text for b in response.content if hasattr(b, "text") and b.text),
+            "I could not generate a response. Please try rephrasing."
+        )
+
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Claude error: {exc}")
 
     return {
         "reply":    reply,
-        "response": reply,          # alias so frontend reads it correctly
+        "response": reply,
         "filters":  filters.model_dump(),
     }
 
