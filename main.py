@@ -2256,7 +2256,10 @@ def chat(payload: ChatRequest):
             max_tokens=1500,
         )
         
-        print(f"{'🗄️  [chat] DB QUERY TRIGGERED' if response.stop_reason == 'tool_use' else '📊 [chat] ANSWERED FROM PRE-BUILT DATA'}")
+        if response.stop_reason == "tool_use":
+            print(f"🗄️  [chat] LIVE DB QUERY TRIGGERED — pre-built data insufficient for: '{payload.message[:80]}'")
+        else:
+            print(f"📊 [chat] ANSWERED FROM PRE-BUILT DATA — no DB call needed for: '{payload.message[:80]}'")
         # ── 7. Tool use loop (up to 3 rounds) ────────────────────────────────
         rounds = 0
         while response.stop_reason == "tool_use" and rounds < 3:
@@ -2271,8 +2274,8 @@ def chat(payload: ChatRequest):
             sql          = tool_use_block.input.get("sql", "")
             query_result = run_clickhouse_query(sql)
 
-            print(f"🔍 [chat tool] Round {rounds} SQL: {sql[:120]}...")
-            print(f"📊 [chat tool] Result: {query_result[:200]}")
+            print(f"🔍 [chat tool] Round {rounds}/3 — SQL: {sql[:200]}...")
+            print(f"📥 [chat tool] Round {rounds}/3 — Result preview: {query_result[:300]}")
 
             chat_messages = chat_messages + [
                 {"role": "assistant", "content": response.content},
@@ -2297,7 +2300,10 @@ def chat(payload: ChatRequest):
                 max_tokens=1500,
             )
         
-        print(f"✅ [chat] Done — {rounds} DB call(s) made")
+        if rounds == 0:
+            print(f"✅ [chat] Done — answered entirely from pre-built pipeline data (0 DB calls)")
+        else:
+            print(f"✅ [chat] Done — answered using live ClickHouse queries ({rounds} DB call(s) made)")
         # ── 8. Extract final reply ────────────────────────────────────────────
         reply = next(
             (b.text for b in response.content if hasattr(b, "text") and b.text),
