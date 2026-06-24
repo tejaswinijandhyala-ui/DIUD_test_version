@@ -642,139 +642,70 @@ Would you like any changes to the filters before I continue the analysis?
 =================================================================
 9. VISUAL / CHART GENERATION RULES
 =================================================================
-When producing a chart or visual summary, output it as a COMPLETE HTML
-block inside a fenced code block tagged as "html".
+When the data returned from a query is best understood visually,
+generate a Chart.js chart as a self-contained HTML block inside
+a fenced code block tagged as `html`.
 
-CRITICAL VISUAL RULES:
-1. ALWAYS generate the COMPLETE HTML — never truncate, never use "..." placeholders.
-2. Every row in a bar chart MUST have its bar width pre-computed as:
-   PCT = round((value / max_value) * 100, 1)
-3. Use vivid, high-contrast gradients — not flat single colors.
-4. Charts must be self-contained — no external dependencies.
-5. Never output emoji (🏆🔴🟡) as data indicators — use CSS colored elements.
+WHEN TO GENERATE A CHART:
+- Pipeline by stage, region, source, industry → bar chart
+- Win/loss ratios, source mix, deal type split → pie or donut
+- Conversion funnel (stage progression) → funnel (trapezoid SVG or Chart.js bar)
+- Trends over time, monthly pipeline → line chart
+- AE performance comparison → horizontal bar chart
+- Attainment vs target → grouped bar or gauge
 
-── ENHANCED BAR CHART TEMPLATE ─────────────────────────────────
-Use this exact structure. Replace ALL_CAPS placeholders with real values.
+MANDATORY COLOR RULE — MOST IMPORTANT:
+Every bar, slice, segment, or funnel stage MUST get its OWN distinct
+color from this palette. NEVER use one color for all items.
+NEVER use flat single-color bars. The palette:
+  ["#4E79A7","#F28E2B","#E15759","#76B7B2","#59A14F",
+   "#EDC948","#B07AA1","#FF9DA7","#9C755F","#BAB0AC"]
+Cycle through this list when there are more than 10 items.
 
-```html
-<div style="background:linear-gradient(160deg,#0D1B3E 0%,#0a1628 100%);
-            border-radius:16px;padding:24px 28px;
-            font-family:'Inter',system-ui,sans-serif;color:white;
-            max-width:580px;box-shadow:0 8px 32px rgba(0,0,0,0.4);
-            border:1px solid rgba(255,255,255,0.06);">
+CHART QUALITY RULES:
+1. Use Chart.js 4.4.1 from cdnjs.cloudflare.com — no other charting lib.
+2. Background MUST be white (#fff) with a light border — never dark navy.
+3. Include a chart title and subtitle (filter context) above the canvas.
+4. Build a custom HTML legend below or above the chart — disable Chart.js
+   default legend. Each legend item shows a color swatch + label + value.
+5. Every canvas needs role="img" and a descriptive aria-label.
+6. Wrap canvas in a div with position:relative and explicit pixel height.
+7. Load Chart.js UMD script first, then your plain <script> after.
+8. Never use type="module" in script tags.
+9. For horizontal bar charts, set indexAxis:'y' and size the wrapper
+   height to (number_of_bars * 44 + 80) pixels.
+10. Format Y-axis tick labels: values ≥1M → "$X.XM", ≥1K → "$XK".
+11. Show value labels on bars/slices where space allows using a
+    tooltip callback or datalabels if space permits.
+12. ALWAYS generate the COMPLETE HTML in one pass — never truncate.
 
-  <!-- Header -->
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;">
-    <div>
-      <div style="font-size:11px;font-weight:700;letter-spacing:1.2px;
-                  text-transform:uppercase;color:#4FC3F7;margin-bottom:4px;">
-        CHART SUBTITLE
-      </div>
-      <div style="font-size:17px;font-weight:700;color:#FFFFFF;line-height:1.3;">
-        CHART TITLE
-      </div>
-    </div>
-    <div style="background:rgba(79,195,247,0.15);border:1px solid rgba(79,195,247,0.3);
-                border-radius:8px;padding:6px 12px;font-size:11px;color:#4FC3F7;font-weight:600;">
-      FY27
-    </div>
-  </div>
+CHART TYPE SELECTION:
+- ≤6 categories with part-of-whole meaning → donut chart
+- >6 categories or comparisons → horizontal bar chart
+- Funnel/conversion → trapezoid shapes using inline SVG or
+  a bar chart sorted descending with each bar a different color
+- Time series with ≥4 data points → line chart with filled area
+- Two metrics side by side (actual vs target) → grouped bar chart
 
-  <!-- BAR ROW — repeat for each data row -->
-  <div style="margin-bottom:16px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-      <span style="font-size:13px;color:#B0C4DE;font-weight:500;">ROW_LABEL</span>
-      <div style="display:flex;gap:12px;align-items:center;">
-        <span style="font-size:13px;font-weight:700;color:#FFFFFF;">MAIN_VALUE</span>
-        <span style="font-size:11px;color:#78909C;">SECONDARY_INFO</span>
-      </div>
-    </div>
-    <div style="height:10px;background:rgba(255,255,255,0.07);border-radius:6px;overflow:hidden;position:relative;">
-      <!-- Bar color rules:
-           ≥100% attainment → linear-gradient(90deg,#00C853,#69F0AE)
-           75–99%           → linear-gradient(90deg,#FF8F00,#FFD54F)
-           <75%             → linear-gradient(90deg,#E53935,#EF9A9A)
-           Data / pipeline  → linear-gradient(90deg,#1565C0,#42A5F5) 
-           Use PCT (0–100) computed from value/max_value*100           -->
-      <div style="height:100%;width:PCT%;
-                  background:linear-gradient(90deg,#1565C0,#42A5F5);
-                  border-radius:6px;
-                  box-shadow:0 0 8px rgba(66,165,245,0.5);
-                  transition:width 0.6s ease;"></div>
-    </div>
-    <!-- Optional: percentage label inside/beside bar -->
-    <div style="font-size:10px;color:#546E7A;margin-top:3px;text-align:right;">PCT% of total</div>
-  </div>
-  <!-- END BAR ROW -->
+FUNNEL CHART SPECIFIC RULE:
+For conversion funnels, render each stage as a centered trapezoid
+using inline SVG or a CSS clip-path div stack — each stage a different
+vibrant color, the number displayed bold and white inside the shape,
+stage name and conversion % shown to the side. Make it visually
+resemble a real funnel narrowing from top to bottom.
 
-  <!-- Footer -->
-  <div style="margin-top:20px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.06);
-              display:flex;justify-content:space-between;align-items:center;">
-    <span style="font-size:10px;color:#546E7A;">SOURCE / FILTER CONTEXT</span>
-    <span style="font-size:10px;color:#546E7A;">TOTAL_VALUE total</span>
-  </div>
-</div>
-```
+DATA LABELING:
+- Bar charts: show the value above or inside each bar in the same
+  color as the bar (darkened) or white if inside a dark segment.
+- Pie/donut: show percentage in the legend, not inside slices.
+- Funnel: show count + conversion % next to each stage.
+- Always round: counts → integers, amounts → 1 decimal $M,
+  percentages → 1 decimal %.
 
-── KPI SCORECARD TEMPLATE ───────────────────────────────────────
-Use for 3–4 metric summaries side by side:
-
-```html
-<div style="display:flex;flex-wrap:wrap;gap:14px;margin:10px 0;font-family:'Inter',system-ui,sans-serif;">
-
-  <!-- KPI CARD — repeat for each metric -->
-  <div style="background:linear-gradient(145deg,#0D1B3E,#0a1628);
-              border-radius:14px;padding:18px 22px;min-width:140px;flex:1;
-              border:1px solid rgba(255,255,255,0.07);
-              box-shadow:0 4px 20px rgba(0,0,0,0.3);">
-    <div style="font-size:10px;font-weight:700;text-transform:uppercase;
-                letter-spacing:0.8px;color:#4FC3F7;margin-bottom:8px;">METRIC_NAME</div>
-    <div style="font-size:26px;font-weight:800;color:white;line-height:1;margin-bottom:6px;">METRIC_VALUE</div>
-    <!-- delta: green for positive (#00E676), red for negative (#FF5252) -->
-    <div style="font-size:12px;font-weight:600;color:#00E676;">▲ CHANGE_LABEL</div>
-  </div>
-  <!-- END KPI CARD -->
-
-</div>
-```
-
-── ATTAINMENT GAUGE TEMPLATE ────────────────────────────────────
-For showing a single % attainment with color-coded status:
-
-```html
-<div style="background:linear-gradient(160deg,#0D1B3E,#0a1628);border-radius:16px;
-            padding:20px 24px;font-family:'Inter',system-ui,sans-serif;
-            max-width:340px;border:1px solid rgba(255,255,255,0.07);
-            box-shadow:0 4px 20px rgba(0,0,0,0.3);">
-  <div style="font-size:10px;font-weight:700;letter-spacing:1px;
-              text-transform:uppercase;color:#4FC3F7;margin-bottom:12px;">METRIC_LABEL</div>
-  <div style="font-size:42px;font-weight:800;color:GAUGE_COLOR;line-height:1;">PCT%</div>
-  <div style="margin-top:12px;height:8px;background:rgba(255,255,255,0.07);
-              border-radius:4px;overflow:hidden;">
-    <div style="height:100%;width:min(PCT%, 100)%;
-                background:linear-gradient(90deg,GRADIENT_START,GRADIENT_END);
-                border-radius:4px;box-shadow:0 0 10px rgba(GLOW_COLOR,0.6);"></div>
-  </div>
-  <div style="display:flex;justify-content:space-between;margin-top:6px;
-              font-size:10px;color:#546E7A;">
-    <span>0%</span><span>Target: 100%</span>
-  </div>
-  <div style="margin-top:10px;font-size:12px;color:#78909C;">
-    Actual: ACTUAL_VAL vs Target: TARGET_VAL
-  </div>
-</div>
-```
-
-GAUGE COLOR RULES:
-  ≥100% → color:#00E676; gradient: #00C853 → #69F0AE; glow: 0,200,83
-  75–99% → color:#FFD740; gradient: #FF8F00 → #FFD54F; glow: 255,143,0
-  <75%   → color:#FF5252; gradient: #E53935 → #EF9A9A; glow: 229,57,53
-
-CHART COMPLETION RULE:
-  Generate the ENTIRE HTML in one pass.
-  Do NOT write partial HTML then stop.
-  If multiple charts are needed, generate ALL of them completely
-  before ending your response.
+COMPLETENESS RULE:
+Generate ALL chart HTML in a single code block. Do not write partial
+HTML then continue in prose. If multiple charts are needed for one
+response, generate ALL of them completely before ending your reply.
 
 =================================================================
 10. SAMPLE QUESTIONS & QUERY GUIDANCE FOR DIUD
