@@ -1,1725 +1,965 @@
-
-# =============================================================================
-# main.py
-# AI-For-Looker — FastAPI Backend
-# =============================================================================
-
-# ── Standard Library ──────────────────────────────────────────────────────────
+import csv
 import io
 import json
 import os
+import re
 import traceback
-from collections import defaultdict
-from datetime import date, timedelta
-from typing import List, Literal, Optional
+import uuid
+from datetime import date, datetime
+from typing import Dict, List, Literal, Optional
 
-# ── Third-Party: Web Framework ────────────────────────────────────────────────
-from fastapi import FastAPI, HTTPException, Query
+import httpx
+import anthropic
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
-
-# ── Third-Party: Environment & Config ─────────────────────────────────────────
 from dotenv import load_dotenv
 
-# ── Third-Party: AI / LLM ─────────────────────────────────────────────────────
-import anthropic
-
-# ── Third-Party: Database ─────────────────────────────────────────────────────
-import clickhouse_connect
-
-# ── Third-Party: Presentation (PPTX) ─────────────────────────────────────────
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
-from pptx.util import Emu, Inches, Pt
+from pptx.util import Inches, Pt
 
-# ── Third-Party: PDF Generation ───────────────────────────────────────────────
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import (
-    HRFlowable,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
+    BaseDocTemplate, Frame, PageTemplate,
+    PageBreak, Paragraph, Spacer, Table, TableStyle,
 )
 
-
-# ── Internal Modules ──────────────────────────────────────────────────────────
-from dashboard_queries import get_all_pipeline_metrics, get_filtered_pipeline_metrics
-from generate_pptx import build_pptx
-from generate_pdf import build_pdf
-
 # =============================================================================
-# Environment
+# Load ENV
 # =============================================================================
 load_dotenv()
 
+# =============================================================================
+# FastAPI App
+# =============================================================================
+app = FastAPI(title="DIUD", description="Decision Intelligence Using Data", version="4.0.0")
 
-# FastAPI — App Initialisation & Middleware
-app = FastAPI(
-    title="AI-For-Looker",
-    description="Revenue intelligence API powered by OpenAI and ClickHouse.",
-    version="2.0.0",
-    redirect_slashes=False,
-)
- 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # tighten to specific origins in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =============================================================================
+# Claude client
+# =============================================================================
+_ai_client    = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+_CLAUDE_MODEL = "claude-sonnet-4-5"   # fallback default, still used by export
+ALLOWED_MODELS = {
+    "sonnet": "claude-sonnet-4-5",
+    "opus":   "claude-opus-4-5",
+}
 
-# Serve the frontend HTML at the root
-@app.get("/", response_class=HTMLResponse)
-def root():
-    with open("chat.html", "r") as f:
-        return HTMLResponse(content=f.read())
+# =============================================================================
+# SERVER-SIDE SESSION STORE
+# Keeps the last query result per session so export endpoints can always
+# access the full raw dataset — no JSON embedding in messages, no truncation.
+# Key  : session_id (UUID string, generated once per browser tab)
+# Value: QueryResult dict with full rows + metadata
+# =============================================================================
 
-# ----------------------------
-# Claude CLIENTS
-# ----------------------------
-client_ai     = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-client_router = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-_CLAUDE_MODEL = "claude-opus-4-5"
+class QueryResult:
+    """Holds the full raw result of the most recent ClickHouse query in a session."""
+    def __init__(self, sql: str, columns: List[str], rows: List[dict],
+                 total_rows: int, captured_at: str, filters_applied: str = ""):
+        self.sql            = sql
+        self.columns        = columns
+        self.rows           = rows          # ALL rows, no cap
+        self.total_rows     = total_rows
+        self.captured_at    = captured_at
+        self.filters_applied = filters_applied
+
+_SESSION_STORE: Dict[str, QueryResult] = {}   # session_id → QueryResult
+
+def _store_result(session_id: str, result: QueryResult):
+    _SESSION_STORE[session_id] = result
+
+def _get_result(session_id: str) -> Optional[QueryResult]:
+    return _SESSION_STORE.get(session_id)
 
 
 # =============================================================================
-# ClickHouse — Lazy Singleton with Auto-Reconnect
+# ClickHouse HTTP proxy — base helpers
 # =============================================================================
-_click_client: clickhouse_connect.driver.Client | None = None
- 
- 
-def get_click_client() -> clickhouse_connect.driver.Client:
-    """
-    Return a live ClickHouse client, (re)connecting when necessary. 
-    Strategy:
-    1. If a cached client exists, ping it with SELECT 1.
-    2. On any ping failure, discard the stale client and fall through.
-    3. Create a fresh client and verify the connection before returning. 
-    Raises:
-        RuntimeError: if the connection cannot be established.
-    """
-    global _click_client
-    if _click_client is not None:
-        try:
-            _click_client.command("SELECT 1")
-        except Exception:
-            print("⚠️  ClickHouse ping failed — reconnecting…")
-            _click_client = None
-    if _click_client is None:
-        try:
-            _click_client = clickhouse_connect.get_client(
-                host=os.getenv("CLICKHOUSE_HOST"),
-                port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
-                username=os.getenv("CLICKHOUSE_USER"),
-                password=os.getenv("CLICKHOUSE_PASSWORD"),
-                database=os.getenv("CLICKHOUSE_DB", "hs_analytics"),
-                secure=False,
-                verify=False,
-                connect_timeout=10,
-                send_receive_timeout=30,
-            )
-            _click_client.command("SELECT 1")   # confirm the connection is live
-            print("✅ ClickHouse connected successfully")
-        except Exception as exc:
-            _click_client = None
-            raise RuntimeError(f"ClickHouse connection failed: {exc}") from exc
- 
-    return _click_client
+def _base_url() -> str:
+    return (os.getenv("CLICKHOUSE_API_URL") or "").rstrip("/")
 
+def _token() -> str:
+    return os.getenv("CLICKHOUSE_API_TOKEN") or ""
 
+def _auth_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {_token()}",
+        "Content-Type":  "application/json",
+    }
 
-
+FORBIDDEN_KEYWORDS = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE"]
 
 # =============================================================================
-# summary_endpoint.py
-# POST /summary  —  Executive & Analyst styles, with/without filters
-#
-# Sections:
-#   1. Pydantic Models
-#   2. ClickHouse Data Fetching
-#   3. Metric Extraction  (_extract_computed_metrics)
-#   4. Scorecard Builder  (build_scorecards)
-#   5. Prompt Builder     (build_prompt)
-#   6. FastAPI Endpoint   (POST /summary)
+# Schema discovery
 # =============================================================================
+_LIVE_SCHEMA: dict = {}
+_SCHEMA_BLOCK: str = "Schema not yet loaded."
 
-# =============================================================================
-# 1. Pydantic Models
-# =============================================================================
- 
-class Filters(BaseModel):
-    """
-    All optional dashboard filters.
-    Empty string ("") means "no filter — show everything".
-    """
-    region:      str = ""
-    deal_source: str = ""
-    fy:          str = ""
-    ai_for_x:    str = ""
-    industry:    str = ""
-    stage:       str = ""   # "5" | "10" | "20" | "" (all)
- 
-    def is_empty(self) -> bool:
-        """True when no filters are active — triggers global data fetch."""
-        return not any([
-            self.region, self.deal_source, self.fy,
-            self.ai_for_x, self.industry, self.stage,
-        ])
- 
-    def as_query_dict(self) -> dict:
-        """Pass directly to get_filtered_pipeline_metrics()."""
-        return {
-            "region":      self.region,
-            "deal_source": self.deal_source,
-            "fy":          self.fy,
-            "ai_for_x":    self.ai_for_x,
-            "industry":    self.industry,
-            "stage":       self.stage,
 
-        }
-        
-class ReportRequestWithSummary(BaseModel):
-    style:   Literal["executive", "analyst"] = "executive"
-    filters: Filters = Filters()
-    summary: str = ""
- 
-class SummaryRequest(BaseModel):
-    """
-    Request body for POST /summary.
- 
-    style   : "executive" → 4-section CRO view, 6-8 bullets, ~30s read
-              "analyst"   → 4-section diagnostic view, 10-15 bullets
-    filters : leave all fields empty for a global (unfiltered) view
-    """
-    style:   Literal["executive", "analyst"] = "executive"
-    filters: Filters = Filters()
- 
-# =============================================================================
-# 2. ClickHouse Data Fetching
-# =============================================================================
- 
-def fetch_pipeline_data(filters: Filters, ch_client) -> dict:
-    """
-    Single entry point for all data fetching.
- 
-    - No filters  →  get_all_pipeline_metrics()     (full business view)
-    - Any filter  →  get_filtered_pipeline_metrics() (slice-specific view)
- 
-    Both functions must return the same dict shape:
-        {
-          "funnel":            {...},
-          "period_attainment": {...},
-          "region_source":     [...],
-          "stage_velocity":    [...],
-          "deals_to_watch":    [...],
-          "quarterly_trend":   [...],
-          "industry_product":  [...],
-
-        }
-    """
+def _proxy_get(path: str) -> dict | list | None:
+    base_url = _base_url()
+    token    = _token()
+    if not base_url or not token:
+        return None
     try:
-        return get_filtered_pipeline_metrics(ch_client, filters.as_query_dict())
-    except Exception as exc:
-        raise RuntimeError(f"ClickHouse fetch failed: {exc}") from exc
- 
- 
-# =============================================================================
-# 3. Metric Extraction
-# =============================================================================
- 
-def _extract_computed_metrics(metrics: dict, filters: Filters) -> dict:
-    """
-    Compute ALL derived values (conversion rates, gaps, attainment %, text blocks)
-    in one place from the raw ClickHouse response.
- 
-    Both build_scorecards() and build_prompt() read exclusively from this dict —
-    there is a single source of truth and no risk of drift between scorecards
-    and the AI summary.
- 
-    Returns a flat dict with every value scorecards and prompts will need.
-    """
-    f   = metrics.get("funnel",            {}) or {}
-    fc = metrics.get("funnel_conversions", {}) or {}
-    p   = metrics.get("period_attainment", {}) or {}
-    rs  = metrics.get("region_source",     []) or []
-    sv  = metrics.get("stage_velocity",    []) or []
-    dw  = metrics.get("deals_to_watch",    []) or []
-    qt  = metrics.get("quarterly_trend",   []) or []
-    ip  = metrics.get("industry_product",  []) or []
-    wl = metrics.get("won_lost_deals", []) or []
+        r = httpx.get(f"{base_url}{path}", headers=_auth_headers(), timeout=20)
+        if r.status_code == 200:
+            return r.json()
+        print(f"   ⚠️  GET {path} → HTTP {r.status_code}: {r.text[:200]}")
+        return None
+    except Exception as e:
+        print(f"   ⚠️  GET {path} → {e}")
+        return None
 
-    won_deals  = [d for d in wl if d.get("deal_stage") in ("Closed Won", "90% - Deal Desk Review")]
-    lost_deals = [d for d in wl if d.get("deal_stage") in ("Prospect Disengaged", "Closed Lost",
-                                  "Didn't Qualify")]
 
-    def _fmt_notes(notes):
-        notes = str(notes or "").strip()
-        return notes[:150] + "…" if len(notes) > 150 else notes
+def discover_schema() -> str:
+    global _LIVE_SCHEMA, _SCHEMA_BLOCK
 
-    def _counter_top(items, n=3):
-        """Return top-n (value, count) pairs from a list, sorted by frequency desc."""
-        counts = defaultdict(int)
-        for v in items:
-            v = str(v or "").strip()
-            if v and v.lower() not in ("", "n/a", "none", "null"):
-                counts[v] += 1
-        return sorted(counts.items(), key=lambda x: -x[1])[:n]
+    print("🔎 Discovering schema from ClickHouse proxy…")
+    databases_raw = _proxy_get("/databases")
+    if not databases_raw:
+        msg = "⚠️  Could not fetch databases — check CLICKHOUSE_API_URL / CLICKHOUSE_API_TOKEN."
+        print(msg); _SCHEMA_BLOCK = msg; return msg
 
-    def _build_grouped_block(deals, outcome):
-        """
-        Group deals by (region, deal_source_rollup) and emit a structured block.
-        For each group: deal count, total $, top win/loss reasons, top 2-3 deals with details.
-        outcome: 'won' | 'lost'
-        """
-        # ── group deals ───────────────────────────────────────────────────────
-        groups = defaultdict(list)
-        for d in deals:
-            region = str(d.get("region", "Unknown") or "Unknown").strip()
-            source = str(d.get("deal_source_rollup", "Unknown") or "Unknown").strip()
-            groups[(region, source)].append(d)
+    if isinstance(databases_raw, list) and databases_raw:
+        if isinstance(databases_raw[0], str):
+            databases = databases_raw
+        elif isinstance(databases_raw[0], dict):
+            databases = [d.get("name") or d.get("database") or list(d.values())[0] for d in databases_raw]
+        else:
+            databases = [str(d) for d in databases_raw]
+    elif isinstance(databases_raw, dict):
+        databases = databases_raw.get("data") or databases_raw.get("databases") or list(databases_raw.values())[0] if databases_raw else []
+    else:
+        databases = []
 
-        # Sort groups: most deals first
-        sorted_groups = sorted(groups.items(), key=lambda x: -len(x[1]))
+    SKIP_DBS = {"system", "information_schema", "INFORMATION_SCHEMA"}
+    databases = [d for d in databases if d not in SKIP_DBS]
+    print(f"   Databases found: {databases}")
 
-        label = "WON" if outcome == "won" else "LOST"
-        block = f"{label} DEALS — BY REGION & SOURCE:\n"
+    schema_lines, schema_dict = [], {}
 
-        if not sorted_groups:
-            block += f"  No {outcome} deals found.\n"
-            return block
+    for db in databases:
+        tables_raw = _proxy_get(f"/tables/{db}")
+        if not tables_raw:
+            continue
+        if isinstance(tables_raw, list) and tables_raw:
+            tables = tables_raw if isinstance(tables_raw[0], str) else [t.get("name") or t.get("table") or list(t.values())[0] for t in tables_raw]
+        elif isinstance(tables_raw, dict):
+            tables = tables_raw.get("data") or tables_raw.get("tables") or list(tables_raw.values())[0] if tables_raw else []
+        else:
+            tables = []
 
-        for (region, source), grp in sorted_groups[:6]:   # cap at 6 groups
-            total_amt = sum(float(d.get("amount", 0) or 0) for d in grp)
-            count     = len(grp)
-
-            if outcome == "won":
-                reasons   = [str(d.get("primary_closed_won_reason_", "") or "").strip() for d in grp]
+        print(f"   {db}: tables = {tables}")
+        for tbl in tables:
+            schema_raw = _proxy_get(f"/schema/{db}/{tbl}")
+            if not schema_raw:
+                schema_lines.append(f"\nTABLE: {db}.{tbl}\n  (schema unavailable)")
+                continue
+            if isinstance(schema_raw, list):
+                cols = schema_raw
+            elif isinstance(schema_raw, dict):
+                cols = schema_raw.get("columns") or schema_raw.get("data") or schema_raw.get("schema") or [schema_raw]
             else:
-                reasons   = [str(d.get("primary_closed_lost_reason", "") or "").strip() for d in grp]
+                cols = []
 
-            competitors = [
-                str(d.get("competitors", "") or d.get("competition", "") or "").strip()
-                for d in grp
-            ]
-            ai_cats = [str(d.get("ai_for_x", "") or "").strip() for d in grp]
+            schema_dict[f"{db}.{tbl}"] = cols
+            col_lines = []
+            for col in cols:
+                if isinstance(col, dict):
+                    col_name = col.get("name") or col.get("column_name") or col.get("Field") or list(col.keys())[0]
+                    col_type = col.get("type") or col.get("data_type") or col.get("Type") or ""
+                    col_comment = col.get("comment") or col.get("Comment") or ""
+                    col_lines.append(f"  {col_name:<35} {col_type}" + (f"  — {col_comment}" if col_comment else ""))
+                else:
+                    col_lines.append(f"  {col}")
+            schema_lines.append(f"\nTABLE: {db}.{tbl}")
+            schema_lines.extend(col_lines)
 
-            top_reasons     = _counter_top(reasons,     3)
-            top_competitors = _counter_top(competitors, 2)
-            top_ai          = _counter_top(ai_cats,     2)
+    _LIVE_SCHEMA  = schema_dict
+    _SCHEMA_BLOCK = "\n".join(schema_lines) if schema_lines else "No tables found."
+    print(f"✅ Schema loaded: {list(schema_dict.keys())}")
+    return _SCHEMA_BLOCK
 
-            block += (
-                f"\n  ── {region} | {source} ──\n"
-                f"  Deals: {count} | Total: ${total_amt/1e6:.2f}M\n"
+
+# =============================================================================
+# System prompt
+# =============================================================================
+def _build_system_prompt() -> str:
+    compact_lines = []
+    for table_key, cols in _LIVE_SCHEMA.items():
+        col_parts = []
+        for col in cols:
+            if isinstance(col, dict):
+                name = col.get("name") or col.get("column_name") or col.get("Field") or list(col.keys())[0]
+                typ  = col.get("type") or col.get("data_type") or col.get("Type") or ""
+                col_parts.append(f"{name}:{typ}")
+            else:
+                col_parts.append(str(col))
+        compact_lines.append(f"{table_key}({', '.join(col_parts)})")
+
+    schema = "\n".join(compact_lines) or "Schema not yet loaded."
+    if len(schema) > 20000:
+        schema = schema[:20000] + "\n[schema truncated]"
+
+    return f"""
+You are DIUD (Decision Intelligence Using Data) — a conversational data assistant.
+
+=================================================================
+1. GREETING RULE — HIGHEST PRIORITY
+=================================================================
+If the user's message is ONLY a greeting (hi, hey, hello, good morning, etc.),
+respond with EXACTLY:
+"Hey, I'm DIUD, your data intelligence agent to help you analyse
+the live ClickHouse or Web data. How may I help you?"
+No bullet points, no extras. This overrides everything.
+
+=================================================================
+2. CLICKHOUSE DIRECT ACCESS
+=================================================================
+You have LIVE access to a ClickHouse database via the query_clickhouse tool.
+Use it for any question about pipeline deals, AEs, regions, industries,
+stages, win/loss, competitors, conversions, or any metric not already
+in the conversation context.
+
+If the tool returns DATABASE CONNECTION FAILED, relay it to the user.
+
+EXPORT INTENT RULE:
+When the user asks to export, download, or get a list/CSV/PDF of results
+from a PREVIOUS query (e.g. "give me those 256 deals", "export the list",
+"download this as CSV"), respond with this EXACT marker on a line by itself:
+
+__EXPORT_INTENT__
+
+Then on the next line write a friendly confirmation like:
+"Sure! I'm exporting all [N] deals from the previous query to your chosen format."
+Do NOT re-run the query. The export panel handles format selection.
+
+=================================================================
+3. TABLES — SCHEMA, PURPOSE, DEFINITIONS
+=================================================================
+DUPLICATE RECORD EXCLUSION — ALWAYS APPLY:
+1. hs_analytics tables: ALWAYS use FINAL keyword
+2. Aggregations: always countDistinct(), never count()
+3. Association tables: DISTINCT in subquery
+4. Targets table: always GROUP BY + SUM
+
+── TABLE 1: hs_analytics.deals ─────────────────────────────────
+PURPOSE: Core deals fact table. Always use FINAL.
+Key columns: deal_id, deal_name, deal_owner, deal_stage,
+deal_type, pipeline, amount, region, deal_source_rollup,
+kore_primary_industry, account_priority_level, create_date,
+close_date, became_5_deal_date, became_10_deal_date,
+became_20_deal_date, became_30_deal_date, became_40_deal_date,
+became_60_deal_date, became_75_deal_date
+
+── TABLE 2: hs_analytics.owners (FINAL) ─────────────────────────
+PURPOSE: AE/owner master data.
+Columns: id, firstName, lastName, email
+
+── TABLE 3: hs_analytics.companies (FINAL) ──────────────────────
+PURPOSE: Company/account master data.
+Columns: company_id, name, domain, industry, country, city
+
+── TABLE 4: hs_analytics.contacts (FINAL) ───────────────────────
+PURPOSE: Contact/lead master data.
+Columns: contact_id, email, first_name, last_name, company_name,
+company_priority, region, original_source, lead_status,
+lifecycle_stage,
+date_entered_marketing_qualified_lead_lifecycle_stage_pipeline
+
+── TABLE 5: kore_ai_hubspot.gs_DealContactAssociation ───────────
+PURPOSE: Many-to-many link between contacts and deals.
+Columns: contact_id, deal_id
+
+── TABLE 6: kore_ai_hubspot.gs_marketing_targets ────────────────
+PURPOSE: Marketing MQL and pipeline targets by source.
+Columns: fy, quarter, month, region, original_source, mql_target
+
+── TABLE 7: kore_ai_hubspot.gs_deal_ids_hs ──────────────────────
+PURPOSE: Allowlist of valid deal IDs — used in mandatory base filter.
+Columns: deal_id_hs
+
+MANDATORY BASE FILTERS (apply to every deals query):
+WHERE pipeline = 'default'
+AND CASE WHEN deal_type IS NULL THEN 'Not Assigned' ELSE deal_type END
+    NOT IN ('Partner-Led SMB')
+AND toInt64(deal_id) IN (
+    SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs
+)
+
+=================================================================
+4. TARGET TABLES — SCHEMA, PURPOSE, DEFINITIONS
+=================================================================
+
+TARGET TIER DEFAULT RULE — CRITICAL:
+Three tiers: L2 (base/default), L1 (stretch), Committed.
+DEFAULT: Always use L2 targets unless user explicitly says "L1",
+"stretch", or "committed". Never mix tiers in one query unless asked.
+
+COLUMN NAMING CONVENTION:
+  • L2 (DEFAULT) → no prefix:         amount_target_20, deals_target_20
+  • L1           → l1_ prefix:        l1_amount_target_20, l1_deals_target_20
+  • Committed    → committed_ prefix: committed_amount_target_20
+
+NULLABLE STRING CASTING — MANDATORY:
+All target table columns are Nullable(String) in ClickHouse.
+ALWAYS cast before any math: toFloat64OrZero(col_name)
+Example: SUM(toFloat64OrZero(amount_target_20))
+Never use a target column raw in SUM/AVG/comparison — it will error.
+
+─────────────────────────────────────────────────────────────────
+TABLE T1: kore_ai_hubspot.gs_pipeline_quotas_v1
+PURPOSE : Org-wide pipeline targets by region, source, funnel stage.
+USE FOR : Pipeline attainment, EOP tracking, coverage ratio, gap-to-target.
+─────────────────────────────────────────────────────────────────
+COLUMNS (all Nullable(String) except id):
+  id, fy, quarter, month, monthly_share, quarterly_share
+  region, regional_share, source, source_share
+
+  ── L2 targets (DEFAULT) ──
+  amount_target_20, deals_target_20
+  amount_target_10, deals_target_10
+  amount_target_5,  deals_target_5
+
+  ── L1 targets (only if user says "L1" / "stretch") ──
+  amount_target_20_l1, deals_target_20_l1
+  amount_target_10_l1, deals_target_10_l1
+  amount_target_5_l1,  deals_target_5_l1
+
+  ── Committed targets (only if user says "committed") ──
+  amount_target_20_committed, deals_target_20_committed
+  amount_target_10_committed, deals_target_10_committed
+  amount_target_5_committed,  deals_target_5_committed
+
+─────────────────────────────────────────────────────────────────
+TABLE T2: kore_ai_hubspot.gs_partner_targets_region_wise
+PURPOSE : Region-level partner pipeline targets by partner type.
+USE FOR : Partner pipeline attainment by region, hyperscaler splits.
+─────────────────────────────────────────────────────────────────
+COLUMNS (all Nullable(String) except id):
+  id, fy, quarter, month, region, regional_split
+  partner_team, partner_team_type, hyperscaler_type, amount_pk
+
+  ── L2 targets (DEFAULT) ──
+  l2_amount_target_20, l2_deals_target_20
+  l2_amount_target_10, l2_deals_target_10
+  l2_amount_target_5,  l2_deals_target_5
+
+  ── L1 targets ──
+  l1_amount_target_20, l1_deals_target_20
+  l1_amount_target_10, l1_deals_target_10
+  l1_amount_target_5,  l1_deals_target_5
+
+  ── Committed targets ──
+  committed_amount_target_20, committed_deals_target_20
+  committed_deals_target_10,  committed_deals_target_5
+
+  ── Hyperscaler C1 targets ──
+  msft_c1_targets_20, msft_c1_amount_target_20, msft_c1_targets_10, msft_c1_targets_5
+  aws_c1_targets_20,  aws_c1_amount_target_20,  aws_c1_targets_10,  aws_c1_targets_5
+
+NOTE: committed_amount_target_10 and committed_amount_target_5 are NOT
+      present in this table — do not query them here.
+
+─────────────────────────────────────────────────────────────────
+TABLE T3: kore_ai_hubspot.gs_partner_targets_psd
+PURPOSE : PSD (Partner Sales Director) level partner targets.
+USE FOR : PSD quota attainment, individual PSD performance.
+─────────────────────────────────────────────────────────────────
+COLUMNS (all Nullable(String) except id):
+  id, fy, quarter, month, region, partner_team
+  psd, hyperscaler_type, amount_primary_key
+
+  ── Committed targets ONLY (no L1/L2 columns in this table) ──
+  committed_amount_target_20, committed_amount_target_10, committed_amount_target_5
+  committed_deals_target_20,  committed_deals_target_10,  committed_deals_target_5
+
+IMPORTANT: For L1/L2 PSD-level targets use gs_partner_targets_region_wise
+filtered by partner_team or region instead.
+
+─────────────────────────────────────────────────────────────────
+TABLE T4: kore_ai_hubspot.gs_marketing_targets
+PURPOSE : Marketing MQL and pipeline targets by source.
+USE FOR : MQL attainment, marketing-sourced pipeline vs target.
+─────────────────────────────────────────────────────────────────
+COLUMNS (all Nullable(String) except id):
+  id, fy, quarter, month, monthly_share, quarterly_share
+  region, regional_share, original_source, source_share
+
+  ── L2 targets (DEFAULT) ──
+  amount_target_20, deals_target_20
+  amount_target_10, deals_target_10
+  amount_target_5,  deals_target_5
+  mql_target
+
+  ── L1 targets ──
+  l1_mql_target, l1_deals_target_20, l1_deals_target_10, l1_deals_target_5
+
+NOTE: No Committed tier and no L1 Amount columns in this table.
+      For MQL actuals JOIN to hs_analytics.contacts FINAL on
+      region + original_source + toYYYYMM(date_entered_...) = month.
+      Always GROUP BY region, original_source + SUM(toFloat64OrZero(mql_target)).
+
+─────────────────────────────────────────────────────────────────
+TABLE T5: kore_ai_hubspot.gs_closed_won_quotas
+PURPOSE : Closed Won revenue quotas by AE.
+USE FOR : CW attainment %, AE-level quota tracking, forecast vs actual.
+─────────────────────────────────────────────────────────────────
+COLUMNS (all Nullable(String) except id):
+  fy, quarter, month, region
+  ae                         — AE name; JOIN to hs_analytics.deals.deal_owner
+  role, manager
+  assigned_amount_quota      — quarterly CW $ quota
+  assigned_deals_quota       — quarterly CW deal count quota
+  annualized_amount_quota    — annualized CW $ quota
+  annualized_deals_quota     — annualized deal count quota
+
+NOTE: Single quota tier only — no L1/L2/Committed split.
+      Always cast: toFloat64OrZero(assigned_amount_quota)
+
+=================================================================
+5. TARGETS SQL RULES (apply to ALL target tables)
+=================================================================
+1.  DEFAULT TIER = L2 (no-prefix columns). Switch only on explicit user request.
+
+2.  CAST ALL NUMERIC COLUMNS — every target column is Nullable(String):
+      SUM(toFloat64OrZero(amount_target_20))       -- T1 L2
+      SUM(toFloat64OrZero(l2_amount_target_20))    -- T2/T3 L2
+    Never use raw column in arithmetic — silent null or type error.
+
+3.  NO FAN-OUT JOINS: never join raw deal rows to a target table then SUM.
+    One quota row × N matching deals = quota multiplied N times.
+
+4.  CORRECT PATTERN — independent CTEs, combine at the end:
+
+    WITH actual AS (
+      SELECT region,
+             round(SUM(amount)/1e6, 1) AS achieved_m
+      FROM hs_analytics.deals FINAL
+      WHERE <base filters + date range>
+      GROUP BY region
+    ),
+    target AS (
+      SELECT region,
+             round(SUM(toFloat64OrZero(amount_target_20))/1e6, 1) AS target_m
+      FROM kore_ai_hubspot.gs_pipeline_quotas_v1
+      WHERE fy = 'FY27' AND quarter = 'Q1'
+      GROUP BY region
+    )
+    SELECT
+      a.region,
+      a.achieved_m,
+      t.target_m,
+      round(a.achieved_m / nullIf(t.target_m, 0) * 100, 1) AS attainment_pct
+    FROM actual a
+    LEFT JOIN target t USING (region)
+
+5.  Use nullIf(target, 0) in division to avoid divide-by-zero errors.
+
+6.  Match period grain: if actuals are for Q1 FY27, filter target table
+    to fy = 'FY27' AND quarter = 'Q1'.
+
+7.  ATTAINMENT = round(actual / nullIf(target, 0) * 100, 1)
+    COVERAGE   = round(pipeline / nullIf(revenue_target, 0), 1)
+
+8.  For partner tables: filter partner_team_type to isolate
+    'Hyperscaler' vs 'GSI/SI' vs 'Reseller/BPO/TSD' as needed.
+
+9.  gs_partner_targets_psd has ONLY Committed columns — for L2 PSD
+    performance use gs_partner_targets_region_wise.
+
+=================================================================
+6. DASHBOARD DEFINITIONS
+=================================================================
+When a user asks about a specific dashboard, apply the correct logic below.
+If unclear, ask the user which dashboard context they want.
+
+── DASHBOARD 1: EOP (End-of-Period) DASHBOARD ──────────────────
+PURPOSE: Tracks pipeline health and attainment against EOP targets
+at the end of each fiscal quarter.
+
+KEY METRICS:
+  • EOP Pipeline Value — total amount of active deals within EOP date window
+  • EOP Target — from kore_ai_hubspot.gs_pipeline_quotas_v1
+  • EOP Attainment % — EOP Pipeline ÷ EOP Target × 100
+  • Stage-wise EOP breakdown — pipeline bucketed by deal_stage
+  • Region-wise EOP — pipeline grouped by region
+
+FILTERS: Mandatory base filters + close_date within current quarter end
+window + deal_stage IN active stages (20%–75%) + pipeline = 'default'
+
+TYPICAL QUERIES: "EOP pipeline vs target for Q2 FY27", "EOP attainment
+by region", "Gap to EOP target this quarter"
+
+── DASHBOARD 2: EXEC KPI DASHBOARD ─────────────────────────────
+PURPOSE: Senior leadership view of pipeline performance, win rates,
+and revenue attainment across all regions.
+
+KEY METRICS:
+  • Total Active Pipeline ($M) — sum(amount) on active deals
+  • Closed Won ($M) — sum(amount) where deal_stage = 'Closed Won'
+  • Closed Won Attainment % — Closed Won ÷ gs_closed_won_quotas × 100
+  • Win Rate % — Closed Won ÷ (Closed Won + Closed Lost) × 100
+  • Pipeline Coverage — Active Pipeline ÷ Revenue Target
+  • New Logo Count — countDistinct(deal_id) where deal_type = 'New Logo'
+  • ACV Weighted Pipeline — (stage_probability × amount) summed
+
+FILTERS: Mandatory base filters + FY27 date range on close_date +
+exclude deal_stage IN ('Closed Won','Closed Lost') for active pipeline
+
+TYPICAL QUERIES: "Executive KPI summary for FY27", "Closed Won
+attainment vs quota by region", "Win rate trend by quarter"
+
+── DASHBOARD 3: CS (Customer Success) DASHBOARD ────────────────
+PURPOSE: Tracks existing customer pipeline — renewals, upsells,
+expansions — and CS team performance.
+
+KEY METRICS:
+  • Renewal Pipeline ($M) — deals where deal_type LIKE '%Renewal%'
+  • Upsell / Expansion Pipeline ($M) — deal_type LIKE '%Upsell%' or LIKE '%Expansion%'
+  • Renewal Win Rate % — Closed Won renewals ÷ total renewals × 100
+  • Net Revenue Retention (NRR) — (Renewals + Upsells) ÷ Base ARR
+  • At-Risk Deals — active deals with stale last_contacted date
+  • CS AE Performance — pipeline/closed won by owner filtered to CS team
+
+FILTERS: Mandatory base filters + deal_type IN ('Renewal','Upsell','Expansion') + FY27
+
+TYPICAL QUERIES: "CS renewal pipeline for FY27", "Upsell attainment
+by AE", "At-risk renewals this quarter"
+
+── DASHBOARD 4: GLOBAL PIPELINE GOVERNANCE DASHBOARD ───────────
+PURPOSE: Executive governance view comparing pipeline across all
+regions, sources, and partner types against global targets.
+
+KEY METRICS:
+  • Global Pipeline by Region ($M) — broken down by region + stage
+  • Partner Pipeline ($M) — deals from partner sources (deal_source_rollup LIKE '%Partner%')
+  • Partner Attainment % — vs gs_partner_targets_region_wise
+  • Partner PSD Attainment % — vs gs_partner_targets_psd
+  • Pipeline Coverage Ratio — by region vs gs_pipeline_quotas_v1
+  • Closed Won Governance — actual vs gs_closed_won_quotas by region/quarter
+  • Marketing Sourced Pipeline — deals from marketing sources vs gs_marketing_targets
+
+FILTERS: Mandatory base filters + FY27 date range + appropriate partner
+source filters for partner metrics
+
+TYPICAL QUERIES: "Global pipeline governance report for FY27",
+"Partner pipeline attainment by region", "Closed Won vs quota by quarter"
+
+=================================================================
+7. CORE BUSINESS RULES
+=================================================================
+
+── FISCAL YEAR ──────────────────────────────────────────────────
+FY27 = Apr 2026 – Mar 2027. Default to FY27 unless user specifies.
+  Q1: Apr–Jun 2026  |  Q2: Jul–Sep 2026
+  Q3: Oct–Dec 2026  |  Q4: Jan–Mar 2027
+
+FY calculation: if month >= 4, FY = year + 1, else FY = year.
+Example: Oct 2026 → FY27. Jan 2027 → FY27. Apr 2027 → FY28.
+
+── REGION MAPPING (display only — use in SELECT, not WHERE) ──────
+  japac        → JAPAC
+  Africa       → Middle East
+  india___sea  → ISEA
+
+── SOURCE MAPPING (display only) ────────────────────────────────
+  Executive Outreach + Investor → Executive Outreach
+  BDR Outbound                  → BDR
+  Partner                       → Partner - Non Hyperscaler
+
+── INDUSTRY MAPPING (display only) ──────────────────────────────
+  Financial Services + Banking + Insurance        → Financial Services
+  Manufacturing Discreet + Manufacturing Process + CPG → Manufacturing
+
+── ACTIVE PIPELINE DEFINITION ───────────────────────────────────
+A deal is ACTIVE pipeline when ALL of the following are true:
+  1. deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
+                    '60% - Price Negotiation','75% - Contract Review')
+  2. close_date >= '2026-04-01' AND close_date <= '2027-03-31' (FY27)
+  3. All mandatory base filters applied
+
+Only apply deal_stage filter for active pipeline IF the user explicitly
+asks for "active" pipeline. Do not assume active unless stated.
+
+── REGISTERED DEALS (REG DEALS) DEFINITION ──────────────────────
+For registered/created deals filtered to a specific funnel stage,
+the entry date is the became_[stage]_deal_date for that stage,
+NOT the deal create_date.
+
+Example: "Deals that became 20% in Q1 FY27"
+  → Filter on became_20_deal_date between '2026-04-01' and '2026-06-30'
+  → Also apply deal_stage filter for that stage if user asks for active
+
+Stage-to-column mapping:
+  5%  → became_5_deal_date
+  10% → became_10_deal_date
+  20% → became_20_deal_date
+  30% → became_30_deal_date
+  40% → became_40_deal_date
+  60% → became_60_deal_date
+  75% → became_75_deal_date
+
+── QUERY RULES ───────────────────────────────────────────────────
+1.  SELECT / WITH only — no destructive SQL ever.
+2.  FINAL on all hs_analytics tables.
+3.  Apply all 3 mandatory base filters on every deals query.
+4.  For LIST queries: NO LIMIT unless user says "top N" or "first N".
+    Return ALL matching rows — the system handles display safely.
+5.  countDistinct(deal_id) for unique deal counts, never count().
+6.  round(sum(amount)/1e6, 1) for $M amounts.
+7.  Dates: toDate(LEFT(coalesce(col,'1900-01-01'),10))
+8.  Always tell the user the TOTAL row count (e.g. "Found 256 deals").
+9.  NEVER use numbers from memory or cache. Every metric must be
+    queried live from the database. Never state a count, amount,
+    or percentage without running a query first.
+
+── RESPONSE FORMAT ───────────────────────────────────────────────
+Answer in clean markdown. Use tables for data. Bold key numbers.
+Never fabricate numbers. Never run destructive SQL.
+
+FILTER CONFIRMATION RULE — MANDATORY
+
+After every database-backed answer, ALWAYS append the following section:
+
+---
+Filters Applied:
+- <list all detected filters>
+
+Please verify these filters are correct.
+Would you like any changes to the filters before I continue the analysis?
+---
+
+Examples:
+
+Filters Applied:
+- FY27
+- Region: North America
+- Stage: 20% Deals
+- Deal Source: Partner
+
+Please verify these filters are correct.
+Would you like any changes to the filters before I continue the analysis?
+
+=================================================================
+8. SAMPLE QUESTIONS & QUERY GUIDANCE FOR DIUD
+=================================================================
+The following examples show what the user might ask and what filters
+or logic DIUD must apply. Use these to calibrate interpretation.
+
+ACTIVE PIPELINE:
+  Q: "What is our active pipeline for FY27?"
+  → deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
+    '60% - Price Negotiation','75% - Contract Review')
+    AND close_date BETWEEN '2026-04-01' AND '2027-03-31'
+    + mandatory base filters
+
+  Q: "Show me active pipeline by region"
+  → Same as above, GROUP BY region
+
+REG / COHORT DEALS:
+  Q: "How many deals became 20% in Q1 FY27?"
+  → Filter on became_20_deal_date BETWEEN '2026-04-01' AND '2026-06-30'
+    Do NOT use close_date. Do NOT apply deal_stage filter unless user
+    also says "active".
+
+  Q: "Show me deals that entered 40% stage this quarter"
+  → Filter on became_40_deal_date in current quarter range
+
+CLOSED WON:
+  Q: "What is our Closed Won for FY27 by AE?"
+  → deal_stage = 'Closed Won'
+    AND close_date BETWEEN '2026-04-01' AND '2027-03-31'
+    GROUP BY deal_owner
+    + mandatory base filters
+
+TARGETS & ATTAINMENT:
+  Q: "Pipeline attainment vs target by region for Q1 FY27?"
+  → Use CTE pattern: actual CTE from deals, target CTE from
+    gs_pipeline_quotas_v1 WHERE fy='FY27' AND quarter='Q1',
+    JOIN on fy, quarter, month, deal source, region, compute attainment %
+
+  Q: "Partner pipeline vs target?"
+  → Actual from deals WHERE deal_source_rollup LIKE '%Partner%'
+    Target from gs_partner_targets_region_wise
+
+  Q: "AE quota attainment?"
+  → Actual Closed Won from deals, quota from gs_closed_won_quotas
+    JOIN on deal_owner = ae
+
+MQL / MARKETING:
+  Q: "MQL actuals vs target by source?"
+  → Actuals from hs_analytics.contacts FINAL, counting on
+    date_entered_marketing_qualified_lead_lifecycle_stage_pipeline
+    Targets from gs_marketing_targets
+    JOIN on region + original_source + month
+
+INDUSTRY / REGION DISPLAY:
+  Q: "Pipeline by industry?"
+  → Use kore_primary_industry column, apply industry mapping in
+    SELECT (CASE WHEN) for display grouping, not in WHERE
+
+NEW LOGO vs RENEWAL:
+  Q: "New logo pipeline this FY?"
+  → deal_type = 'New Logo' + active pipeline filters
+
+  Q: "Renewal pipeline at risk?"
+  → deal_type LIKE '%Renewal%' + active pipeline filters
+  
+=================================================================
+9. VISUAL / CHART GENERATION RULES
+=================================================================
+When producing a chart or visual summary, output it as an HTML
+block inside a fenced code block tagged as "html". Do NOT use
+ASCII art, monospace characters, repeated box symbols, or emoji
+(🏆🔴🟡) as data indicators. Use real CSS colored elements.
+
+BAR CHART — use this exact structure, fill in values:
+```html
+<div style="background:#0D1B3E;border-radius:12px;padding:20px 24px;
+            font-family:Inter,system-ui,sans-serif;color:white;max-width:560px;">
+  <div style="font-size:11px;font-weight:600;letter-spacing:.8px;
+              text-transform:uppercase;color:#546E7A;margin-bottom:16px;">
+    CHART TITLE
+  </div>
+
+  <!-- Repeat this block for each row: -->
+  <div style="margin-bottom:14px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+      <span style="font-size:12.5px;color:#B0BEC5;">ROW LABEL</span>
+      <span style="font-size:13px;font-weight:600;color:white;">VALUE</span>
+    </div>
+    <div style="height:8px;background:rgba(255,255,255,.08);border-radius:4px;overflow:hidden;">
+      <div style="height:100%;width:PCT%;background:linear-gradient(90deg,#1565C0,#1E88E5);
+                  border-radius:4px;"></div>
+    </div>
+  </div>
+
+  <div style="margin-top:16px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08);
+              font-size:10.5px;color:#546E7A;">
+    SOURCE / FILTER CONTEXT
+  </div>
+</div>
+```
+
+KPI CARDS — use for metric summaries (3-4 numbers side by side):
+```html
+<div style="display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;">
+  <div style="background:#0D1B3E;border-radius:10px;padding:16px 20px;
+              min-width:130px;flex:1;border:1px solid rgba(255,255,255,.07);">
+    <div style="font-size:10px;font-weight:600;text-transform:uppercase;
+                letter-spacing:.6px;color:#546E7A;margin-bottom:6px;">METRIC</div>
+    <div style="font-size:22px;font-weight:700;color:white;">VALUE</div>
+    <div style="font-size:11px;color:#4CAF50;margin-top:4px;">▲ CHANGE</div>
+  </div>
+</div>
+```
+
+RULES:
+1. PCT = round((row_value / max_row_value) * 100, 1). Always compute this.
+2. Attainment bar color: ≥100% use #4CAF50 (green), 75-99% use #FFA726 (amber),
+   <75% use #EF5350 (red). Change the background gradient on the inner div.
+3. Positive delta text: color #4CAF50. Negative: color #EF5350.
+4. Every chart must have a title (top) and a source/filter line (bottom).
+5. Never output trophy or circle emojis as performance signals.
+
+"""
+
+_SYSTEM_PROMPT = _build_system_prompt()
+
+# =============================================================================
+# ClickHouse query runner — stores full result in session, returns display text
+# =============================================================================
+def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
+    """
+    Execute SQL against ClickHouse.
+    - Stores the FULL result set in _SESSION_STORE[session_id] (no row cap).
+    - Returns a chat-display string capped at CHAT_DISPLAY_LIMIT rows.
+    The export layer reads from the session store and gets all rows.
+    """
+    base_url = _base_url()
+    token    = _token()
+
+    if not base_url:
+        return "DATABASE CONNECTION FAILED: CLICKHOUSE_API_URL is not set."
+    if not token:
+        return "DATABASE CONNECTION FAILED: CLICKHOUSE_API_TOKEN is not set."
+
+    stripped = sql.strip().upper()
+    if not (stripped.startswith("SELECT") or stripped.startswith("WITH")):
+        return "ERROR: Only SELECT/WITH queries are permitted."
+    for kw in FORBIDDEN_KEYWORDS:
+        if re.search(rf'\b{kw}\b', stripped):
+            return f"ERROR: Forbidden keyword: {kw}"
+
+    print(f"🔍 SQL (session={session_id}) → {sql[:200]}")
+
+    try:
+        resp = httpx.post(
+            f"{base_url}/query",
+            headers=_auth_headers(),
+            json={"query": sql},
+            timeout=60,
+        )
+
+        if resp.status_code == 401:
+            return "DATABASE CONNECTION FAILED: 401 Unauthorized."
+        if resp.status_code == 403:
+            return "DATABASE CONNECTION FAILED: 403 Forbidden."
+        if resp.status_code == 422:
+            return f"ERROR: Proxy rejected query (422): {resp.text[:400]}"
+        if resp.status_code == 500:
+            return f"DATABASE ERROR: HTTP 500: {resp.text[:400]}"
+        if resp.status_code != 200:
+            return f"DATABASE ERROR: HTTP {resp.status_code} — {resp.text[:300]}"
+
+        payload = resp.json()
+
+        # Normalise to list of rows
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict):
+            rows = payload.get("data") or payload.get("rows") or payload.get("result") or payload.get("results")
+            api_columns = payload.get("columns") or payload.get("meta") or payload.get("column_names")
+            if rows is None:
+                return json.dumps(payload, indent=2, default=str)[:3000]
+        else:
+            return f"Unexpected response type: {type(payload)}"
+
+        if not rows:
+            return "Query returned 0 rows."
+
+        # Normalise rows to list-of-dicts
+        if isinstance(rows[0], dict):
+            columns = list(rows[0].keys())
+            norm_rows = rows
+        else:
+            # List-of-lists — use index keys
+            if api_columns and len(api_columns) == len(rows[0]):
+                columns = [c["name"] if isinstance(c, dict) else c for c in api_columns]
+            else:
+                columns = [f"col_{i}" for i in range(len(rows[0]))]
+            norm_rows = [dict(zip(columns, r)) for r in rows]
+
+        total_rows = len(norm_rows)
+
+        # ── Store FULL result in session (no row cap) ──────────────────
+        if session_id:
+            _store_result(session_id, QueryResult(
+                sql          = sql,
+                columns      = columns,
+                rows         = norm_rows,   # ALL rows
+                total_rows   = total_rows,
+                captured_at  = datetime.utcnow().isoformat() + "Z",
+                filters_applied = _extract_filters_from_sql(sql),
+            ))
+
+        # ── Build chat display (capped at 100 rows for readability) ───
+        CHAT_DISPLAY_LIMIT = 100
+        header = " | ".join(columns)
+        lines  = [header, "-" * min(len(header), 140)]
+        for row in norm_rows[:CHAT_DISPLAY_LIMIT]:
+            lines.append(" | ".join(str(row.get(c, "")) for c in columns))
+
+        if total_rows > CHAT_DISPLAY_LIMIT:
+            lines.append(
+                f"\n📊 **Showing {CHAT_DISPLAY_LIMIT} of {total_rows} rows.** "
+                f"Say **\"export these deals as CSV\"** or **\"export as PDF\"** "
+                f"to download all {total_rows} records."
             )
 
-            if top_reasons:
-                reason_strs = ", ".join(f'"{r}" (x{c})' for r, c in top_reasons)
-                key = "Win Reasons" if outcome == "won" else "Loss Reasons"
-                block += f"  {key}: {reason_strs}\n"
-
-            if top_competitors:
-                comp_strs = ", ".join(f'"{c}" (x{n})' for c, n in top_competitors)
-                block += f"  Competitors: {comp_strs}\n"
-
-            if top_ai:
-                ai_strs = ", ".join(f'"{a}" (x{n})' for a, n in top_ai)
-                block += f"  AI Categories: {ai_strs}\n"
-
-            # Top 2–3 representative deals
-            top_deals = sorted(grp, key=lambda d: -float(d.get("amount", 0) or 0))[:3]
-            for d in top_deals:
-                amt         = float(d.get("amount", 0) or 0)
-                notes       = _fmt_notes(d.get("won_loss_notes", ""))
-                exit_stage  = str(d.get("deal_stage", "N/A") or "N/A").strip()
-                close_date  = str(d.get("close_date", "") or "")[:10]
-                if outcome == "won":
-                    reason  = str(d.get("primary_closed_won_reason_", "") or "N/A").strip()
-                    block += (
-                        f"    • {d.get('deal_name','N/A')} | ${amt/1e6:.2f}M | "
-                        f"AI:{d.get('ai_for_x','N/A')} | Close:{close_date} | "
-                        f"Reason:{reason or 'N/A'} | Notes:{notes or 'N/A'}\n"
-                    )
-                else:
-                    reason  = str(d.get("primary_closed_lost_reason", "") or "N/A").strip()
-                    comp    = str(d.get("competitors", "") or d.get("competition", "") or "N/A").strip()
-                    block += (
-                        f"    • {d.get('deal_name','N/A')} | ${amt/1e6:.2f}M | "
-                        f"ExitStage:{exit_stage} | AI:{d.get('ai_for_x','N/A')} | "
-                        f"Reason:{reason or 'N/A'} | Competitor:{comp} | Notes:{notes or 'N/A'}\n"
-                    )
-
-        return block
-
-    won_deals_block  = _build_grouped_block(won_deals,  "won")
-    lost_deals_block = _build_grouped_block(lost_deals, "lost")
-
-    print("=== WON/LOST BLOCK ===")
-    print(won_deals_block)
-    print(lost_deals_block)
-    print("=== END ===")
- 
-    # ── Funnel counts & pipeline amounts ─────────────────────────────────────
-    cnt_5   = int(f.get("cnt_5pct",       0) or 0)
-    cnt_10  = int(f.get("cnt_10pct",      0) or 0)
-    cnt_20  = int(f.get("cnt_20pct",      0) or 0)
-    cnt_won = int(f.get("cnt_closed_won", 0) or 0)
-    cnt_out = int(f.get("cnt_fallen_out", 0) or 0)
-    amt_5   = float(f.get("amt_5pct",     0) or 0)
-    amt_10  = float(f.get("amt_10pct",    0) or 0)
-    amt_20  = float(f.get("amt_20pct",    0) or 0)
- 
-    # ── Conversion rates (pre-calculated; LLM must use these, not recompute) ─
-    base_5        = int(fc.get("base_5",         0) or 0)
-    conv_5_to_10  = int(fc.get("conv_5_to_10",   0) or 0)
-    conv_5_to_20  = int(fc.get("conv_5_to_20",   0) or 0)
-    conv_5_to_won = int(fc.get("conv_5_to_won",  0) or 0)
-    base_10       = int(fc.get("base_10",        0) or 0)
-    conv_10_to_20 = int(fc.get("conv_10_to_20",  0) or 0)
-    conv_10_to_won= int(fc.get("conv_10_to_won", 0) or 0)
-    base_20       = int(fc.get("base_20",        0) or 0)
-    conv_20_to_won= int(fc.get("conv_20_to_won", 0) or 0)
-
-    conv_5_10   = round(conv_5_to_10  / base_5  * 100, 1) if base_5  > 0 else 0.0
-    conv_10_20  = round(conv_10_to_20 / base_10 * 100, 1) if base_10 > 0 else 0.0
-    win_rate    = round(conv_20_to_won / base_20 * 100, 1) if base_20 > 0 else 0.0
-    overall_eff = round(conv_5_to_won  / base_5  * 100, 1) if base_5  > 0 else 0.0
- 
-    # ── Attainment vs L1 target ───────────────────────────────────────────────
-    pct_5  = float(p.get("pct_l1_ytd_5",  0) or 0)
-    pct_10 = float(p.get("pct_l1_ytd_10", 0) or 0)
-    pct_20 = float(p.get("pct_l1_ytd_20", 0) or 0)
- 
-    actual_5  = int(p.get("ytd_5",  0) or 0)
-    actual_10 = int(p.get("ytd_10", 0) or 0)
-    actual_20 = int(p.get("ytd_20", 0) or 0)
- 
-    l1_5  = float(p.get("l1_ytd_5",  0) or 0)
-    l1_10 = float(p.get("l1_ytd_10", 0) or 0)
-    l1_20 = float(p.get("l1_ytd_20", 0) or 0)
- 
-    # None (not "N/A") so JSON serialises cleanly to null
-    gap_5  = max(0, round(l1_5  - actual_5))  if l1_5  > 0 else None
-    gap_10 = max(0, round(l1_10 - actual_10)) if l1_10 > 0 else None
-    gap_20 = max(0, round(l1_20 - actual_20)) if l1_20 > 0 else None
- 
-    mtd_5  = int(p.get("mtd_5",  0) or 0)
-    mtd_10 = int(p.get("mtd_10", 0) or 0)
-    mtd_20 = int(p.get("mtd_20", 0) or 0)
-    qtd_5  = int(p.get("qtd_5",  0) or 0)
-    qtd_10 = int(p.get("qtd_10", 0) or 0)
-    qtd_20 = int(p.get("qtd_20", 0) or 0)
- 
-    # ── Stage velocity & health ───────────────────────────────────────────────
-    stage_filter_map   = {"5": "5%", "10": "10%", "20": "20%"}
-    active_stage_label = stage_filter_map.get(filters.stage, "")
- 
-    total_red = total_yellow = total_green = 0
-    velocity_lines = ""
- 
-    for s in sv:
-        stage_label = s.get("deal_stage", "N/A") or "N/A"
-        if active_stage_label and active_stage_label not in stage_label:
-            continue
-        bench  = s.get("avg_days_benchmark", 0) or 0
-        actual = s.get("avg_days_actual",    0) or 0
-        green  = int(s.get("green_deals",    0) or 0)
-        yellow = int(s.get("yellow_deals",   0) or 0)
-        red    = int(s.get("red_deals",      0) or 0)
-        total  = green + yellow + red
-        red_pct = round(red / total * 100, 1) if total > 0 else 0
-        over    = round((actual - bench) / bench * 100, 1) if bench > 0 else 0
-        total_red    += red
-        total_yellow += yellow
-        total_green  += green
-        velocity_lines += (
-            f"  {stage_label}: total={total} | "
-            f"benchmark={bench}d actual={actual}d (+{over}% over) | "
-            f"Green={green} Yellow={yellow} Red={red}({red_pct}%)\n"
-        )
- 
-    total_active = total_red + total_yellow + total_green
-    pct_red = round(total_red / total_active * 100, 1) if total_active > 0 else 0
- 
-    # ── Region & Source aggregation ───────────────────────────────────────────
-    region_5  = defaultdict(int);   region_10 = defaultdict(int);  region_20 = defaultdict(int)
-    source_5  = defaultdict(int);   source_10 = defaultdict(int);  source_20 = defaultdict(int)
-    r_l1_5    = defaultdict(float); r_l1_10   = defaultdict(float); r_l1_20  = defaultdict(float)
- 
-    for r in rs:
-        reg = r.get("region",             "Unknown") or "Unknown"
-        src = r.get("deal_source_rollup", "Unknown") or "Unknown"
-        region_5[reg]  += int(r.get("deals_5",  0) or 0)
-        region_10[reg] += int(r.get("deals_10", 0) or 0)
-        region_20[reg] += int(r.get("deals_20", 0) or 0)
-        source_5[src]  += int(r.get("deals_5",  0) or 0)
-        source_10[src] += int(r.get("deals_10", 0) or 0)
-        source_20[src] += int(r.get("deals_20", 0) or 0)
-        r_l1_5[reg]    += float(r.get("l1_5",  0) or 0)
-        r_l1_10[reg]   += float(r.get("l1_10", 0) or 0)
-        r_l1_20[reg]   += float(r.get("l1_20", 0) or 0)
- 
-    # Backfill unattributed so totals always reconcile
-    for total_cnt, bucket in [(cnt_5, region_5), (cnt_10, region_10), (cnt_20, region_20)]:
-        gap = total_cnt - sum(bucket.values())
-        if gap > 0:
-            bucket["Unattributed"] = gap
- 
-    available_regions = sorted([
-        reg for reg in region_5
-        if reg not in ("Unknown", "Unattributed", "N/A", "")
-    ])
- 
-    # ── Region block (prompt-ready text) ─────────────────────────────────────
-    region_block = "DEALS & ATTAINMENT BY REGION:\n"
-    for reg in sorted(set(list(region_5) + list(region_10) + list(region_20))):
-        a5, a10, a20 = region_5[reg], region_10[reg], region_20[reg]
-        l5, l10, l20 = r_l1_5[reg], r_l1_10[reg], r_l1_20[reg]
-        att5  = round(a5  / l5  * 100, 1) if l5  > 0 else "N/A"
-        att10 = round(a10 / l10 * 100, 1) if l10 > 0 else "N/A"
-        att20 = round(a20 / l20 * 100, 1) if l20 > 0 else "N/A"
-        region_block += (
-            f"  {reg}: "
-            f"5%={a5}(L1={l5:.0f},att={att5}%) | "
-            f"10%={a10}(L1={l10:.0f},att={att10}%) | "
-            f"20%={a20}(L1={l20:.0f},att={att20}%)\n"
-        )
-    region_block += f"  TOTALS: 5%={cnt_5} | 10%={cnt_10} | 20%={cnt_20}\n"
- 
-    # ── Source block ──────────────────────────────────────────────────────────
-    source_block = "DEALS BY SOURCE:\n" + "".join(
-        f"  {src}: 5%={source_5[src]} | 10%={source_10[src]} | 20%={source_20[src]}\n"
-        for src in sorted(set(list(source_5) + list(source_10) + list(source_20)))
-    )
- 
- 
-    # ── Quarterly trend ───────────────────────────────────────────────────────
-    quarter_summary = "QUARTERLY BREAKDOWN:\n"
-    for q in qt:
-        q_label = q.get("quarter", "N/A") or "N/A"
-        a5  = int(q.get("actual_deals",    0) or 0)
-        a10 = int(q.get("actual_10_deals", 0) or 0)
-        a20 = int(q.get("actual_20_deals", 0) or 0)
-        amt = float(q.get("actual_amount", 0) or 0)
-        l1  = float(q.get("l1_target_deals", 0) or 0)
-        att = float(q.get("pct_l1", 0) or 0)
-        c10 = round(a10 / a5 * 100, 1) if a5 > 0 else 0
-        c20 = round(a20 / a5 * 100, 1) if a5 > 0 else 0
-        quarter_summary += (
-            f"  {q_label}: 5%={a5}(L1={l1:.0f},att={att}%) | "
-            f"10%={a10}(conv={c10}%) | 20%={a20}(conv={c20}%) | ${amt/1e6:.1f}M\n"
-        )
-    quarter_summary += f"  YTD: 5%={cnt_5} | 10%={cnt_10} | 20%={cnt_20} | Won={cnt_won}\n"
- 
-    # ── AI for X & Industry breakdown ────────────────────────────────────────
-    ai_10  = defaultdict(int);  ai_20  = defaultdict(int);  ai_amt = defaultdict(float)
-    ind_10 = defaultdict(int);  ind_20 = defaultdict(int)
- 
-    for row in ip:
-        ai  = row.get("ai_for_x",             "N/A")   or "N/A"
-        ind = row.get("kore_primary_industry", "Other") or "Other"
-        d10 = int(row.get("deals_10pct",    0) or 0)
-        d20 = int(row.get("deals_20pct",    0) or 0)
-        a20 = float(row.get("amount_20pct", 0) or 0)
-        ai_10[ai]  += d10;  ai_20[ai]  += d20;  ai_amt[ai] += a20
-        ind_10[ind] += d10; ind_20[ind] += d20
- 
-    ai_summary = "AI FOR X BREAKDOWN:\n" + "".join(
-        f"  {ai}: 10%={ai_10[ai]} | 20%={cnt} | ${ai_amt[ai]/1e6:.1f}M\n"
-        for ai, cnt in sorted(ai_20.items(), key=lambda x: -x[1])
-    )
-    ind_summary = "INDUSTRY BREAKDOWN:\n" + "".join(
-        f"  {ind}: 10%={ind_10[ind]} | 20%={cnt}\n"
-        for ind, cnt in sorted(ind_20.items(), key=lambda x: -x[1])
-    )
- 
-    # ── Flagged deals ─────────────────────────────────────────────────────────
-    deals_lines = ""
-    for d in dw:
-        stage_label = d.get("deal_stage", "") or ""
-        if active_stage_label and active_stage_label not in stage_label:
-            continue
-        amt     = float(d.get("amount", 0) or 0)
-        days_in = int(d.get("days_in_current_stage", 0) or 0)
-        bench   = int(d.get("avg_days_benchmark",    0) or 0)
-        deals_lines += (
-            f"  {d.get('deal_name','N/A')} | Stage:{stage_label} | "
-            f"Region:{d.get('region','N/A')} | Source:{d.get('deal_source_rollup','N/A')} | "
-            f"AI:{d.get('ai_for_x','N/A')} | ${amt/1e6:.2f}M | "
-            f"Close:{str(d.get('close_date',''))[:10]} | Health:{d.get('deal_health','N/A')} | "
-            f"DaysInStage:{days_in}(benchmark:{bench}d)\n"
-        )
-    deals_lines = deals_lines or "  No flagged deals.\n"
- 
-    return dict(
-        # raw blobs (kept for scorecards)
-        funnel=f, period=p, raw_rs=rs, raw_sv=sv,
-        # funnel counts & amounts
-        cnt_5=cnt_5,   cnt_10=cnt_10,  cnt_20=cnt_20,
-        cnt_won=cnt_won, cnt_out=cnt_out,
-        amt_5=amt_5,   amt_10=amt_10,  amt_20=amt_20,
-        # conversion rates
-        conv_5_10=conv_5_10, conv_10_20=conv_10_20,
-        win_rate=win_rate,   overall_eff=overall_eff,
-        # attainment
-        pct_5=pct_5,   pct_10=pct_10,  pct_20=pct_20,
-        actual_5=actual_5, actual_10=actual_10, actual_20=actual_20,
-        l1_5=l1_5,     l1_10=l1_10,    l1_20=l1_20,
-        gap_5=gap_5,   gap_10=gap_10,  gap_20=gap_20,
-        mtd_5=mtd_5,   mtd_10=mtd_10,  mtd_20=mtd_20,
-        qtd_5=qtd_5,   qtd_10=qtd_10,  qtd_20=qtd_20,
-        # health
-        total_active=total_active, total_red=total_red,
-        total_yellow=total_yellow, total_green=total_green, pct_red=pct_red,
-        # prompt text blocks
-        velocity_lines=velocity_lines,
-        region_block=region_block,     source_block=source_block,
-        quarter_summary=quarter_summary, ai_summary=ai_summary,
-        ind_summary=ind_summary,       deals_lines=deals_lines,
-        available_regions=available_regions,
-        won_deals_block=won_deals_block,
-        lost_deals_block=lost_deals_block
-    )
- 
- 
-# =============================================================================
-# 4. Scorecard Builder
-# =============================================================================
- 
-def build_scorecards(m: dict, filters: Filters) -> dict:
-    """
-    Build the structured scorecard payload from pre-computed metrics.
- 
-    Sections (per scope doc §3):
-      • stage_overview  — deals, pipeline $, attainment %, gap per stage
-      • funnel_health   — conversion rates + overall efficiency
-      • period_cadence  — MTD / QTD / YTD actuals vs L1 + gap
-      • deal_health     — Red / Yellow / Green breakdown
- 
-    Filter behaviour:
-      - stage filter active  → returns only that stage's card in stage_overview
-      - no stage filter       → returns all four stage cards
-      - all counts/$ reflect whatever slice was fetched from ClickHouse
-    """
- 
-    def status(pct: float) -> str:
-        if pct >= 100: return "on_track"
-        if pct >= 60:  return "at_risk"
-        return "below_target"
- 
-    # ── Stage overview ────────────────────────────────────────────────────────
-    all_stages = [
-        {
-            "stage":      "5% IQM Held",
-            "stage_key":  "5",
-            "deals":       m["cnt_5"],
-            "pipeline_m":  round(m["amt_5"] / 1e6, 1),
-            "ytd_pct":     m["pct_5"],
-            "ytd_actual":  m["actual_5"],
-            "l1_target":   m["l1_5"],
-            "gap":         m["gap_5"],        # None if no target set
-            "status":      status(m["pct_5"]),
-        },
-        {
-            "stage":      "10% Discovery",
-            "stage_key":  "10",
-            "deals":       m["cnt_10"],
-            "pipeline_m":  round(m["amt_10"] / 1e6, 1),
-            "ytd_pct":     m["pct_10"],
-            "ytd_actual":  m["actual_10"],
-            "l1_target":   m["l1_10"],
-            "gap":         m["gap_10"],
-            "status":      status(m["pct_10"]),
-        },
-        {
-            "stage":      "20%+ Qualified",
-            "stage_key":  "20",
-            "deals":       m["cnt_20"],
-            "pipeline_m":  round(m["amt_20"] / 1e6, 1),
-            "ytd_pct":     m["pct_20"],
-            "ytd_actual":  m["actual_20"],
-            "l1_target":   m["l1_20"],
-            "gap":         m["gap_20"],
-            "status":      status(m["pct_20"]),
-        },
-        {
-            "stage":      "Closed Won",
-            "stage_key":  "won",
-            "deals":       m["cnt_won"],
-            "pipeline_m":  None,             # no pipeline $ for closed deals
-            "ytd_pct":     m["win_rate"],
-            "ytd_actual":  m["cnt_won"],
-            "l1_target":   None,
-            "gap":         None,
-            "status":      None,
-        },
-    ]
- 
-    stage_filter = filters.stage
-    stage_overview = (
-        [s for s in all_stages if s["stage_key"] == stage_filter]
-        if stage_filter else all_stages
-    )
- 
-    # ── Funnel health ─────────────────────────────────────────────────────────
-    funnel_health = {
-        "conv_5_to_10_pct":   m["conv_5_10"],
-        "conv_10_to_20_pct":  m["conv_10_20"],
-        "win_rate_pct":        m["win_rate"],
-        "overall_efficiency":  m["overall_eff"],
-        "fallen_out":          m["cnt_out"],
-    }
- 
-    # ── Period cadence ────────────────────────────────────────────────────────
-    period_cadence = {
-        "MTD": {
-            "deals_5":  m["mtd_5"],
-            "deals_10": m["mtd_10"],
-            "deals_20": m["mtd_20"],
-        },
-        "QTD": {
-            "deals_5":  m["qtd_5"],
-            "deals_10": m["qtd_10"],
-            "deals_20": m["qtd_20"],
-        },
-        "YTD": {
-            "deals_5":  m["actual_5"],  "l1_5":  m["l1_5"],  "gap_5":  m["gap_5"],
-            "deals_10": m["actual_10"], "l1_10": m["l1_10"], "gap_10": m["gap_10"],
-            "deals_20": m["actual_20"], "l1_20": m["l1_20"], "gap_20": m["gap_20"],
-        },
-    }
- 
-    # ── Deal health ───────────────────────────────────────────────────────────
-    deal_health = {
-        "total_active": m["total_active"],
-        "green":        m["total_green"],
-        "yellow":       m["total_yellow"],
-        "red":          m["total_red"],
-        "red_pct":      m["pct_red"],
-    }
- 
-    return {
-        "stage_overview":  stage_overview,
-        "funnel_health":   funnel_health,
-        "period_cadence":  period_cadence,
-        "deal_health":     deal_health,
-        "filter_applied":  filters.model_dump(),
-    }
- 
- 
-# =============================================================================
-# 5. Prompt Builder
-# =============================================================================
- 
-# Injected into every prompt so the LLM never confuses abbreviated stage codes.
-_STAGE_REFERENCE = """
-STAGE NAME REFERENCE (always use the full label, never abbreviations):
-  "1%"  → "1% - IQM Scheduled"      "5%"  → "5% - IQM Held"
-  "10%" → "10% - Discovery"          "20%" → "20% - Solution"
-  "30%" → "30% - Proof"              "40%" → "40% - Proposal"
-  "60%" → "60% - Price Negotiation"  "75%" → "75% - Contract Review"
-  "Closed Won" = final won stage
-NOTE: APAC is NOT a valid region. ISEA = India / Southeast Asia.
-""".strip()
- 
- 
-# ── Style-specific instructions ───────────────────────────────────────────────
- 
-_EXECUTIVE_INSTRUCTIONS = """\
-You are a senior GTM strategist and trusted advisor to the CEO/CRO at Kore.ai.
-You have read every number before writing a single word.
-You think in business outcomes, risk, and decisions — not templates.
- 
-FILTER COMPLIANCE — READ THIS FIRST, BEFORE ANYTHING ELSE:
-If filters are active (stage, region, source, AI for X, industry), you must:
-  - Restrict EVERY bullet in EVERY section to ONLY the filtered slice
-  - Never mention stages, regions, or sources outside the active filter
-  - If stage=20% is active, NEVER reference 5% or 10% stage numbers
-  - If region=North America is active, NEVER reference ISEA, Middle East, JAPAC, etc.
-  - If source=Hyperscaler is active, NEVER reference BDR, Marketing, AE Outbound, etc.
-  - The only exception: you may contrast the filtered slice against global ONLY when
-    explicitly labeling both (e.g. "NA at 26.1% vs global 64.6%")
-  - Active filters are stated at the top of the data block — read them before writing
-TONE RULE:
-You are advising, not instructing. Never tell the CRO what "must" be done or what
-"the CRO must prioritize." You are a peer with data, not a consultant with a deck.
-Write as if you are talking to the person, not writing a report about them.
-BAD: "The CRO must prioritize sourcing from alternative channels."
-GOOD: "The Hyperscaler dependency is the single biggest structural risk here —
-  if that source dries up, there is no pipeline backstop."
- 
-FORMAT RULE:
-Write every section as bullet points. No prose paragraphs.
-Each bullet = one complete thought. Max 2 lines per bullet — split if longer.
-Every bullet must contain a number AND an implication. No exceptions.
-
-BOLD RULE: Every bullet must start with a bold opening phrase (3-8 words) 
-followed by an em dash —
-Example: **The 5% stage is critically undersourced** — 156 deals at 8% attainment means...
-The bold phrase is the headline; the rest of the bullet is the supporting evidence.
-Never write a bullet that starts without bold text.
- 
-STRUCTURE ANTI-PATTERN RULE — CRITICAL:
-Do NOT use fixed sentence templates. The bullets should read naturally from the data,
-not like they were poured into a mold.
- 
-These templates are BANNED — if you catch yourself using them, rewrite:
-  BANNED: "Because [X], we need to [Y], which addresses [Z]."
-  BANNED: "Because [X], we must [Y], which mitigates [Z]."
-  BANNED: "Because [X], we should [Y], which will [Z]."
- 
-Focus area bullets should sound like a strategist making a call, not filling a form.
-Each focus area should be written differently — varied sentence structure, varied framing —
-because each action addresses a different kind of problem.
- 
-BAD focus areas (all same template, all vague):
-  "• Because 420 deals are short at 5%, we need aggressive sourcing to fill the pipeline,
-  which addresses the immediate revenue risk."
-  "• Because 0% of deals convert 20%→Won, we must enhance qualification criteria at 20%,
-  which mitigates future revenue loss."
- 
-GOOD focus areas (varied, specific, natural):
-  "• The 5% gap of 420 deals can't close organically — the math requires 3x current run rate,
-  which means this needs a campaign decision this week, not a coaching conversation."
-  "• Zero closed won despite deals reaching 20% points to a closing motion problem, not a
-  pipeline problem — the fix is deal desk review of every 20%+ deal over 60 days in stage,
-  not more top-of-funnel activity."
- 
-Generate a summary using EXACTLY these 6 sections (bold markdown headers):
- 
-**Pipeline Health at a Glance**
-**Funnel Velocity & Conversion**
-**Revenue Position & Closed Won**
-**Deal Quality & Risk Signals**
-**What's Working**
-**Win/Loss Intelligence**
-**Focus Areas & Recommended Actions**
- 
-═══════════════════════════════════════════════════════════
-SECTION GUIDANCE
-═══════════════════════════════════════════════════════════
- 
-**Pipeline Health at a Glance**
- 
-First bullet: one sentence state of the pipeline. What's the headline?
-Not a list of gaps — one coherent read on where the business stands.
- 
-Then one bullet per active stage (ONLY stages in the active filter, or all three if no
-stage filter is set). Each bullet must earn its place — state the gap AND what it means
-by year-end, expressed as a run-rate problem. If the math is alarming, say it is alarming.
-If the gap is manageable, say that too. Don't use the same sentence structure for each stage.
- 
-For regions: if a region filter is active, cover only that region.
-If no region filter, name the outliers — best and worst — and explain the business
-implication of that gap. Don't list all regions with numbers. Name the story.
- 
-For sources: if a source filter is active, cover only that source.
-If no source filter, name the source that's dragging conversion and quantify the drag.
- 
-Final bullet: a "so what" that feels like a natural conclusion from everything above —
-not a mandatory closing line, but whatever the data actually points to.
- 
----
- 
-**Funnel Velocity & Conversion**
- 
-First bullet: what's the funnel's overall health in one read?
-Is the problem entry volume, mid-funnel stall, closing failure, or all three?
- 
-Then one bullet per gate — but only gates relevant to the active filter.
-If stage=20% is active, focus on the 20%→Won gate. Don't recap 5→10 or 10→20.
- 
-Each gate bullet integrates: rate + benchmark gap + time in stage + what that combination
-reveals about behavior + consequence. The combination is the signal — never report
-rate alone or time alone.
- 
-Diagnostic logic to internalize (not to copy):
-  Low rate + high time → stalling (qualification or IQM issue)
-  Low rate + normal time → worked but lost (pitch, fit, champion issue)
-  High rate + high time → slow progression (capacity or prioritization bottleneck)
-  High rate + normal time → gate is healthy — say what's working and protect it
- 
-For anomalies (100% conversion, 0% win rate, undefined days):
-  Take a position — more likely real or data artifact? Say why.
-  Don't hedge with "could be A or could be B" — that's not analysis.
- 
-Final bullet: funnel yield — for every 100 deals entering, how many close?
-What does that mean for required pipeline volume?
- 
----
- 
-**Revenue Position & Closed Won**
- 
-Open with the closed won number — no softening.
-The exact closed won count is in the data block under "Closed Won : X deals" — use that number.
-DO NOT say "zero" unless the data block explicitly shows "Closed Won : 0 deals".
- 
-Project forward: what does EOQ look like at current rate? How many deals must close
-in remaining weeks? If the answer is "we will miss," say so directly.
-
-If FY STATUS = CLOSED:
-  - DO NOT calculate required deals/month
-  - DO NOT assume time remaining
-  - Frame all gaps as final shortfall
-
-If FY STATUS = IN PROGRESS:
-  - You may compute required pace vs current run rate
-
-If FY STATUS = CLOSED:
-  - Do not compute required/month
-  - Do not mention pacing
-  - Treat gap as final shortfall
-Connect the revenue gap to a specific upstream cause — name the gate that's responsible.
-"This isn't a sourcing problem — it's a closing motion problem" or vice versa.
-The framing should follow from the data, not from a template.
- 
----
- 
-**Deal Quality & Risk Signals**
- 
-Frame the overall risk in one opening bullet — is risk concentrated, diffuse, or structural?
- 
-Then cover the signals that are actually present in the data:
-  - Fallen-out deals: where did they exit? Exit stage = where the funnel is leaking.
-  - Red-flagged deals: apply to revenue, not just count. What does Red % mean for EOQ?
-  - Concentration risk: if one source or region holds all the pipeline, name the failure mode.
-  - Lost deal patterns: if notes reveal a theme, name it with count + $ + exit stage.
-Only cover signals that are actually present. If Red deals are 0%, don't manufacture
-a risk signal from absence — "no high-risk deals currently" is fine if that's the truth,
-but follow it with what the absence actually implies (stagnation? small sample? data gap?).
- 
-Do not repeat risks already stated in other sections. Each bullet must add new information.
- 
----
- 
-**What's Working**
- 
-If there are genuine bright spots, cover them — with the number, vs benchmark, and
-what it means to protect or scale. Interrogate each: is it actually strong or does it
-only look good because the denominator is small or the bar is low?
- 
-WHAT'S WORKING RULE:
-
-- Identify relative strengths, not just absolute wins
-- A metric can be "working" if:
-    • It is stronger than other stages/regions/sources
-    • It shows better conversion relative to funnel average
-    • It represents meaningful volume even if below benchmark
-
-- ONLY say "no genuine bright spots" if:
-    • ALL stages are severely underperforming (<50% attainment)
-    • AND conversion is below benchmark across ALL gates
-    • AND no region/source meaningfully outperforms others
-
-- Prefer:
-    "No metrics are above benchmark, but X is relatively stronger and worth protecting"
- 
----
----
-
-**Win/Loss Intelligence**
-
-The data is structured by Region + Deal Source groups (e.g. "North America | BDR", "Middle East | Hyperscaler").
-Each group shows: deal count, total $, top reasons (with frequency), competitors, AI categories, and 2–3 representative deals.
-
-Read across ALL groups before writing. Extract the cross-group signal, not per-deal details.
-
-For won deal groups:
-  - Which region+source combination produces the most wins? Name count + total $.
-  - What win reason appears most frequently across groups? Name it explicitly (e.g. "Superior Functionality (x4)").
-  - If a competitor appears repeatedly in won deals, name them — it's a replicable competitive advantage.
-  - Name the AI category that dominates won deals if one stands out.
-
-For lost deal groups:
-  - Which region+source combination has the highest loss concentration? Name count + total $ at risk.
-  - What is the primary loss reason across groups? Be specific — "Didn't Qualify at Discovery stage" not "qualification issues".
-  - If the same competitor appears across 2+ loss groups, flag it as a competitive pattern, not a one-off.
-  - Name the exit stage — it reveals WHERE in the funnel the leak is.
-
-Contrast bullet (mandatory): what do winning region+source combinations have that losing ones consistently lack?
-One sentence, grounded in the data — region, source, reason, AI category, or size. This is the most actionable line.
-
-If a group has only 1 deal, do not call it a pattern — say "single data point."
-If reasons are mostly blank, say so and work only from what IS present.
-
----
- 
-**Focus Areas & Recommended Actions**
- 
-Exactly 3 bullets. Each one must be specific to THIS data — not generic pipeline advice.
- 
-The three bullets should address three different kinds of problems (e.g. volume, conversion,
-process) and should be written with varied sentence structure. They should not all start
-with the same word or follow the same grammatical pattern.
- 
-Each focus area must:
-  - Name a specific number or pattern from the data
-  - Name a specific mechanism or action (not a category like "improve sourcing")
-  - Say what it addresses or prevents (without using "which addresses" as a template)
-Write these as a strategist making calls — direct, opinionated, varied.
-The tone should differ by the urgency of the problem:
-  - An acute crisis (0 closed won) sounds urgent and direct
-  - A structural risk (single-source dependency) sounds measured and forward-looking
-  - A process fix (deal desk review) sounds operational and specific
-BANNED focus area phrases:
-  "Because X, we need to Y, which addresses Z" (and all variations)
-  "implement aggressive sourcing strategies"
-  "enhance qualification criteria"
-  "conduct a thorough review"
-  "address the immediate revenue risk"
-  "mitigate future revenue loss"
-  "stem the current pipeline leakage"
-  These are placeholders, not actions. Replace every one with something specific to the data.
- 
-═══════════════════════════════════════════════════════════
-HARD RULES
-═══════════════════════════════════════════════════════════
- 
-1. FILTER COMPLIANCE IS NON-NEGOTIABLE.
-   Active filters define the universe of this summary.
-   A filtered summary that references out-of-scope data is wrong, not just imprecise.
-2. NO FIXED TEMPLATES. Bullets must vary in structure, opening word, and framing.
-   If three bullets in a row start with "Because" — rewrite all three.
-   If two bullets have identical grammatical structure — rewrite one.
-3. NO INSTRUCTING THE CRO. You advise, you don't assign.
-   "The CRO must..." / "Leadership should..." / "The team needs to..." — all banned.
-   Rephrase as a finding or a call: "The math here requires a campaign decision, not
-   a coaching conversation" not "The CRO must launch a sourcing campaign."
-4. EVERY BULLET = number + implication. No naked numbers. No implications without numbers.
-5. MAX 10 BULLETS TOTAL. Weight toward sections with the most signal.
-   A section with nothing urgent = 1 bullet. Don't pad.
-6. NEVER sum deal counts across stages. Each stage is an independent cohort.
-7. No "Next Steps" framing outside of Focus Areas.
-8. Each section must teach something new. If a CRO reads a section and only knows
-   what the dashboard already showed them — rewrite it.
-""".strip()
- 
-_ANALYST_INSTRUCTIONS = """\
-You are a senior GTM analyst embedded in the sales org at Kore.ai.
-You have internalized every number before writing a single word.
-You think in patterns, cohorts, and levers — not problems and failures.
-
-Your goal is a diagnostic that RevOps, Sales Ops, and deal desk can act on.
-The difference between a good analyst summary and a bad one:
-  BAD: "BDR is responsible for 4.7 points of drag on total funnel efficiency."
-  GOOD: "BDR converts 4.7pts below the funnel average at 5→10 — closing that gap
-  to the Marketing benchmark would add ~X deals to the 10% cohort without new sourcing."
-
-  BAD: "The 132.5pt gap between ISEA and NA indicates high revenue risk concentration."
-  GOOD: "ISEA's 158.6% attainment vs NA's 26.1% means ISEA's playbook — source mix,
-  AI category focus, deal cadence — is the most replicable asset in the portfolio;
-  NA has 982 deals at 5% to work with, so the gap is a conversion question, not a
-  volume question."
-
-FRAMING PRINCIPLE — THIS GOVERNS EVERY BULLET:
-  Data is neutral. Your job is to find the mechanism and the lever, not to assign blame.
-  Every gap is a question: "what would have to change to close this, and is that achievable?"
-  Every underperformance is a diagnostic: "is this a volume problem or a conversion problem?"
-  These need different interventions — naming which one it is IS the analysis.
-
-ANALYST VOICE RULES:
-  - Never frame a metric as "a problem" without naming the specific lever that addresses it
-  - Never describe a gap without stating whether it's closable at current trajectory
-  - "Risk" language is allowed only when the risk is specific and quantified
-    ALLOWED: "At current 20→Won rate of 8.8%, the 676-deal gap requires closing 75 additional
-    deals from existing 20% pipeline — only possible if win rate improves to ~18%"
-    BANNED: "This indicates significant revenue risk" (vague, no lever)
-  - Source comparison bullets must answer: "what should we do differently with this source?"
-    not "this source is dragging the funnel"
-  - Regional comparison bullets must answer: "what's replicable from the leader?"
-    not "the laggard represents a structural weakness"
-
-FORMAT RULE — THIS IS MANDATORY:
-Write EVERY section as bullet points. No prose paragraphs. No walls of text.
-Each bullet = one complete thought: one number + one mechanism + one lever or implication.
-A bullet that is more than 2 lines long must be split into two bullets.
-A bullet that contains no number must be rewritten or deleted.
-A bullet that names a gap without naming the mechanism behind it must be rewritten.
-
-BOLD RULE: Every bullet must start with a bold opening phrase (3-8 words) 
-followed by an em dash —
-Example: **The 5% stage is critically undersourced** — 156 deals at 8% attainment means...
-The bold phrase is the headline; the rest of the bullet is the supporting evidence.
-Never write a bullet that starts without bold text.
-
-BULLET QUALITY RULE — THE ANALYST STANDARD:
-Every bullet must answer three questions in sequence:
-  1. What is the number?
-  2. What behavior or process produces exactly that number?
-  3. What specific lever exists to change it, or what does it predict about what comes next?
-
-BAD: "• 10% stage: 1,347 deals | Target: 2,478 | Attainment: 54.4% | Gap: 1,131"
-BAD: "• 10% stage is 1,131 deals short — this is a structural issue requiring immediate attention."
-GOOD: "• 10% stage is 1,131 deals short at 54.4% — since 10% is fed by 5→10 progression,
-  improving that conversion rate from 61.7% to 70% (benchmark midpoint) would add ~300 deals
-  to 10% without a single new IQM; the remaining gap requires sourcing acceleration."
-
-Generate a diagnostic analysis using EXACTLY these 7 sections (bold markdown headers):
-
-**Overall Pipeline Snapshot**
-**Funnel Conversion & Velocity Analysis**
-**Regional & Source Performance**
-**AI for X & Deal Category Breakdown**
-**Stage Velocity & Stagnation**
-**Win/Loss Intelligence**
-**Focus Areas & Highest-Leverage Interventions**
-**Root Cause Hypotheses**
-
-═══════════════════════════════════════════════════════════
-SECTION GUIDANCE
-═══════════════════════════════════════════════════════════
-
-**Overall Pipeline Snapshot**
-
-First bullet: one headline that characterizes the pipeline state — frame it as
-"where the biggest lever is" not "what's broken." Is the primary opportunity in
-entry volume, conversion improvement, or closing motion? Name the one with the
-most addressable gap.
-
-Then one bullet per stage (5%, 10%, 20%). Each bullet must contain:
-  - attainment % AND gap in deals
-  - the specific conversion or sourcing lever that would close the gap (or the
-    fraction of it that's mechanically achievable)
-  - whether that lever has been hit in any prior quarter this year
-
-Frame the stage bullets as: "here's the gap, here's what it would take, here's
-whether that's realistic" — not "here's how far behind we are."
-
-BAD bullet:
-  "• 20% stage: 676 deals short at 48.4% — this gap is compounding and requires
-  immediate intervention to avoid further decline."
-GOOD bullet:
-  "• 20% stage: 676 deals short at 48.4% — but 20% is downstream of 10%, so the
-  fastest lever is improving 10→20 conversion from 42.9% toward the 50% benchmark;
-  a 7pt lift on the existing 10% pool adds ~90 deals to 20% without any new sourcing."
-
-Then one bullet for regional performance — frame it as: what does the leader's
-playbook look like, and how much of it is replicable in underperforming regions?
-Name the specific mechanism (source mix, AI category, deal size) not just the gap.
-
-Then one bullet for source performance — frame it as: which source is closest to
-its conversion benchmark, and what would it take to bring the lagging source there?
-Use the "closing the gap" calculation, not the "drag" calculation.
-
-Final bullet: realistic recovery framing — given the levers available, what's the
-earliest quarter where a meaningful recovery is possible, and what would have to
-be true for it to happen?
-
----
-
-**Funnel Conversion & Velocity Analysis**
-
-First bullet: characterize the entire funnel in one diagnostic read.
-Where is the highest-leverage conversion gate — the one where a benchmark-level
-improvement would have the largest downstream impact on closed won deals?
-
-Then one bullet per gate (5→10, 10→20, 20→Won). Each bullet must contain:
-  - conversion rate + gap from benchmark (in percentage points)
-  - avg days vs benchmark (as a ratio, e.g. "2.9x benchmark")
-  - mechanism: what does the rate + time combination reveal about rep behavior?
-  - the specific lever: what process change or intervention targets exactly that behavior?
-
-Use this diagnostic matrix (internalize, never copy literally):
-  Low rate + high time → deals stalling — qualification or IQM quality issue
-    LEVER: IQM quality review, next-step accountability process
-  Low rate + normal time → deals worked but lost — pitch, fit, or champion issue
-    LEVER: champion mapping, competitive positioning, value prop refinement
-  High rate + high time → advances slowly — capacity or process bottleneck
-    LEVER: deal prioritization, capacity planning
-  High rate + normal time → gate is healthy — protect what's working
-    LEVER: document and replicate
-
-BAD bullet:
-  "• 10→20 gate: 42.9% conversion — 7pts below benchmark — with deals spending 80d
-  vs 28d benchmark. Low rate AND high time indicate reps investing in non-progressing deals."
-GOOD bullet:
-  "• 10→20 gate converts at 42.9% (7pts below benchmark) with deals spending 80d vs
-  28d benchmark (2.9x) — low rate AND high time together means reps are cycling on
-  deals without a defined advancement path; the lever is structured next-step accountability
-  after Discovery calls, not more top-of-funnel activity."
-
-For any anomaly (rate at 100% or near-zero): take a position.
-State which explanation is more likely and why — don't hedge.
-
-Final bullet: overall funnel efficiency framed as an opportunity calculation.
-"At current 5%→Won efficiency of X%, producing 100 closed won deals requires Y
-deals at 5% — the fastest path to improving that ratio is [gate] where a [X]pt
-lift has the highest mechanical leverage."
-
-CLOSED WON LANGUAGE RULE:
-- If Closed Won = 0 → say "no closed won deals recorded yet this period"
-- If Closed Won > 0 but below expectation → state the number and what win rate
-  improvement would be needed to reach target
-- NEVER use words like "absence," "lack of," or frame it as catastrophic without
-  stating what conversion improvement would change the trajectory
-
----
-
-**Regional & Source Performance**
-
-First bullet: the regional performance spread — but frame it as a replication
-opportunity, not a risk statement.
-"ISEA's 158.6% at 20% vs NA's 26.1% creates a natural experiment: ISEA's source
-mix, AI category focus, and deal cadence are the most studied playbook in the
-portfolio — the question is which elements transfer to NA's 982-deal 5% pipeline."
-
-Then one bullet for the top performer: WHY do they lead?
-Name the specific mechanism — source mix, AI category concentration, deal size,
-regional demand pattern. Frame it as: "this is what makes it replicable / not fully
-replicable elsewhere, and here's the transferable piece."
-
-Then one bullet for the lowest performer: diagnose as volume problem OR conversion problem.
-These need different interventions — naming which one it is IS the analysis.
-Volume problem = too few deals entering → lever is sourcing, campaign, or IQM cadence.
-Conversion problem = deals exist but don't advance → lever is rep process, champion quality,
-or deal desk review of stalled deals.
-NEVER say "this indicates a structural weakness" — say "this is a [type] problem,
-which means the intervention is [specific action]."
-
-Then one bullet for the lowest-converting source:
-Frame it as: "closing the gap between [source] and the benchmark would add X deals
-to the funnel — here's what's driving the conversion gap."
-NOT: "[source] is responsible for X points of drag."
-
-Then one bullet for the highest-converting source:
-State why it converts well, whether it's scalable, and what "protecting" it means
-operationally — is it at risk of being disrupted by pipeline creation pressure?
-
----
-
-**AI for X & Deal Category Breakdown**
-
-First bullet: characterize the PMF landscape as a portfolio — which categories
-show strong conversion (double down), which show stall (investigate), and which
-show early signal (develop)?
-
-Then one bullet per AI for X category with meaningful volume (5+ deals at 10%).
-Each bullet must contain:
-  - 10→20 conversion rate (computed from counts)
-  - immediate interpretation: strong fit signal OR fit risk signal
-  - the specific operational lever: "protect the closing motion" / "investigate
-    champion quality" / "refine value prop for this segment"
-
-BAD bullet:
-  "• AI for Process: 38.9% conversion — fit risk signal, necessitating operational
-  focus on improving deal progression."
-GOOD bullet:
-  "• AI for Process converts 38.9% of Discovery deals to Solution ($10.6M pipeline) —
-  11pts below AI for Service; the gap is most likely unclear ROI articulation at
-  Discovery, not product fit — testable by reviewing whether lost deals in this
-  category cite 'Didn't Qualify' vs 'No Budget' as exit reason."
-
-For the weakest converting category with meaningful volume:
-Name the most likely root cause (weak champions, unclear ROI, product-pain mismatch)
-and what single data point from the won/loss notes would confirm or refute it.
-
----
-
-**Stage Velocity & Stagnation**
-
-First bullet: what does the health distribution predict about deal advancement
-over the next 30-60 days? Apply Red % to deal count AND pipeline value.
-Frame it as: "X deals representing $YM are currently past their advancement
-benchmark — direct intervention on these deals is the highest-ROI activity
-available to the deal desk right now."
-
-Then one bullet per stage with significant Red concentration.
-For each: explain what Red at that specific stage means operationally AND
-what the targeted intervention looks like.
-  Red at 5% → IQM advancement broken → lever: IQM follow-up cadence, call quality review
-  Red at 10% → Discovery stalling, no next steps → lever: structured next-step accountability
-  Red at 20% → closing motion absent → lever: deal desk review of all 20%+ deals >60d in stage
-  (Use the stage-specific lever, not generic language)
-
-Then one bullet for fallen-out deals: count + exit stage + what the exit stage
-tells us about where to focus retention effort.
-Frame it as: "X deals exited at [stage] — this is where the funnel is leaking,
-and it aligns with / contradicts the conversion rate story because [reason]."
-
-Then one bullet for avg days vs benchmark: state as a ratio, then name the rep
-behavior that produces exactly that number AND the process that would change it.
-"2.9x benchmark at 10% means reps have no defined next step after Discovery —
-the fix is a mandatory 'next meeting booked before close of call' standard,
-not more coaching."
-
----
-
-**Win/Loss Intelligence**
-
-The data is structured by Region + Deal Source groups.
-Each group shows: deal count, total $, top reasons (with frequency), competitors,
-AI categories, and 2–3 representative deals.
-
-Read across ALL groups before writing. Extract the cross-group signal.
-
-For won deal groups — frame as: what's replicable?
-  - Which region+source combination produces the most wins? Name count + total $.
-    Frame it as: "this combination is the model — here's what drives it."
-  - What win reason appears most frequently? Name it explicitly (e.g. "Superior
-    Functionality (x41)"). Frame it as a competitive strength to protect and message.
-  - If a competitor appears repeatedly in won deals, name them and frame it as:
-    "we have a documented win pattern against [competitor] — this should be
-    systematized into the competitive playbook."
-  - Name the AI category dominating won deals and what it says about where PMF is strongest.
-
-For lost deal groups — frame as: where's the recoverable opportunity?
-  - Which region+source combination has the highest loss concentration?
-    Frame it as: "X deals totaling $YM exited here — at the current win rate,
-    improving qualification earlier in this source/region would be higher-leverage
-    than adding new deals to the top."
-  - What is the primary loss reason? Be specific. Frame it as a process gap,
-    not a verdict: "Didn't Qualify at Discovery" means qualification criteria
-    aren't surfacing fit signals early enough, not that the deals were bad.
-  - If the same competitor appears in 2+ loss groups, frame it as:
-    "competitive pattern against [competitor] — a structured battle card for
-    this matchup would directly address X deals worth $YM."
-  - Name the exit stage and connect it to the conversion analysis already done.
-
-Contrast bullet (mandatory): what does the winning combination have that the
-losing combination consistently lacks? One sentence, grounded in the data.
-Frame it as an actionable difference, not a judgment.
-
-If a group has only 1 deal, say "single data point — insufficient for pattern."
-If reasons are mostly blank, say so and work only from what IS present.
-
----
----
-
-**Focus Areas & Highest-Leverage Interventions**
-
-Exactly 3 bullets. Each one must be the output of the analysis above —
-not a restatement of a gap, but a specific intervention derived from the
-mechanism identified in an earlier section.
-
-Each bullet structure:
-  [The lever] — [the specific data that makes this the highest-leverage action] —
-  [the expected outcome if the lever is pulled, expressed as a number or rate change] —
-  [how to know if it's working within 30 days]
-
-The three bullets must address three different parts of the funnel or org:
-one conversion lever, one sourcing or volume lever, one deal-level or process lever.
-They should not all be about the same stage or the same team.
-
-BAD focus area (gap restatement):
-  "• 10→20 conversion at 42.9% is 7pts below benchmark and needs improvement through
-  better Discovery engagement and champion mapping to advance deals."
-
-GOOD focus area (lever with outcome):
-  "• Mandatory next-step booking at close of every Discovery call would directly
-  target the 10→20 stall — 943 Red deals at 10% represent $265.5M sitting past
-  their advancement benchmark; even a 10pt conversion lift on stalled deals adds
-  ~94 deals to 20% from existing pipeline, no new sourcing required.
-  Leading indicator: Red deal count at 10% should decline within 3 weeks of
-  implementing the standard."
-
-Each focus area must:
-  - Name a number from the data (deal count, conversion rate, pipeline $, or attainment %)
-  - Name the specific mechanism or process change (not a category like "improve sourcing")
-  - State the expected outcome as a quantified change (deals added, rate improvement,
-    pipeline $ recovered)
-  - Name one leading indicator that would confirm it's working within 30 days
-
-BANNED focus area language:
-  "implement aggressive sourcing strategies"
-  "enhance qualification criteria"
-  "conduct a thorough review"
-  "address the revenue gap"
-  "focus on improving deal progression"
-  "requires immediate attention"
-  These are categories, not interventions. Every banned phrase must be replaced
-  with: a specific action + the number it moves + how you'd know it's working.
-
-The tone should be operational and precise — like a RevOps analyst handing
-a prioritized work order to the deal desk, not a consultant presenting a slide.
-
-**Root Cause Hypotheses**
-
-Write exactly 3–4 hypotheses. Each hypothesis = ONE bullet (up to 3 lines).
-Do NOT use sub-bullets or nested structure inside hypotheses.
-
-Each hypothesis bullet must contain in sequence:
-  [Name + Confidence] — [2-3 data points that together support it] —
-  [mechanism: what behavior produces exactly this pattern] —
-  [the lever: what specific change would test or address this hypothesis] —
-  [what would need to be true for this hypothesis to be wrong]
-
-Frame hypotheses as explanations that, if true, would point to a specific lever —
-not as indictments of a team or function.
-
-BAD:
-  "• Champion Quality Issues [High confidence] — lost deals frequently cite 'Didn't
-  Qualify' indicating weak champions; this suggests a need for better qualification."
-
-GOOD:
-  "• Discovery Next-Step Accountability Gap [High confidence] — 10→20 converts at
-  42.9% while spending 2.9x benchmark time; if it were fit alone, time would be
-  normal but conversion low — both degraded together means reps are re-running
-  Discovery rather than advancing; testable by checking if deals with a booked
-  follow-up at close of 10% call advance at materially higher rates."
-
-At least one hypothesis must be grounded in won/loss note patterns.
-At least one hypothesis must identify a replicable positive (why something IS working).
-Hypotheses should be mutually exclusive where possible.
-
-═══════════════════════════════════════════════════════════
-HARD RULES
-═══════════════════════════════════════════════════════════
-
-1. BULLET FORMAT IS MANDATORY. No prose paragraphs anywhere.
-2. LEVER RULE: Every gap bullet must name a specific lever. A bullet that describes
-   a gap without naming what would close it is incomplete — rewrite it.
-3. FRAMING RULE: "Drag," "structural weakness," "risk concentration," and "requires
-   immediate intervention" are banned unless immediately followed by the specific
-   lever that addresses them. Without the lever, these phrases are alarm without insight.
-4. NEVER sum deal counts across stages. Each is an independent cohort.
-5. 14–18 bullets TOTAL across all 7 sections.
-   Root Cause Hypotheses: exactly 3–4 bullets.
-   Win/Loss Intelligence: 3–5 bullets.
-   No other section under 1 bullet.
-6. Every comparison must produce an actionable conclusion, not a contrast.
-   "NA is 26.1% and ISEA is 158.6%" = contrast (banned).
-   "ISEA's 158.6% vs NA's 26.1% means ISEA's source mix is the most available
-   replication lever — NA has the deal volume to work with, the gap is conversion" = conclusion.
-7. Actively look for what's working. A section that contains only gap analysis
-   has failed the analyst standard — every section should surface at least one lever
-   or bright spot alongside the diagnosis.
-8. No "Next Steps" or "Recommendations" section.
-   The analyst diagnoses. The executive decides. Actions belong in the executive summary.
-9. If filters are active, restrict ALL analysis to that slice.
-10. Write like you're briefing a RevOps VP who will ask "so what do we do with that?"
-    after every bullet. Pre-answer that question inside every bullet.
-11. BANNED PHRASES (replace with specific lever language):
-    "indicates a need for improvement"
-    "requires immediate intervention"
-    "necessitating operational focus"
-    "indicating a structural weakness"
-    "representing a significant area for improvement"
-    "this suggests a need for better [X]"
-    "[source] is responsible for X points of drag"
-    "high concentration of revenue risk"
-    Each of these is a conclusion without a lever. Replace with: what specifically
-    would change this number, and is it achievable?
-""".strip()
- 
- 
-def _build_data_block(m: dict, filters: Filters) -> str:
-    """
-    Assembles the structured data block injected at the end of every prompt.
-    The LLM is instructed to treat this as its ONLY source of truth.
-    """
-    today = date.today()
-    # FY27 = Apr 2026 – Mar 2027. FY26 = Apr 2025 – Mar 2026.
-    # Determine FY scope for prompt context
-    fy_raw = filters.fy or "2027"
-    fy_vals_prompt = [v.strip() for v in fy_raw.split(",") if v.strip().isdigit()]
-
-    if not fy_vals_prompt or set(fy_vals_prompt) == {"2026", "2027"} or "ALL" in (filters.fy or "").upper():
-        # All FY or both selected
-        selected_fy   = 2027   # use latest for fy_end calc
-        fy_scope_label = "FY26 + FY27 COMBINED"
-        fy_end         = date(2027, 3, 31)
-    else:
-        selected_fy    = int(fy_vals_prompt[0])
-        fy_scope_label = f"FY{str(selected_fy)[2:]}"
-        fy_end         = date(selected_fy, 3, 31)
-
-    fy_status = "CLOSED" if today > fy_end else "IN PROGRESS"
-    filter_note = (
-        f"ACTIVE FILTERS: stage={filters.stage or 'all'} | "
-        f"region={filters.region or 'all'} | source={filters.deal_source or 'all'} | "
-        f"fy={filters.fy or 'all'} | ai_for_x={filters.ai_for_x or 'all'} | "
-        f"industry={filters.industry or 'all'}"
-    )
- 
-    gap_5_str  = str(m['gap_5'])  if m['gap_5']  is not None else "N/A"
-    gap_10_str = str(m['gap_10']) if m['gap_10'] is not None else "N/A"
-    gap_20_str = str(m['gap_20']) if m['gap_20'] is not None else "N/A"
-    
-    # ── Velocity lookup for conversion rate context ───────────────────────────
-    velocity_lookup = {}
-    for s in (m.get('raw_sv') or []):
-        stage = s.get('deal_stage', '')
-        velocity_lookup[stage] = {
-            'avg_days':  s.get('avg_days_actual',    'N/A'),
-            'benchmark': s.get('avg_days_benchmark', 'N/A'),
-        }
-    v5  = velocity_lookup.get('5% - IQM Held',  {})
-    v10 = velocity_lookup.get('10% - Discovery', {})
-    v20 = velocity_lookup.get('20% - Solution',  {})
-
-    v5_days  = v5.get('avg_days',  'N/A')
-    v5_bench = v5.get('benchmark', 'N/A')
-    v10_days  = v10.get('avg_days',  'N/A')
-    v10_bench = v10.get('benchmark', 'N/A')
-    v20_days  = v20.get('avg_days',  'N/A')
-    v20_bench = v20.get('benchmark', 'N/A')
- 
-    return f"""
-=================================================================
-PIPELINE DATA — LIVE  ({date.today()})
-=================================================================
-{filter_note}
-AVAILABLE REGIONS: {', '.join(m['available_regions'])}
-{_STAGE_REFERENCE}
- 
-CRITICAL: Use ONLY the numbers below. Never invent or estimate.
-If a value is absent, write "data not available".
- 
-FUNNEL TOTALS  (independent cohorts — DO NOT sum across stages)
-  5%  IQM Held   : {m['cnt_5']:,} deals  | ${m['amt_5']/1e6:.1f}M  | L1 Target={m['l1_5']:.0f} | YTD Actual={m['actual_5']} | Gap={gap_5_str} | Attainment={m['pct_5']}%
-  10% Discovery  : {m['cnt_10']:,} deals  | ${m['amt_10']/1e6:.1f}M | L1 Target={m['l1_10']:.0f} | YTD Actual={m['actual_10']} | Gap={gap_10_str} | Attainment={m['pct_10']}%
-  20%+ Qualified : {m['cnt_20']:,} deals  | ${m['amt_20']/1e6:.1f}M | L1 Target={m['l1_20']:.0f} | YTD Actual={m['actual_20']} | Gap={gap_20_str} | Attainment={m['pct_20']}%
-  Closed Won     : {m['cnt_won']:,} deals
-  Fallen Out     : {m['cnt_out']:,} deals
-
-  NOTE: Each stage uses its own cohort (became_X_deal_date). A deal appears in 5%, 10%, AND 20% independently.
-  NEVER sum these counts to describe "total pipeline deals".
-  In Overall Pipeline Snapshot: describe each stage separately with its actuals, target, and gap.
- 
-CONVERSION RATES (cohort-based, matching Looker funnel logic):
-  5%  → 10%        : {m['conv_5_10']}%   (benchmark 60–70%)
-                     Avg days spent at 5% before progressing: {v5.get('avg_days','N/A')}d  (benchmark {v5.get('benchmark','N/A')}d)
-  10% → 20%        : {m['conv_10_20']}%  (benchmark 50%+)
-                     Avg days spent at 10% before progressing: {v10.get('avg_days','N/A')}d  (benchmark {v10.get('benchmark','N/A')}d)
-  20% → Closed Won : {m['win_rate']}%    (benchmark 20–30%)
-                     Avg days spent at 20% before progressing: {v20.get('avg_days','N/A')}d  (benchmark {v20.get('benchmark','N/A')}d)
-  Overall 5%→Won   : {m['overall_eff']}%
- 
------------------------------------------------------------------
-ATTAINMENT VS L1 TARGET
------------------------------------------------------------------
-  5%  YTD : {m['pct_5']}%  | L1={m['l1_5']:.0f}  | Actual={m['actual_5']}  | Gap={gap_5_str}
-  10% YTD : {m['pct_10']}% | L1={m['l1_10']:.0f} | Actual={m['actual_10']} | Gap={gap_10_str}
-  20% YTD : {m['pct_20']}% | L1={m['l1_20']:.0f} | Actual={m['actual_20']} | Gap={gap_20_str}
-  MTD     : 5%={m['mtd_5']} | 10%={m['mtd_10']} | 20%={m['mtd_20']}
-  QTD     : 5%={m['qtd_5']} | 10%={m['qtd_10']} | 20%={m['qtd_20']}
- 
------------------------------------------------------------------
-REGION BREAKDOWN
------------------------------------------------------------------
-{m['region_block']}
------------------------------------------------------------------
-SOURCE BREAKDOWN
------------------------------------------------------------------
-{m['source_block']}
------------------------------------------------------------------
-QUARTERLY TREND
------------------------------------------------------------------
-{m['quarter_summary']}
------------------------------------------------------------------
-AI FOR X & INDUSTRY
------------------------------------------------------------------
-{m['ai_summary']}
-{m['ind_summary']}
------------------------------------------------------------------
-PIPELINE HEALTH
------------------------------------------------------------------
-  Total active : {m['total_active']} deals
-  Red          : {m['total_red']} ({m['pct_red']}%)
-  Yellow       : {m['total_yellow']}
-  Green        : {m['total_green']}
- 
------------------------------------------------------------------
-STAGE VELOCITY
------------------------------------------------------------------
-{m['velocity_lines']}
------------------------------------------------------------------
-FLAGGED DEALS (Red/Yellow health, >$1M)
------------------------------------------------------------------
-{m['deals_lines']}
-
------------------------------------------------------------------
-WON & LOST DEALS WITH NOTES
------------------------------------------------------------------
-{m['won_deals_block']}
-{m['lost_deals_block']}
-
-FY SCOPE: {fy_scope_label}
-FY STATUS: {fy_status}
-FY END DATE: {fy_end}
-=================================================================
-""".strip()
-
-
-
-
-def _build_filter_context(filters: Filters) -> str:
-    """
-    Convert active filters into a natural-language scope phrase and a
-    mandatory framing instruction block for the LLM.
-
-    Returns "" when no filters are active — no mandate injected.
-    """
-    parts = []
-
-    if filters.fy:
-        parts.append(filters.fy)
-    if filters.region:
-        parts.append(filters.region)
-    if filters.deal_source:
-        parts.append(f"{filters.deal_source}-sourced")
-    if filters.ai_for_x:
-        parts.append(filters.ai_for_x)
-    if filters.industry:
-        parts.append(filters.industry)
-
-    stage_labels = {"5": "5% IQM Held", "10": "10% Discovery", "20": "20%+ Qualified"}
-    if filters.stage:
-        stage_label = stage_labels.get(filters.stage, f"{filters.stage}% stage")
-        parts.append(f"{stage_label} stage")
-
-    if not parts:
-        return ""
-
-    scope_phrase = ", ".join(parts) + " pipeline"
-
-    opening_example = f'Within the {scope_phrase}…'
-    if len(parts) >= 2:
-        opening_example = (
-            f'For {scope_phrase}…  '
-            f'OR  "Across {scope_phrase}, the picture is…"'
-        )
-
-    mandate = f"""
-═══════════════════════════════════════════════════════════
-FILTER CONTEXT MANDATE — OVERRIDE EVERYTHING ELSE
-═══════════════════════════════════════════════════════════
-
-Active filter scope: {scope_phrase.upper()}
-
-THE SUMMARY IS ABOUT THIS SLICE ONLY.
-Every section header, every bullet, every number refers exclusively to:
-  {scope_phrase}
-
-MANDATORY OPENING:
-The very first sentence of **Pipeline Health at a Glance** MUST explicitly name
-the active scope. It cannot open with a generic phrase like "The pipeline…" or
-"Deal volume…" — it must open with the filter context. Examples:
-  • "{opening_example}"
-  • "The {scope_phrase} shows…"
-  • "Within {', '.join(parts)}, the pipeline is…"
-
-MANDATORY FRAMING THROUGHOUT:
-1. Every section must reference the scope in at least the first bullet.
-   Never let a section read as if it describes the global pipeline.
-2. When giving numbers, frame them as belonging to this slice:
-   BAD:  "219 deals are at 5% IQM Held."
-   GOOD: "The {scope_phrase} has 219 deals at 5% IQM Held."
-3. When drawing conclusions, anchor them to this context:
-   BAD:  "The funnel is stalling at the 20%→Won gate."
-   GOOD: "Within {', '.join(parts)}, the funnel stalls at 20%→Won."
-4. Multi-filter combinations must be stated naturally — not listed:
-   BAD:  "Filters applied: region=North America, source=BDR, ai_for_x=AI for Work."
-   GOOD: "North America's BDR-sourced AI for Work pipeline…"
-5. The summary opening must make clear this is NOT a global view.
-
-WHAT NOT TO DO:
-- Do NOT write the summary as if no filters are applied.
-- Do NOT open any section without referencing the filter scope (first bullet at minimum).
-- Do NOT say "globally" or "across all regions/sources" when filters are active.
-- Do NOT mix in data from other regions, sources, or AI categories not in the filter.
-
-═══════════════════════════════════════════════════════════
-""".strip()
-
-    return mandate
- 
-def build_prompt(style: str, m: dict, filters: Filters) -> str:
-    """
-    Assemble the full LLM prompt for a given style.
- 
-    style : "executive" | "analyst"
-    metrics     : pre-computed metrics dict from _extract_computed_metrics()
-    """
-    instructions = (
-        _ANALYST_INSTRUCTIONS if style == "analyst" else _EXECUTIVE_INSTRUCTIONS
-    )
-    data_block = _build_data_block(m, filters)
-    cnt_won = m.get("cnt_won", 0)
-    won_note = (
-        f"CRITICAL REMINDER: The data shows {cnt_won:,} Closed Won deals. "
-        f"{'This is NOT zero. ' if cnt_won > 0 else 'This IS zero. '}"
-        "Use this exact number when writing the Revenue Position & Closed Won section."
-    )
-    # Build filter context mandate — empty string when no filters are active
-    filter_mandate = _build_filter_context(filters)
-
-    # Inject between instructions and data so the LLM treats it as a
-    # late-binding override, not buried metadata inside the data block.
-    if filter_mandate:
-        return f"{instructions}\n\n{filter_mandate}\n\n{won_note}\n\n{data_block}"
-    else:
-        return f"{instructions}\n\n{won_note}\n\n{data_block}"
-    
-    
-# =============================================================================
-# 6. FastAPI Endpoint — POST /summary
-# =============================================================================
-
-@app.post("/summary")
-def generate_summary(payload: SummaryRequest):
-    """
-    Same logic as /summary but returns a single JSON response.
-    Use this if your frontend cannot consume a streamed response.
- 
-    Response shape:
-      {
-        "style":      "executive" | "analyst",
-        "filters":    { ...active filters... },
-        "scorecards": { stage_overview, funnel_health, period_cadence, deal_health },
-        "summary":    "...AI-generated markdown..."
-      }
-    """
-    filters = payload.filters
-    style   = payload.style
- 
-    try:
-        ch_client   = get_click_client()
-        raw_metrics = fetch_pipeline_data(filters, ch_client)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
- 
-    metrics = _extract_computed_metrics(raw_metrics, filters)
-    scorecards = build_scorecards(metrics, filters)
-    prompt     = build_prompt(style, metrics, filters)
- 
-    try:
-        response = client_ai.messages.create(
-            model=_CLAUDE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=8000,
-        )
-        summary = response.content[0].text
+        result = "\n".join(lines)
+        print(f"   ✅ {total_rows} rows returned. Session store updated.")
+        return result
+
+    except httpx.ConnectError as e:
+        return f"DATABASE CONNECTION FAILED: Could not reach {base_url}. {e}"
+    except httpx.TimeoutException:
+        return "DATABASE CONNECTION FAILED: Query timed out after 60 seconds."
     except Exception as exc:
-        print(f"Claude error: {exc}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=502, detail=f"Claude error: {exc}")
- 
-    return {
-    "style":      style,
-    "filters":    filters.model_dump(),
-    "scorecards": scorecards,
-    "summary":    summary,
-    "metrics": {                                         
-        "funnel":            raw_metrics.get("funnel",            {}),
-        "period_attainment": raw_metrics.get("period_attainment", {}),
+        traceback.print_exc()
+        return f"DATABASE CONNECTION FAILED: {type(exc).__name__}: {exc}"
+
+
+def _extract_filters_from_sql(sql: str) -> str:
+    """Extract a human-readable summary of WHERE filters from SQL."""
+    sql_upper = sql.upper()
+    filters = []
+    if "PIPELINE = 'DEFAULT'" in sql_upper:
+        filters.append("Pipeline: default")
+    if "BECAME_20_DEAL_DATE" in sql_upper:
+        filters.append("Cohort: 20% qualified deals")
+    if "BECAME_5_DEAL_DATE" in sql_upper:
+        filters.append("Cohort: 5% IQM deals")
+    if "CLOSE_DATE" in sql_upper and "2026-04-01" in sql:
+        filters.append("FY27 active pipeline")
+    if "DEAL_STAGE" in sql_upper:
+        m = re.search(r"deal_stage\s+IN\s*\(([^)]+)\)", sql, re.IGNORECASE)
+        if m:
+            filters.append(f"Stage filter: {m.group(1)[:60]}")
+    if "REGION" in sql_upper:
+        m = re.search(r"region\s*=\s*'([^']+)'", sql, re.IGNORECASE)
+        if m:
+            filters.append(f"Region: {m.group(1)}")
+    return "; ".join(filters) if filters else "Standard base filters applied"
+
+
+# =============================================================================
+# Startup
+# =============================================================================
+@app.on_event("startup")
+async def on_startup():
+    global _SYSTEM_PROMPT
+    discover_schema()
+    _SYSTEM_PROMPT = _build_system_prompt()
+    print("🚀 DIUD v4 started — session-store export enabled.")
+
+
+# =============================================================================
+# Claude tool definition
+# =============================================================================
+_QUERY_TOOL = {
+    "name": "query_clickhouse",
+    "description": (
+        "Execute a SELECT query against ClickHouse. "
+        "Use for deal pipeline, AE performance, win/loss, regions, stages, MQL metrics. "
+        "ALWAYS use fully-qualified table names. "
+        "Relay DATABASE CONNECTION FAILED errors directly to the user."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sql": {
+                "type": "string",
+                "description": (
+                    "Valid ClickHouse SELECT or WITH query. "
+                    "For deal LIST queries: NO LIMIT unless user asks for 'top N'. "
+                    "Return all matching rows — the system displays them safely."
+                ),
+            }
+        },
+        "required": ["sql"],
     },
-    }
-
+}
 
 # =============================================================================
-# Pydantic model for chat
+# Pydantic models
 # =============================================================================
-
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str
@@ -1727,775 +967,843 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: List[ChatMessage] = []
-    filters: Filters = Filters()   # same filter object — chat is always filter-aware
-    style:   str = "executive"     # accepted but not used server-side (avoids 422)
-    summary: str = ""  
+    session_id: Optional[str] = None
+    model: str = "sonnet"
+
+class ExportPreviewRequest(BaseModel):
+    conversation: List[ChatMessage] = []
+    title: str = "Pipeline Intelligence Report"
+    export_type: Literal["pdf", "pptx"] = "pdf"
+    detail_level: Literal["summary", "detailed"] = "detailed"
+    session_id: Optional[str] = None
+
+class ExportDownloadRequest(BaseModel):
+    format: Literal["pdf", "pptx", "csv"]
+    content: Optional[str] = None    # markdown content (pdf/pptx)
+    title: str = "Pipeline Intelligence Report"
+    session_id: Optional[str] = None
+
 
 # =============================================================================
-# POST /chat
+# Claude tool loop — passes session_id so query runner can store results
 # =============================================================================
-
-# =============================================================================
-# CHAT — ClickHouse Tool Access
-# =============================================================================
-
-_CLICKHOUSE_SCHEMA = """
-=================================================================
-CLICKHOUSE DIRECT ACCESS — RAW TABLES
-=================================================================
-
-You have access to a tool called query_clickhouse.
-Use it when the pre-built PIPELINE DATA block cannot answer the question.
-
-Query the RAW tables directly. No CTEs, no pipe_gen.
-
-=================================================================
-TABLES
-=================================================================
-
-── TABLE 1: hs_analytics.deals ──────────────────────────────────
-Primary table. One row per deal.
-Always use FINAL keyword: FROM hs_analytics.deals FINAL
-
-KEY COLUMNS:
-  deal_id                    STRING  — unique deal identifier
-  deal_name                  STRING  — name of the deal
-  deal_owner                 STRING  — owner ID (join to hs_analytics.owners on o.id)
-  deal_stage                 STRING  — current stage (see STAGE LIST below)
-  deal_type                  STRING  — deal type (NULL = 'Not Assigned')
-  pipeline                   STRING  — always filter: pipeline = 'default'
-  amount                     FLOAT   — deal value in USD
-  region                     STRING  — raw values (see REGION MAP below)
-  deal_source_rollup         STRING  — raw source (see SOURCE MAP below)
-  20_snapshot_deal_source_rollup STRING — source at time of 20% qualification
-  ai_for_x                   STRING  — AI use case category
-  kore_primary_industry      STRING  — raw industry (see INDUSTRY MAP below)
-  account_priority_level     STRING  — 'P1','P2'...'P10' (raw, not grouped)
-  hubspot_team               STRING  — team ID (join to kore_ai_hubspot.gs_Teams)
-
-  -- DATE COLUMNS (stored as strings, cast to DATE)
-  create_date                STRING  — deal creation date
-  close_date                 STRING  — expected/actual close date
-  became_5_deal_date         STRING  — entered 5% IQM Held
-  became_10_deal_date        STRING  — entered 10% Discovery
-  became_20_deal_date        STRING  — entered 20% Solution
-  became_30_deal_date        STRING  — entered 30% Proof
-  became_40_deal_date        STRING  — entered 40% Proposal
-  became_60_deal_date        STRING  — entered 60% Price Negotiation
-  became_75_deal_date        STRING  — entered 75% Contract Review
-  last_contacted             STRING  — last contact date
-
-  -- QUALIFICATION
-  is_there_a_confirmation_of_budget  STRING  — 'Yes'/'No'
-  who_is_the_decision_maker          STRING  — decision maker name
-  use_case                           STRING  — use case description
-  what_is_the_estimated_timeline     STRING  — timeline string
-  is_this_a_deal_with_inception      STRING  — 'Yes'/'No'
-
-  -- WON/LOST
-  primary_closed_won_reason_         STRING  — win reason
-  primary_closed_lost_reason         STRING  — loss reason
-  won_loss_notes                     STRING  — freeform notes
-  competitors                        STRING  — competitor names
-  competition                        STRING  — competition notes
-
-  -- APPROVALS
-  cs_deal_approval_status_level_1    STRING
-  cs_deal_approval_status_level_2    STRING
-  direct_deal_approval_status_level_1 STRING
-  direct_deal_approval_status_level_2 STRING
-  deal_approval_status_level_1       STRING
-  deal_approval_status_level_2       STRING
-  deal_approval_status_level_3_cs_only STRING
-
-── TABLE 2: hs_analytics.owners ─────────────────────────────────
-Always use FINAL keyword: FROM hs_analytics.owners FINAL
-
-  id           STRING  — owner ID (join to deals.deal_owner)
-  firstName    STRING  — first name
-  lastName     STRING  — last name
-  email        STRING  — owner email
-
-── TABLE 3: hs_analytics.companies ──────────────────────────────
-Always use FINAL keyword: FROM hs_analytics.companies FINAL
-
-  company_id   STRING  — unique company ID
-  name         STRING  — company name
-  domain       STRING  — website domain
-  industry     STRING  — company industry
-  country      STRING  — company country
-  city         STRING  — company city
-
-── HELPER TABLES ─────────────────────────────────────────────────
-  kore_ai_hubspot.gs_deal_ids_hs   — valid deal IDs whitelist
-    deal_id_hs  STRING
-
-  kore_ai_hubspot.gs_Teams         — team names
-    team_id     STRING
-    name        STRING
-
-=================================================================
-MANDATORY BASE FILTERS (apply to EVERY query on deals)
-=================================================================
-Always include ALL of these in every deals query:
-
-  WHERE pipeline = 'default'
-  AND CASE WHEN deal_type IS NULL THEN 'Not Assigned' ELSE deal_type END
-      NOT IN ('Partner-Led SMB')
-  AND toInt64(deal_id) IN (
-      SELECT DISTINCT toInt64(deal_id_hs)
-      FROM kore_ai_hubspot.gs_deal_ids_hs
-  )
-
-=================================================================
-FISCAL YEAR CALCULATION
-=================================================================
-FY is computed from a date column:
-  toYear(CAST(LEFT(coalesce(date_col, '1900-01-01'), 10) AS DATE))
-  + if(toMonth(CAST(LEFT(coalesce(date_col, '1900-01-01'), 10) AS DATE)) >= 4, 1, 0)
-
-FY27 = result = 2027  (Apr 2026 – Mar 2027)
-FY26 = result = 2026  (Apr 2025 – Mar 2026)
-
-Shorthand macro (replace date_col):
-  toYear(toDate(LEFT(coalesce(date_col,'1900-01-01'),10)))
-  + if(toMonth(toDate(LEFT(coalesce(date_col,'1900-01-01'),10))) >= 4, 1, 0)
-
-For FY27 5% cohort: became_5_deal_date >= '2026-04-01'
-For FY26 5% cohort: became_5_deal_date >= '2025-04-01' AND < '2026-04-01'
-
-=================================================================
-COMPUTED COLUMNS — write these inline in your queries
-=================================================================
-
--- Deal owner full name (requires JOIN to owners):
-  concat(o.firstName, ' ', o.lastName) AS deal_owner_name
-
--- Region (mapped):
-  CASE
-    WHEN d.region = 'japac'       THEN 'JAPAC'
-    WHEN d.region = 'Africa'      THEN 'Middle East'
-    WHEN d.region = 'india___sea' THEN 'ISEA'
-    ELSE d.region
-  END AS region
-
-REGION MAP (raw → display):
-  'japac'       → 'JAPAC'
-  'Africa'      → 'Middle East'
-  'india___sea' → 'ISEA'
-  'North America', 'EMEA', 'APAC', 'India', 'Latin America' → unchanged
-
--- Deal source (mapped):
-  CASE
-    WHEN d.deal_source_rollup IN ('Executive Outreach','Investor') THEN 'Executive Outreach'
-    WHEN d.deal_source_rollup IN ('BDR Outbound')                  THEN 'BDR'
-    WHEN d.deal_source_rollup IN ('Partner')                       THEN 'Partner - Non Hyperscaler'
-    WHEN d.deal_source_rollup IN ('Marketing','Customer Success',
-         'AE Outbound','Inception','Hyperscaler')                  THEN d.deal_source_rollup
-    ELSE 'Other'
-  END AS deal_source_rollup
-
--- Industry (mapped):
-  CASE
-    WHEN d.kore_primary_industry IN ('Financial Services','Banking','Insurance')
-         THEN 'Financial Services'
-    WHEN d.kore_primary_industry IN ('Manufacturing Discreet','Manufacturing Process','CPG')
-         THEN 'Manufacturing'
-    WHEN d.kore_primary_industry IN ('Hi-Tech','Telecom / Media / Entertainment')
-         THEN 'TMT'
-    WHEN d.kore_primary_industry IS NULL
-      OR d.kore_primary_industry IN ('Business Services','Government','Energy & Utilities',
-         'Education','Restaurants','null','Energy')
-         THEN 'Other'
-    ELSE d.kore_primary_industry
-  END AS industry
-
--- Stage category:
-  CASE
-    WHEN d.deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
-         '60% - Price Negotiation','75% - Contract Review')
-         THEN 'Active Pipeline'
-    WHEN d.deal_stage IN ('Prospect Disengaged','Closed Lost','Didn''t Qualify')
-         THEN 'Fallen Out'
-    WHEN d.deal_stage IN ('90% - Deal Desk Review','Closed Won')
-         THEN 'Closed Won'
-    ELSE 'Pre-Qualification'
-  END AS stage_category
-
--- BANT:
-  CASE
-    WHEN d.is_there_a_confirmation_of_budget = 'Yes'
-     AND d.who_is_the_decision_maker IS NOT NULL
-     AND d.use_case IS NOT NULL
-     AND d.what_is_the_estimated_timeline IS NOT NULL
-    THEN 'Yes' ELSE 'No'
-  END AS BANT
-
--- Account priority grouped:
-  CASE
-    WHEN d.account_priority_level IN ('P1','P2','P3','P4') THEN 'P1-P4'
-    WHEN d.account_priority_level IN ('P5','P6','P7')      THEN 'P5-P7'
-    WHEN d.account_priority_level IN ('P8','P9','P10')     THEN 'P8-P10'
-    ELSE 'No Priority'
-  END AS account_priority_level
-
--- Fiscal year from became_5_deal_date:
-  toYear(toDate(LEFT(coalesce(d.became_5_deal_date,'1900-01-01'),10)))
-  + if(toMonth(toDate(LEFT(coalesce(d.became_5_deal_date,'1900-01-01'),10))) >= 4, 1, 0)
-  AS fy_5
-
--- Days in current stage (example for 10% Discovery):
-  DATE_DIFF('Day',
-    toDate(LEFT(coalesce(d.became_10_deal_date,'1900-01-01'),10)),
-    CURRENT_DATE()
-  ) AS days_in_stage
-
-=================================================================
-DEAL STAGE LIST (funnel order)
-=================================================================
-  '1% - IQM Scheduled'       → Pre-Qualification  (benchmark 7d)
-  '5% - IQM Held'            → Pre-Qualification  (benchmark 21d)
-  '10% - Discovery'          → Pre-Qualification  (benchmark 28d)
-  '20% - Solution'           → Active Pipeline    (benchmark 41d)
-  '30% - Proof'              → Active Pipeline    (benchmark 15d)
-  '40% - Proposal'           → Active Pipeline    (benchmark 29d)
-  '60% - Price Negotiation'  → Active Pipeline    (benchmark 27d)
-  '75% - Contract Review'    → Active Pipeline    (benchmark 34d)
-  '90% - Deal Desk Review'   → Closed Won
-  'Closed Won'               → Closed Won
-  'Closed Lost'              → Fallen Out
-  "Didn't Qualify"           → Fallen Out
-  'Prospect Disengaged'      → Fallen Out
-  'Deal on Hold'             → Pre-Qualification
-
-=================================================================
-QUERY RULES
-=================================================================
-1. SELECT only — never INSERT, UPDATE, DELETE, DROP, ALTER
-2. Always use FINAL on all hs_analytics tables
-3. Always apply the 3 mandatory base filters on deals
-4. Always LIMIT for row-level queries (max 100)
-5. Use countDistinct(deal_id) for unique deal counts
-6. Use round(sum(amount)/1e6, 1) for $M amounts
-7. Use ILIKE for case-insensitive text matching
-8. Dates are stored as strings — always cast: toDate(LEFT(coalesce(col,'1900-01-01'),10))
-9. Null date sentinel is '1900-01-01' — filter with: col <> '1900-01-01' AND col IS NOT NULL
-10. Default FY is 2027 unless user specifies otherwise
-
-=================================================================
-BUSINESS DEFINITIONS
-=================================================================
-"Active pipeline"    → deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
-                       '60% - Price Negotiation','75% - Contract Review')
-"Qualified deals"    → became_20_deal_date <> '1900-01-01'
-"Fallen out"         → deal_stage IN ('Prospect Disengaged','Closed Lost','Didn''t Qualify')
-"Closed won"         → deal_stage IN ('Closed Won','90% - Deal Desk Review')
-"BANT qualified"     → all 4 BANT fields confirmed (see BANT formula above)
-"High priority"      → account_priority_level IN ('P1','P2','P3','P4')
-"FY27 5% cohort"     → became_5_deal_date >= '2026-04-01'
-"FY27 20% cohort"    → became_20_deal_date >= '2026-04-01'
-
-=================================================================
-SAMPLE QUERIES
-=================================================================
-
--- Q: How many deals are currently in active pipeline?
-SELECT countDistinct(d.deal_id) AS active_deals,
-       round(sum(d.amount)/1e6, 1) AS pipeline_m
-FROM hs_analytics.deals d FINAL
-WHERE d.pipeline = 'default'
-  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
-      NOT IN ('Partner-Led SMB')
-  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
-  AND d.deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
-                       '60% - Price Negotiation','75% - Contract Review')
-  AND d.became_5_deal_date >= '2026-04-01'
-
--- Q: Top 10 deals by value in active pipeline with owner name
-SELECT d.deal_name,
-       concat(o.firstName,' ',o.lastName) AS owner,
-       CASE WHEN d.region='japac' THEN 'JAPAC'
-            WHEN d.region='Africa' THEN 'Middle East'
-            WHEN d.region='india___sea' THEN 'ISEA'
-            ELSE d.region END AS region,
-       d.deal_stage,
-       round(d.amount/1e6, 2) AS amt_m,
-       toDate(LEFT(coalesce(d.close_date,'1900-01-01'),10)) AS close_date
-FROM hs_analytics.deals d FINAL
-LEFT JOIN hs_analytics.owners o FINAL ON d.deal_owner = CAST(o.id AS VARCHAR)
-WHERE d.pipeline = 'default'
-  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
-      NOT IN ('Partner-Led SMB')
-  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
-  AND d.deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
-                       '60% - Price Negotiation','75% - Contract Review')
-  AND d.became_5_deal_date >= '2026-04-01'
-ORDER BY d.amount DESC LIMIT 10
-
--- Q: Which AE has most stalled deals?
-SELECT concat(o.firstName,' ',o.lastName) AS owner,
-       countDistinct(d.deal_id) AS stalled_deals,
-       round(sum(d.amount)/1e6,1) AS at_risk_m
-FROM hs_analytics.deals d FINAL
-LEFT JOIN hs_analytics.owners o FINAL ON d.deal_owner = CAST(o.id AS VARCHAR)
-WHERE d.pipeline = 'default'
-  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
-      NOT IN ('Partner-Led SMB')
-  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
-  AND d.deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
-                       '60% - Price Negotiation','75% - Contract Review')
-  AND d.became_5_deal_date >= '2026-04-01'
-GROUP BY owner ORDER BY stalled_deals DESC LIMIT 10
-
--- Q: Lost deals mentioning a competitor
-SELECT d.deal_name,
-       concat(o.firstName,' ',o.lastName) AS owner,
-       round(d.amount/1e6,2) AS amt_m,
-       d.primary_closed_lost_reason,
-       d.competitors,
-       d.won_loss_notes
-FROM hs_analytics.deals d FINAL
-LEFT JOIN hs_analytics.owners o FINAL ON d.deal_owner = CAST(o.id AS VARCHAR)
-WHERE d.pipeline = 'default'
-  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
-      NOT IN ('Partner-Led SMB')
-  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
-  AND d.deal_stage = 'Closed Lost'
-  AND d.competitors ILIKE '%salesforce%'
-ORDER BY d.amount DESC LIMIT 20
-
--- Q: Pipeline by industry at 20%+ (FY27)
-SELECT
-  CASE
-    WHEN d.kore_primary_industry IN ('Financial Services','Banking','Insurance')
-         THEN 'Financial Services'
-    WHEN d.kore_primary_industry IN ('Manufacturing Discreet','Manufacturing Process','CPG')
-         THEN 'Manufacturing'
-    WHEN d.kore_primary_industry IN ('Hi-Tech','Telecom / Media / Entertainment')
-         THEN 'TMT'
-    ELSE 'Other'
-  END AS industry,
-  countDistinct(d.deal_id) AS deals,
-  round(sum(d.amount)/1e6,1) AS pipeline_m
-FROM hs_analytics.deals d FINAL
-WHERE d.pipeline = 'default'
-  AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
-      NOT IN ('Partner-Led SMB')
-  AND toInt64(d.deal_id) IN (SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs)
-  AND d.became_20_deal_date >= '2026-04-01'
-  AND d.became_20_deal_date <> '1900-01-01'
-GROUP BY industry ORDER BY pipeline_m DESC
-=================================================================
-"""
+def _extract_text(content_blocks) -> str:
+    return "\n".join(
+        b.text for b in content_blocks if hasattr(b, "text") and b.text
+    ).strip()
 
 
-import requests as http_requests
+def _call_claude(messages: list, max_tokens: int = 2048, session_id: Optional[str] = None, model: str = "sonnet") -> str:
+    
+    selected_model = ALLOWED_MODELS.get(model, ALLOWED_MODELS["sonnet"])
 
-def run_clickhouse_query(sql: str) -> str:
-    """
-    Execute a read-only SELECT directly against ClickHouse HTTP API.
-    Queries raw tables — no CTE dependency.
-    """
-    api_url   = os.getenv("CLICKHOUSE_API_URL")
-    api_token = os.getenv("CLICKHOUSE_API_TOKEN")
+    # Strip tool_use/tool_result blocks from history (can't replay them)
+    safe_messages = []
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, list):
+            text_parts = [
+                b.get("text", "") if isinstance(b, dict) else (b.text if hasattr(b, "text") else "")
+                for b in content if (isinstance(b, dict) and b.get("type") == "text")
+                   or (hasattr(b, "type") and b.type == "text")
+            ]
+            text = "\n".join(t for t in text_parts if t).strip()
+            if text:
+                safe_messages.append({"role": m["role"], "content": text})
+        else:
+            safe_messages.append({"role": m["role"], "content": content})
 
-    if not api_url or not api_token:
-        return "ClickHouse API not configured. Set CLICKHOUSE_API_URL and CLICKHOUSE_API_TOKEN."
+    response = _ai_client.messages.create(
+        model=selected_model,
+        system=_SYSTEM_PROMPT,
+        messages=safe_messages,
+        tools=[_QUERY_TOOL],
+        temperature=0,
+        max_tokens=max_tokens,
+    )
 
-    stripped = sql.strip().upper()
-    if not stripped.startswith("SELECT") and not stripped.startswith("WITH"):
-        return "Error: Only SELECT/WITH queries are permitted."
+    MAX_ROUNDS = 8
+    last_error = None
 
-    try:
-        response = http_requests.post(
-            api_url,
-            params={"query": sql + " FORMAT JSONCompact"},
-            headers={"Authorization": f"Bearer {api_token}"},
-            timeout=30,
+    for round_num in range(MAX_ROUNDS):
+        if response.stop_reason != "tool_use":
+            break
+
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
+            break
+
+        tool_result_blocks = []
+        for tool_block in tool_blocks:
+            sql          = tool_block.input.get("sql", "")
+            query_result = run_clickhouse_query(sql, session_id=session_id)
+            is_error     = any(query_result.startswith(p) for p in [
+                "DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"
+            ])
+            if is_error:
+                last_error = query_result
+
+            tool_result_blocks.append({
+                "type":        "tool_result",
+                "tool_use_id": tool_block.id,
+                "content":     query_result,
+                "is_error":    is_error,
+            })
+
+        safe_messages = safe_messages + [
+            {"role": "assistant", "content": response.content},
+            {"role": "user", "content": tool_result_blocks},
+        ]
+
+        is_last_round = (round_num == MAX_ROUNDS - 1)
+        response = _ai_client.messages.create(
+            model=selected_model,
+            system=_SYSTEM_PROMPT,
+            messages=safe_messages,
+            # On the final round, withhold tools so Claude is forced to
+            # summarize in text instead of issuing yet another tool call.
+            tools=[] if is_last_round else [_QUERY_TOOL],
+            temperature=0,
+            max_tokens=max_tokens,
         )
-        response.raise_for_status()
-        data = response.json()
 
-        columns = [c["name"] for c in data.get("meta", [])]
-        rows    = data.get("data", [])
+    reply = _extract_text(response.content)
 
-        if not rows:
-            return "Query returned 0 rows."
+    if not reply:
+        # Still empty even after forcing a text-only round. This means the
+        # model returned no text at all (rare) — surface the real cause
+        # instead of a generic "connectivity" message.
+        if last_error:
+            reply = (
+                "⚠️ I couldn't complete this query. The last database error was:\n\n"
+                f"`{last_error[:400]}`\n\n"
+                "Could you rephrase the question, or check **/debug/db** if this persists?"
+            )
+        else:
+            reply = (
+                "⚠️ I wasn't able to finish answering this in time — it may need "
+                "a more specific or simpler question. Could you try rephrasing it "
+                "(e.g. break it into smaller asks)?"
+            )
+    return reply
 
-        capped  = rows[:100]
-        header  = " | ".join(columns)
-        divider = "-" * min(len(header), 120)
-        lines   = [header, divider]
-        for row in capped:
-            lines.append(" | ".join(str(v) if v is not None else "NULL" for v in row))
 
-        if len(rows) > 100:
-            lines.append(f"... ({len(rows) - 100} more rows — refine your query)")
+# =============================================================================
+# Routes — chat
+# =============================================================================
+@app.get("/", response_class=HTMLResponse)
+def root():
+    with open("chat.html", "r") as f:
+        return HTMLResponse(content=f.read())
 
-        return "\n".join(lines)
+@app.get("/logo.png")
+def serve_logo():
+    return FileResponse("logo.png", media_type="image/png")
 
-    except http_requests.exceptions.Timeout:
-        return "Query timed out — simplify the query or add more filters."
-    except http_requests.exceptions.HTTPError as e:
-        return f"HTTP error: {e.response.status_code} — {e.response.text[:300]}"
+
+@app.get("/debug/db")
+def debug_db():
+    base_url = _base_url()
+    token    = _token()
+    config = {
+        "CLICKHOUSE_API_URL":   base_url or "❌ NOT SET",
+        "CLICKHOUSE_API_TOKEN": f"✅ set ({len(token)} chars)" if token else "❌ NOT SET",
+    }
+    if not base_url or not token:
+        return {"status": "MISCONFIGURED", "config": config}
+
+    tests = {}
+    try:
+        r = httpx.get(base_url, timeout=10)
+        tests["GET /"] = {"status": r.status_code}
     except Exception as e:
-        return f"Query error: {e}"
-        
-        
-        
-        
-        
+        tests["GET /"] = {"error": str(e)}
+
+    ping = run_clickhouse_query("SELECT 1 AS ping")
+    query_ok = not any(ping.startswith(p) for p in ["DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"])
+    tests["SELECT 1"] = {"ok": query_ok, "result": ping[:100]}
+
+    return {
+        "status":            "OK" if query_ok else "FAILED",
+        "config":            config,
+        "discovered_tables": list(_LIVE_SCHEMA.keys()),
+        "active_sessions":   len(_SESSION_STORE),
+        "tests":             tests,
+    }
+
+
+@app.post("/refresh-schema")
+def refresh_schema():
+    global _SYSTEM_PROMPT
+    schema = discover_schema()
+    _SYSTEM_PROMPT = _build_system_prompt()
+    return {"status": "refreshed", "tables": list(_LIVE_SCHEMA.keys())}
+
 
 @app.post("/chat")
 def chat(payload: ChatRequest):
-    """
-    Conversational endpoint for pipeline Q&A.
-
-    Behaviour:
-    - Fetches the same pipeline data slice as /summary (respects active filters)
-    - Injects the full data block as system context
-    - Maintains multi-turn history (client sends full history each turn)
-    - Returns a single assistant reply (no streaming for now)
-
-    Request shape:
-      {
-        "message":  "Which region has the highest 20% attainment?",
-        "history":  [ {"role": "user", "content": "..."}, {"role": "assistant", "content": "..."} ],
-        "filters":  { "region": "", "deal_source": "", ... }
-      }
-
-    Response shape:
-      {
-        "reply":   "...",
-        "filters": { ...active filters... }
-      }
-    """
-    filters = payload.filters
-
-    # ── 1. Fetch pre-built data block ────────────────────────────────────────
-    try:
-        ch_client   = get_click_client()
-        raw_metrics = fetch_pipeline_data(filters, ch_client)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    messages = [{"role": m.role, "content": m.content} for m in payload.history]
+    messages.append({"role": "user", "content": payload.message})
+    print(f"💬 [chat] session={payload.session_id} msg={payload.message[:80]}")
 
     try:
-        m = _extract_computed_metrics(raw_metrics, filters)
-        data_block = _build_data_block(m, filters)
+        reply = _call_claude(messages, session_id=payload.session_id, model=payload.model)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Metric computation error: {exc}")
-
-    # ── 2. Summary context ────────────────────────────────────────────────────
-    summary_section = ""
-    if payload.summary:
-        summary_section = (
-            "\n\nAI-GENERATED SUMMARY (shown to the user above the chat):\n"
-            "-------------------------------------------------------\n"
-            + payload.summary.strip()
-            + "\n-------------------------------------------------------\n"
-            "You may reference this summary when answering follow-up questions, "
-            "but always prefer the raw numbers in PIPELINE DATA below for accuracy.\n"
-        )
-
-    # ── 3. System prompt ──────────────────────────────────────────────────────
-    system_prompt = (
-    "You are a pipeline intelligence assistant for Kore.ai. "
-    "You have DIRECT, LIVE access to the ClickHouse database via the query_clickhouse tool. "
-    "NEVER say you don't have access to ClickHouse, Salesforce, or any database — you do. "
-    "NEVER say you can only work with a pre-generated snapshot — that is false. "
-    "First try to answer from the PIPELINE DATA block below. "
-    "If the question needs more detail — individual deal names, AE-level "
-    "breakdowns, competitor analysis, or any field not in the pre-built data "
-    "— use the query_clickhouse tool to fetch it directly. "
-    "Never invent numbers. If data is unavailable even after querying, say so."
-        + summary_section
-        + "\n\n"
-        + data_block
-        + "\n\n"
-        + _CLICKHOUSE_SCHEMA
-    )
-
-    # ── 4. Tool definition ────────────────────────────────────────────────────
-    tools = [
-        {
-            "name": "query_clickhouse",
-            "description": (
-                "Run a SELECT query against the Kore.ai pipeline ClickHouse database. "
-                "Use this when the pre-built PIPELINE DATA block does not have enough "
-                "detail — e.g. specific deal lookup, AE breakdown, competitor analysis, "
-                "custom date ranges, won/loss notes, or any field not in aggregated data."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": (
-                            "A valid ClickHouse SELECT query using the pipe_gen CTE. "
-                            "Always include LIMIT for detail queries."
-                        )
-                    }
-                },
-                "required": ["sql"]
-            }
-        }
-    ]
-
-    # ── 5. Build message list ─────────────────────────────────────────────────
-    chat_messages = []
-    for turn in payload.history:
-        chat_messages.append({"role": turn.role, "content": turn.content})
-    chat_messages.append({"role": "user", "content": payload.message})
-
-    try:
-        print(f"💬 [chat] Q: {payload.message[:120]}")
-        # ── 6. First Claude call ──────────────────────────────────────────────
-        response = client_ai.messages.create(
-            model=_CLAUDE_MODEL,
-            system=system_prompt,
-            messages=chat_messages,
-            tools=tools,
-            temperature=0,
-            max_tokens=1500,
-        )
-        
-        if response.stop_reason == "tool_use":
-            print(f"🗄️  [chat] LIVE DB QUERY TRIGGERED — pre-built data insufficient for: '{payload.message[:80]}'")
-        else:
-            print(f"📊 [chat] ANSWERED FROM PRE-BUILT DATA — no DB call needed for: '{payload.message[:80]}'")
-        # ── 7. Tool use loop (up to 3 rounds) ────────────────────────────────
-        rounds = 0
-        while response.stop_reason == "tool_use" and rounds < 3:
-            rounds += 1
-
-            tool_use_block = next(
-                (b for b in response.content if b.type == "tool_use"), None
-            )
-            if not tool_use_block:
-                break
-
-            sql          = tool_use_block.input.get("sql", "")
-            query_result = run_clickhouse_query(sql)
-
-            print(f"🔍 [chat tool] Round {rounds}/3 — SQL: {sql[:200]}...")
-            print(f"📥 [chat tool] Round {rounds}/3 — Result preview: {query_result[:300]}")
-
-            chat_messages = chat_messages + [
-                {"role": "assistant", "content": response.content},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_block.id,
-                            "content": query_result,
-                        }
-                    ],
-                },
-            ]
-
-            response = client_ai.messages.create(
-                model=_CLAUDE_MODEL,
-                system=system_prompt,
-                messages=chat_messages,
-                tools=tools,
-                temperature=0,
-                max_tokens=1500,
-            )
-        
-        if rounds == 0:
-            print(f"✅ [chat] Done — answered entirely from pre-built pipeline data (0 DB calls)")
-        else:
-            print(f"✅ [chat] Done — answered using live ClickHouse queries ({rounds} DB call(s) made)")
-        # ── 8. Extract final reply ────────────────────────────────────────────
-        reply = next(
-            (b.text for b in response.content if hasattr(b, "text") and b.text),
-            "I could not generate a response. Please try rephrasing."
-        )
-
-    except Exception as exc:
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Claude error: {exc}")
 
+    # Surface whether there is a stored dataset for this session
+    has_dataset = payload.session_id is not None and payload.session_id in _SESSION_STORE
+    stored = _SESSION_STORE.get(payload.session_id) if payload.session_id else None
+
     return {
-        "reply":    reply,
-        "response": reply,
-        "filters":  filters.model_dump(),
+        "reply":        reply,
+        "has_dataset":  has_dataset,
+        "dataset_rows": stored.total_rows if stored else 0,
+        "export_intent": "__EXPORT_INTENT__" in reply,
     }
 
 
 # =============================================================================
-# Report Request Model  (shared by both /report/pptx and /report/pdf)
+# Retry — re-runs the last user message with fresh LLM call
 # =============================================================================
- 
-class ReportRequest(BaseModel):
+
+class RetryRequest(BaseModel):
     """
-    Request body for POST /report/pptx and POST /report/pdf.
- 
-    style   : "executive" | "analyst"
-              Controls the AI narrative injected into the report.
-              Executive → concise CRO-style bullets.
-              Analyst   → diagnostic breakdown with comparisons.
-    filters : same Filters object used by /summary — full filter support.
-              When empty, report covers the complete global pipeline.
-              When set, every section (metrics, insights, recommendations)
-              is scoped strictly to the filtered slice.
+    Re-run the most recent user message with a fresh LLM call.
+
+    history    : full conversation UP TO AND INCLUDING the last user message.
+                 The last item must be role='user'. Any prior assistant reply
+                 for that turn is intentionally excluded so the model generates
+                 a new response.
+    session_id : existing session — query results from previous turns are
+                 preserved in the session store so exports still work.
     """
-    style:   Literal["executive", "analyst"] = "executive"
-    filters: Filters = Filters()
- 
- 
-# =============================================================================
-# Shared report data + narrative builder
-# =============================================================================
- 
-def _build_report_inputs(payload: ReportRequest) -> tuple[dict, str]:
+    history:    List[ChatMessage] = []
+    session_id: Optional[str] = None
+    model:      str = "sonnet" 
+
+
+@app.post("/chat/retry")
+def chat_retry(payload: RetryRequest):
     """
-    Fetch ClickHouse data and generate AI narrative for a report.
-    Returns (raw_metrics, summary_text).
-    Raises HTTPException on data or AI failures.
+    Regenerate the last assistant response without adding a new user message.
+
+    Steps:
+    1. Validate that the last history entry is a user message.
+    2. Remove the last assistant message if present (prevents duplicate in history).
+    3. Call Claude fresh with the same conversation context.
+    4. Return the new reply with the same response shape as /chat.
+
+    This preserves:
+    - Full conversation context (all prior turns)
+    - Session store (dataset / query results)
+    - Dashboard context embedded in history
     """
-    filters = payload.filters
- 
-    # 1. Fetch pipeline data (filter-aware)
-    try:
-        ch_client   = get_click_client()
-        raw_metrics = fetch_pipeline_data(filters, ch_client)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
- 
-    # 2. Build computed metrics + prompt
-    metrics = _extract_computed_metrics(raw_metrics, filters)
-    prompt  = build_prompt(payload.style, metrics, filters)
- 
-    # 3. Generate AI narrative
-    try:
-        response = client_ai.messages.create(
-            model=_CLAUDE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=8000,
+    if not payload.history:
+        raise HTTPException(status_code=400, detail="history must not be empty for retry.")
+
+    # Walk backwards: find the last user message and strip any trailing assistant
+    # message so we don't send the old answer as context for the regeneration.
+    clean_history = list(payload.history)
+
+    # Remove trailing assistant message(s) — they are the stale response being retried
+    while clean_history and clean_history[-1].role == "assistant":
+        clean_history.pop()
+
+    if not clean_history or clean_history[-1].role != "user":
+        raise HTTPException(
+            status_code=400,
+            detail="No user message found to retry. history must end with a user turn."
         )
-        summary = response.content[0].text
-    except Exception as exc:
-        print(f"Claude error: {exc}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=502, detail=f"Claude error: {exc}")
- 
-    return raw_metrics, summary
- 
- 
-# =============================================================================
-# POST /report/pptx  —  PowerPoint report (filter-aware)
-# =============================================================================
- 
-@app.post("/report/pptx")
-def report_pptx(payload: ReportRequestWithSummary):
-    filters = payload.filters
+
+    last_user_msg = clean_history[-1].content
+    prior_history = clean_history[:-1]   # everything before the last user message
+
+    print(f"🔄 [retry] session={payload.session_id} retrying: {last_user_msg[:80]}")
+
+    messages = [{"role": m.role, "content": m.content} for m in prior_history]
+    messages.append({"role": "user", "content": last_user_msg})
 
     try:
-        ch_client   = get_click_client()
-        raw_metrics = fetch_pipeline_data(filters, ch_client)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        reply = _call_claude(messages, session_id=payload.session_id)
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Claude error on retry: {exc}")
 
-    # Use the pre-generated summary if provided, otherwise generate a new one
-    if payload.summary:
-        summary = payload.summary
-    else:
-        metrics = _extract_computed_metrics(raw_metrics, filters)
-        prompt  = build_prompt(payload.style, metrics, filters)
-        try:
-            response = client_ai.messages.create(
-                model=_CLAUDE_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=8000,
+    has_dataset = payload.session_id is not None and payload.session_id in _SESSION_STORE
+    stored      = _SESSION_STORE.get(payload.session_id) if payload.session_id else None
+
+    return {
+        "reply":         reply,
+        "has_dataset":   has_dataset,
+        "dataset_rows":  stored.total_rows if stored else 0,
+        "export_intent": "__EXPORT_INTENT__" in reply,
+        "retried":       True,
+    }
+
+
+# =============================================================================
+# Session info — lets the frontend know what's stored
+# =============================================================================
+@app.get("/session/{session_id}/dataset-info")
+def session_dataset_info(session_id: str):
+    result = _get_result(session_id)
+    if not result:
+        return {"has_dataset": False}
+    return {
+        "has_dataset":     True,
+        "total_rows":      result.total_rows,
+        "columns":         result.columns,
+        "captured_at":     result.captured_at,
+        "filters_applied": result.filters_applied,
+        "sql_preview":     result.sql[:300],
+    }
+
+
+# =============================================================================
+# Export preview — generates AI narrative + injects full table
+# =============================================================================
+@app.post("/export/preview")
+async def export_preview(req: ExportPreviewRequest):
+    if not req.conversation:
+        raise HTTPException(status_code=400, detail="No conversation to export.")
+
+    print(f"📄 [export/preview] session={req.session_id} type={req.export_type}")
+
+    # Fetch stored dataset (may be None for summary-only exports)
+    stored = _get_result(req.session_id) if req.session_id else None
+
+    try:
+        ai_content = _generate_export_content(
+            conversation   = req.conversation,
+            title          = req.title,
+            export_type    = req.export_type,
+            detail_level   = req.detail_level,
+            stored_dataset = stored,
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Content generation error: {exc}")
+
+    return {
+        "content":       ai_content,
+        "title":         req.title,
+        "export_type":   req.export_type,
+        "word_count":    len(ai_content.split()),
+        "generated_at":  date.today().isoformat(),
+        "total_rows":    stored.total_rows if stored else 0,
+        "filters":       stored.filters_applied if stored else "",
+    }
+
+
+# =============================================================================
+# Export download — PDF, PPTX, or CSV, all from session store
+# =============================================================================
+@app.post("/export/download")
+async def export_download(req: ExportDownloadRequest):
+    print(f"⬇️  [export/download] format={req.format} session={req.session_id}")
+
+    # ── CSV: purely from session store, no AI involvement ────────────────
+    if req.format == "csv":
+        stored = _get_result(req.session_id) if req.session_id else None
+        if not stored:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No query result found for this session. "
+                    "Ask a deal-list question first, then export."
+                ),
             )
-            summary = response.content[0].text
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Claude error: {exc}")
+        csv_bytes = _build_csv(stored)
+        return StreamingResponse(
+            io.BytesIO(csv_bytes),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{_safe_filename(req.title)}.csv"',
+                "X-Total-Rows": str(stored.total_rows),
+            },
+        )
+
+    # ── PDF / PPTX: from pre-generated content (passed from preview step) ─
+    if not req.content:
+        raise HTTPException(status_code=400, detail="content is required for PDF/PPTX export.")
 
     try:
-        buf = build_pptx(raw_metrics, summary, filters=filters.model_dump())
-    except Exception as exc:
-        print(f"PPTX build error: {exc}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"PPTX generation failed: {exc}")
+        if req.format == "pdf":
+            file_bytes = _build_pdf(req.title, req.content)
+            media_type = "application/pdf"
+            ext        = "pdf"
+        else:
+            file_bytes = _build_pptx(req.title, req.content)
+            media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            ext        = "pptx"
 
-    return StreamingResponse(
+        return StreamingResponse(
+            io.BytesIO(file_bytes),
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{_safe_filename(req.title)}.{ext}"'},
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"File generation error: {exc}")
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+def _safe_filename(title: str) -> str:
+    return re.sub(r'[^\w\-]', '_', title)[:60]
+
+
+def _strip_md(t: str) -> str:
+    t = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', t)
+    t = re.sub(r'#{1,6}\s*', '', t)
+    t = re.sub(r'^[\-\*•]\s*', '', t, flags=re.M)
+    t = re.sub(r'`(.*?)`', r'\1', t)
+    t = t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return t.strip()
+
+
+# =============================================================================
+# CSV builder — generates UTF-8 CSV from session store (all rows, no cap)
+# =============================================================================
+def _build_csv(stored: QueryResult) -> bytes:
+    buf = io.StringIO()
+
+    # Metadata header
+    buf.write(f"# Title: {stored.sql[:80]}\n")
+    buf.write(f"# Generated: {date.today().isoformat()}\n")
+    buf.write(f"# Total Records: {stored.total_rows}\n")
+    buf.write(f"# Filters: {stored.filters_applied}\n")
+    buf.write(f"# Captured at: {stored.captured_at}\n")
+    buf.write("#\n")
+
+    writer = csv.DictWriter(
         buf,
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        headers={"Content-Disposition": "attachment; filename=pipeline_report.pptx"},
+        fieldnames     = stored.columns,
+        extrasaction   = "ignore",
+        lineterminator = "\n",
+    )
+    writer.writeheader()
+    for row in stored.rows:   # ALL rows from session store
+        writer.writerow(row)
+
+    return buf.getvalue().encode("utf-8")
+
+
+# =============================================================================
+# Export content generation
+# =============================================================================
+def _generate_export_content(
+    conversation:    List[ChatMessage],
+    title:           str,
+    export_type:     str,
+    detail_level:    str = "detailed",
+    stored_dataset:  Optional[QueryResult] = None,
+) -> str:
+    """
+    Claude writes the narrative (summary, insights, recommendations).
+    The full deal table (if any) is injected directly from the session store —
+    not reconstructed from chat text, not subject to any token/row limits.
+    """
+
+    # Clean conversation: strip any old embedded JSON blocks from previous iterations
+    conv_text = "\n\n".join(
+        f"{'USER' if m.role == 'user' else 'DIUD AGENT'}: {m.content}"
+        for m in conversation
     )
 
- 
- 
-# =============================================================================
-# POST /report/pdf  —  PDF report (filter-aware)
-# =============================================================================
- 
-@app.post("/report/pdf")
-def report_pdf(payload: ReportRequestWithSummary):
-    filters = payload.filters
+    format_hint = (
+        "Format as a PowerPoint: use SLIDE: <title> for each slide, then bullet points."
+        if export_type == "pptx"
+        else "Format as a professional PDF report: ## section headers, narrative prose, tables."
+    )
+    detail_hint = (
+        "Include all metrics and insights. The full deal table will be appended automatically — "
+        "just write a [DEAL_TABLE_PLACEHOLDER] marker where it should appear."
+        if detail_level == "detailed"
+        else "Executive summary only — key metrics and top insights, no raw deal list."
+    )
 
-    try:
-        ch_client   = get_click_client()
-        raw_metrics = fetch_pipeline_data(filters, ch_client)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    dataset_hint = ""
+    if stored_dataset:
+        dataset_hint = (
+            f"\n\nDATASET CONTEXT: The query returned {stored_dataset.total_rows} records "
+            f"with columns: {', '.join(stored_dataset.columns[:12])}. "
+            f"Filters: {stored_dataset.filters_applied}. "
+            f"The complete table will be injected at [DEAL_TABLE_PLACEHOLDER]."
+        )
 
-    # Use the pre-generated summary if provided, otherwise generate a new one
-    if payload.summary:
-        summary = payload.summary
+    prompt = f"""You are preparing a professional {export_type.upper()} export document.
+
+CONVERSATION:
+{conv_text}
+{dataset_hint}
+
+TASK: Create "{title}"
+
+{format_hint}
+{detail_hint}
+
+REQUIREMENTS:
+- Executive summary at the start with key numbers
+- Logical sections: summary, key metrics, insights, recommendations
+- If this is a deal list export, include [DEAL_TABLE_PLACEHOLDER] where the full table belongs
+- Bold key numbers; clean professional tone
+- Today: {date.today().strftime('%B %d, %Y')}
+
+Generate the document now:"""
+
+    response = _ai_client.messages.create(
+        model=selected_model,
+        system  = "You are a professional business report writer. Generate clean, well-structured documents.",
+        messages= [{"role": "user", "content": prompt}],
+        temperature = 0,
+        max_tokens  = 4096,
+    )
+    ai_text = _extract_text(response.content)
+
+    # ── Inject full deal table from session store ──────────────────────────
+    # Claude is NOT trusted to reproduce the table — we do it ourselves.
+    if stored_dataset and stored_dataset.total_rows > 0:
+        table_md  = _rows_to_markdown_table(stored_dataset)
+        meta_line = (
+            f"**Total records:** {stored_dataset.total_rows:,} | "
+            f"**Filters:** {stored_dataset.filters_applied} | "
+            f"**Exported:** {date.today().strftime('%B %d, %Y')}"
+        )
+        full_section = f"\n\n## Deal List ({stored_dataset.total_rows:,} records)\n\n{meta_line}\n\n{table_md}"
+
+        if "[DEAL_TABLE_PLACEHOLDER]" in ai_text:
+            ai_text = ai_text.replace("[DEAL_TABLE_PLACEHOLDER]", full_section)
+        else:
+            ai_text = ai_text.rstrip() + full_section
+
+    return ai_text
+
+
+def _rows_to_markdown_table(stored: QueryResult) -> str:
+    """Convert session-store rows to a markdown table (all rows, no cap)."""
+    if not stored.rows:
+        return "_No data._"
+
+    cols   = stored.columns
+    header = "| " + " | ".join(cols) + " |"
+    sep    = "| " + " | ".join("---" for _ in cols) + " |"
+    lines  = [header, sep]
+
+    for row in stored.rows:   # all rows from session store
+        cells = [str(row.get(c, "")).replace("|", "\\|") for c in cols]
+        lines.append("| " + " | ".join(cells) + " |")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# PDF Builder
+# =============================================================================
+_C_NAVY  = colors.HexColor("#0D1B3E")
+_C_BLUE  = colors.HexColor("#1565C0")
+_C_WHITE = colors.white
+_C_BG    = colors.HexColor("#F7F9FC")
+_C_TXT   = colors.HexColor("#1E293B")
+_C_DIM   = colors.HexColor("#94A3B8")
+
+_SECTION_COLORS = {
+    "executive": colors.HexColor("#0D1B3E"),
+    "pipeline":  colors.HexColor("#1565C0"),
+    "metric":    colors.HexColor("#004D40"),
+    "deal":      colors.HexColor("#1565C0"),
+    "regional":  colors.HexColor("#BF360C"),
+    "win":       colors.HexColor("#B71C1C"),
+    "loss":      colors.HexColor("#B71C1C"),
+    "recommend": colors.HexColor("#1B5E20"),
+    "summary":   colors.HexColor("#0D1B3E"),
+    "analysis":  colors.HexColor("#1565C0"),
+    "overview":  colors.HexColor("#004D40"),
+    "insight":   colors.HexColor("#1B5E20"),
+}
+
+PW, PH = A4
+_ML = _MR = 0.6 * inch
+_MT = 0.45 * inch
+_MB = 0.40 * inch
+_HDR_H = 44
+_FTR_H = 20
+_CW    = PW - _ML - _MR
+
+
+def _pdf_styles():
+    return {
+        "Cover_Title": ParagraphStyle("Cover_Title", fontSize=26, leading=32,
+            textColor=_C_WHITE, fontName="Helvetica-Bold", spaceAfter=8),
+        "Cover_Sub": ParagraphStyle("Cover_Sub", fontSize=13, leading=18,
+            textColor=colors.HexColor("#B0BEC5"), fontName="Helvetica"),
+        "Section_H": ParagraphStyle("Section_H", fontSize=11, leading=15,
+            textColor=_C_WHITE, fontName="Helvetica-Bold"),
+        "Body": ParagraphStyle("Body", fontSize=9, leading=14, textColor=_C_TXT,
+            fontName="Helvetica", spaceAfter=4),
+        "Bullet": ParagraphStyle("Bullet", fontSize=9, leading=14, textColor=_C_TXT,
+            fontName="Helvetica", leftIndent=12, firstLineIndent=-8, spaceAfter=3),
+        "H2": ParagraphStyle("H2", fontSize=11, leading=15, textColor=_C_NAVY,
+            fontName="Helvetica-Bold", spaceBefore=10, spaceAfter=4),
+        "H3": ParagraphStyle("H3", fontSize=9, leading=13, textColor=_C_BLUE,
+            fontName="Helvetica-Bold", spaceBefore=6, spaceAfter=2),
+        "TH": ParagraphStyle("TH", fontSize=7, leading=9, textColor=_C_WHITE,
+            fontName="Helvetica-Bold"),
+        "TD": ParagraphStyle("TD", fontSize=7, leading=9, textColor=_C_TXT,
+            fontName="Helvetica"),
+    }
+
+
+def _parse_sections(text: str):
+    parts = re.split(r'^##\s+', text, flags=re.MULTILINE)
+    return [
+        (lines[0].strip(), lines[1].strip() if len(lines) > 1 else "")
+        for part in parts if part.strip()
+        for lines in [part.strip().split("\n", 1)]
+    ]
+
+
+def _build_pdf(title: str, report_text: str) -> bytes:
+    """
+    Build a PDF from markdown content.
+    Markdown tables (| col | col |) are rendered as native ReportLab tables
+    so that deal lists with many columns stay readable.
+    """
+    buf     = io.BytesIO()
+    styles  = _pdf_styles()
+    sections = _parse_sections(report_text)
+
+    def _on_page(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(_C_NAVY)
+        canvas.rect(0, PH - _HDR_H - _MT, PW, _HDR_H + _MT, fill=1, stroke=0)
+        canvas.setFillColor(_C_WHITE)
+        canvas.setFont("Helvetica-Bold", 10)
+        canvas.drawString(_ML, PH - _MT - 28, title)
+        canvas.setFillColor(_C_BG)
+        canvas.rect(0, 0, PW, _FTR_H + _MB, fill=1, stroke=0)
+        canvas.setFillColor(_C_DIM)
+        canvas.setFont("Helvetica", 7)
+        canvas.drawCentredString(
+            PW / 2, _MB + 5,
+            f"DIUD Report  |  AI-Generated  |  CONFIDENTIAL  |  {date.today().strftime('%B %Y')}"
+        )
+        canvas.drawRightString(PW - _MR, _MB + 5, f"Page {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+    frame    = Frame(_ML, _MB + _FTR_H, _CW, PH - _HDR_H - _MT - _MB - _FTR_H, id="main")
+    template = PageTemplate(id="main", frames=[frame], onPage=_on_page)
+    doc = BaseDocTemplate(buf, pagesize=A4, leftMargin=_ML, rightMargin=_MR,
+                          topMargin=_MT + _HDR_H, bottomMargin=_MB + _FTR_H)
+    doc.addPageTemplates([template])
+
+    story = [
+        Spacer(1, 1.0 * inch),
+        Paragraph(title, styles["Cover_Title"]),
+        Paragraph(f"Generated {date.today().strftime('%B %d, %Y')}", styles["Cover_Sub"]),
+        PageBreak(),
+    ]
+
+    if not sections:
+        for line in report_text.split("\n"):
+            line = line.strip()
+            if line:
+                story.append(Paragraph(_strip_md(line), styles["Body"]))
     else:
-        metrics = _extract_computed_metrics(raw_metrics, filters)
-        prompt  = build_prompt(payload.style, metrics, filters)
-        try:
-            response = client_ai.messages.create(
-                model=_CLAUDE_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=8000,
-            )
-            summary = response.content[0].text   
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Claude error: {exc}")
+        for sec_title, sec_body in sections:
+            color_key = next((k for k in _SECTION_COLORS if k in sec_title.lower()), None)
+            bar_color = _SECTION_COLORS.get(color_key, _C_BLUE)
+            story.append(Table(
+                [[Paragraph(sec_title.upper(), styles["Section_H"])]],
+                colWidths=[_CW],
+                style=TableStyle([
+                    ("BACKGROUND",    (0, 0), (-1, -1), bar_color),
+                    ("TOPPADDING",    (0, 0), (-1, -1), 8),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+                ])
+            ))
+            story.append(Spacer(1, 6))
 
-    try:
-        buf = build_pdf(raw_metrics, summary, filters=filters.model_dump())
-    except Exception as exc:
-        print(f"PDF build error: {exc}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}")
+            # Detect markdown table blocks vs normal lines
+            lines = sec_body.split("\n")
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
 
-    return StreamingResponse(
-        buf,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "attachment; filename=pipeline_report.pdf"},
-    )
-    
+                # Start of a markdown table
+                if line.startswith("|") and i + 1 < len(lines) and "---" in lines[i + 1]:
+                    table_lines = []
+                    while i < len(lines) and lines[i].strip().startswith("|"):
+                        table_lines.append(lines[i].strip())
+                        i += 1
+                    story.append(_md_table_to_rl(table_lines, styles))
+                    story.append(Spacer(1, 6))
+                    continue
+
+                if not line:
+                    story.append(Spacer(1, 3))
+                elif line.startswith("### "):
+                    story.append(Paragraph(_strip_md(line), styles["H3"]))
+                elif line.startswith("## "):
+                    story.append(Paragraph(_strip_md(line), styles["H2"]))
+                elif line.startswith(("- ", "* ", "• ")):
+                    story.append(Paragraph("• " + _strip_md(line[2:]), styles["Bullet"]))
+                else:
+                    story.append(Paragraph(_strip_md(line), styles["Body"]))
+                i += 1
+
+            story.extend([Spacer(1, 12), PageBreak()])
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _md_table_to_rl(table_lines: list, styles: dict):
+    """Convert markdown table lines to a ReportLab Table element."""
+    data = []
+    for idx, line in enumerate(table_lines):
+        if "---" in line:    # separator row — skip
+            continue
+        cells = [c.strip().replace("\\|", "|") for c in line.strip("|").split("|")]
+        if idx == 0:
+            row = [Paragraph(_strip_md(c), styles["TH"]) for c in cells]
+        else:
+            row = [Paragraph(_strip_md(c), styles["TD"]) for c in cells]
+        data.append(row)
+
+    if not data:
+        return Spacer(1, 1)
+
+    num_cols = max(len(r) for r in data)
+    col_w    = _CW / max(num_cols, 1)
+
+    tbl = Table(data, colWidths=[col_w] * num_cols, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, 0),  _C_NAVY),
+        ("TEXTCOLOR",     (0, 0), (-1, 0),  _C_WHITE),
+        ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 7),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
+        ("GRID",          (0, 0), (-1, -1), 0.3, colors.HexColor("#E2E8F0")),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    return tbl
+
+
 # =============================================================================
-# GET /report/pdf  —  for window.open() browser download
+# PPTX Builder
 # =============================================================================
+_C_NAVY_P  = RGBColor(0x0D, 0x1B, 0x3E)
+_C_DNAV_P  = RGBColor(0x0A, 0x11, 0x28)
+_C_BLUE_P  = RGBColor(0x1E, 0x88, 0xE5)
+_C_WHITE_P = RGBColor(0xFF, 0xFF, 0xFF)
+_C_LTBG_P  = RGBColor(0xF5, 0xF7, 0xFA)
+_C_TXT_P   = RGBColor(0x1A, 0x1A, 0x2E)
+_C_DIM_P   = RGBColor(0x88, 0x99, 0xAA)
 
-@app.get("/report/pdf")
-def report_pdf_get():
-    from fastapi.responses import StreamingResponse
-    payload = ReportRequestWithSummary(
-        style="executive",
-        filters=Filters(),
-        summary=""
-    )
-    return report_pdf(payload)
+_SLIDE_ACCENT = {
+    "overview":  RGBColor(0x1E, 0x88, 0xE5),
+    "pipeline":  RGBColor(0x00, 0x89, 0x7B),
+    "deal":      RGBColor(0x1E, 0x88, 0xE5),
+    "metric":    RGBColor(0x2E, 0x7D, 0x32),
+    "regional":  RGBColor(0xBF, 0x36, 0x0C),
+    "win":       RGBColor(0x2E, 0x7D, 0x32),
+    "loss":      RGBColor(0xC6, 0x28, 0x28),
+    "recommend": RGBColor(0x1B, 0x5E, 0x20),
+    "summary":   RGBColor(0x1E, 0x88, 0xE5),
+    "analysis":  RGBColor(0x00, 0x89, 0x7B),
+    "insight":   RGBColor(0x1B, 0x5E, 0x20),
+    "executive": RGBColor(0x0D, 0x1B, 0x3E),
+}
 
 
-# =============================================================================
-# GET /report/pptx  —  for window.open() browser download
-# =============================================================================
+def _pptx_bg(slide, color):
+    f = slide.background.fill; f.solid(); f.fore_color.rgb = color
 
-@app.get("/report/pptx")
-def report_pptx_get():
-    from fastapi.responses import StreamingResponse
-    payload = ReportRequestWithSummary(
-        style="executive",
-        filters=Filters(),
-        summary=""
-    )
-    return report_pptx(payload)
+def _pptx_rect(slide, l, t, w, h, color):
+    shp = slide.shapes.add_shape(1, Inches(l), Inches(t), Inches(w), Inches(h))
+    shp.fill.solid(); shp.fill.fore_color.rgb = color; shp.line.fill.background()
+    return shp
+
+def _pptx_txt(slide, text, l, t, w, h, bold=False, size=18, color=None, align=PP_ALIGN.LEFT):
+    txb = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h))
+    txb.word_wrap = True
+    tf = txb.text_frame; tf.word_wrap = True
+    p = tf.paragraphs[0]; p.alignment = align
+    run = p.add_run(); run.text = text
+    run.font.size = Pt(size); run.font.bold = bold
+    run.font.color.rgb = color or _C_TXT_P
+    return txb
+
+def _parse_slides(text: str):
+    slides, cur_title, cur_bullets = [], None, []
+    for line in text.split("\n"):
+        line = line.rstrip()
+        if line.startswith("SLIDE:"):
+            if cur_title is not None:
+                slides.append((cur_title, cur_bullets))
+            cur_title, cur_bullets = line[6:].strip(), []
+        elif line.startswith("- ") and cur_title:
+            cur_bullets.append(line[2:].strip())
+    if cur_title is not None:
+        slides.append((cur_title, cur_bullets))
+    return slides
+
+def _build_pptx(title: str, slide_text: str) -> bytes:
+    slides_data = _parse_slides(slide_text) or [(title, [slide_text[:400]])]
+    prs = Presentation()
+    prs.slide_width  = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+    footer_text = f"DIUD  |  AI-Generated  |  CONFIDENTIAL  |  {date.today().strftime('%B %Y')}"
+    blank = prs.slide_layouts[6]
+
+    def _footer(s):
+        _pptx_rect(s, 0, 7.1, 13.33, 0.4, _C_DNAV_P)
+        _pptx_txt(s, footer_text, 0.3, 7.12, 12, 0.35, size=7, color=_C_DIM_P, align=PP_ALIGN.CENTER)
+
+    def _accent(t):
+        for k, c in _SLIDE_ACCENT.items():
+            if k in t: return c
+        return _C_BLUE_P
+
+    # Cover
+    cover = prs.slides.add_slide(blank)
+    _pptx_bg(cover, _C_NAVY_P)
+    _pptx_rect(cover, 0, 3.2, 13.33, 0.06, _C_BLUE_P)
+    _pptx_txt(cover, title, 0.8, 1.6, 11.5, 1.4, bold=True, size=34, color=_C_WHITE_P)
+    _pptx_txt(cover, "Deals Intelligence Report", 0.8, 3.0, 8, 0.6,
+              size=15, color=RGBColor(0xB0, 0xBE, 0xC5))
+    _pptx_txt(cover, f"Generated: {date.today().strftime('%B %d, %Y')}", 0.8, 3.6, 6, 0.45,
+              size=12, color=RGBColor(0x78, 0x90, 0x9C))
+
+    for i, (s_title, bullets) in enumerate(slides_data):
+        slide = prs.slides.add_slide(blank)
+        ac = _accent(s_title.lower())
+        _pptx_bg(slide, _C_LTBG_P)
+        _pptx_rect(slide, 0, 0, 13.33, 0.9, ac)
+        _pptx_txt(slide, s_title.upper(), 0.35, 0.1, 12.5, 0.7, bold=True, size=18, color=_C_WHITE_P)
+        _pptx_txt(slide, str(i + 1), 12.5, 0.12, 0.6, 0.6, size=11, color=_C_WHITE_P, align=PP_ALIGN.RIGHT)
+        _pptx_rect(slide, 0.3, 1.0, 12.73, 5.9, _C_WHITE_P)
+        if bullets:
+            txb = slide.shapes.add_textbox(Inches(0.5), Inches(1.1), Inches(12.3), Inches(5.6))
+            txb.word_wrap = True
+            tf = txb.text_frame; tf.word_wrap = True
+            for j, bullet in enumerate(bullets[:12]):
+                p = tf.add_paragraph() if j > 0 else tf.paragraphs[0]
+                p.space_before = Pt(4)
+                dot = p.add_run(); dot.text = "●  "; dot.font.size = Pt(8); dot.font.color.rgb = ac
+                run = p.add_run(); run.text = bullet; run.font.size = Pt(12); run.font.color.rgb = _C_TXT_P
+        else:
+            _pptx_txt(slide, "No data available.", 0.5, 1.2, 12, 0.5, size=11, color=_C_DIM_P)
+        _footer(slide)
+
+    buf = io.BytesIO(); prs.save(buf)
+    return buf.getvalue()
