@@ -6,7 +6,7 @@ import os
 import re
 import traceback
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Literal, Optional
 
 import httpx
@@ -53,10 +53,10 @@ app.add_middleware(
 # Claude client
 # =============================================================================
 _ai_client    = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-_CLAUDE_MODEL = "claude-sonnet-4-5"
+_CLAUDE_MODEL = "claude-sonnet-4-6"
 ALLOWED_MODELS = {
-    "sonnet": "claude-sonnet-4-5",
-    "opus":   "claude-opus-4-5",
+    "sonnet": "claude-sonnet-4-6",
+    "opus":   "claude-opus-4-6",
 }
 
 # FIX 1: Increased max_tokens across all call sites
@@ -78,13 +78,25 @@ class QueryResult:
         self.captured_at     = captured_at
         self.filters_applied = filters_applied
 
-_SESSION_STORE: Dict[str, QueryResult] = {}
+
+import threading
+
+_SESSION_STORE:      Dict[str, QueryResult] = {}
+_SESSION_TIMESTAMPS: Dict[str, datetime]    = {}
 
 def _store_result(session_id: str, result: QueryResult):
-    _SESSION_STORE[session_id] = result
+    _SESSION_STORE[session_id]      = result
+    _SESSION_TIMESTAMPS[session_id] = datetime.utcnow()
 
-def _get_result(session_id: str) -> Optional[QueryResult]:
-    return _SESSION_STORE.get(session_id)
+def _cleanup_sessions():
+    cutoff  = datetime.utcnow() - timedelta(hours=4)
+    expired = [sid for sid, ts in list(_SESSION_TIMESTAMPS.items()) if ts < cutoff]
+    for sid in expired:
+        _SESSION_STORE.pop(sid, None)
+        _SESSION_TIMESTAMPS.pop(sid, None)
+    if expired:
+        print(f"🧹 Cleaned {len(expired)} expired sessions.")
+    threading.Timer(3600, _cleanup_sessions).start()
 
 
 # =============================================================================
@@ -688,11 +700,12 @@ CHART TYPE SELECTION:
 - Two metrics side by side (actual vs target) → grouped bar chart
 
 FUNNEL CHART SPECIFIC RULE:
-For conversion funnels, render each stage as a centered trapezoid
-using inline SVG or a CSS clip-path div stack — each stage a different
-vibrant color, the number displayed bold and white inside the shape,
-stage name and conversion % shown to the side. Make it visually
-resemble a real funnel narrowing from top to bottom.
+For conversion funnels, render each stage as a centered trapezoid using inline SVG.
+MANDATORY: Every bar must have a minimum width of 18% of total container width —
+never scale bars to zero or near-zero even if deal count is 1.
+Width formula: Math.max((deals / maxDeals) * 88, 18) + '%'
+Top edge of each trapezoid = bottom width of the previous stage.
+Show deal count + $ amount inside or beside each bar in white text.
 
 DATA LABELING:
 - Bar charts: show the value above or inside each bar in the same
@@ -880,8 +893,12 @@ def _extract_filters_from_sql(sql: str) -> str:
 @app.on_event("startup")
 async def on_startup():
     global _SYSTEM_PROMPT
-    discover_schema()
-    _SYSTEM_PROMPT = _build_system_prompt()
+    try:
+        discover_schema()
+        _SYSTEM_PROMPT = _build_system_prompt()
+    except Exception as e:
+        print(f"⚠️  Schema discovery failed: {e}")
+    _cleanup_sessions()
     print("🚀 DIUD v4 started — session-store export enabled.")
 
 
