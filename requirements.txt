@@ -1,9 +1,7 @@
 fastapi
 uvicorn
-clickhouse-connect
 anthropic
+python-dotenv
+clickhouse-connect
 python-pptx
 reportlab
-requests
-pydantic
-python-dotenv
