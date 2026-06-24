@@ -1,3 +1,4 @@
+
 import csv
 import io
 import json
@@ -52,32 +53,32 @@ app.add_middleware(
 # Claude client
 # =============================================================================
 _ai_client    = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-_CLAUDE_MODEL = "claude-sonnet-4-5"   # fallback default, still used by export
+_CLAUDE_MODEL = "claude-sonnet-4-5"
 ALLOWED_MODELS = {
     "sonnet": "claude-sonnet-4-5",
     "opus":   "claude-opus-4-5",
 }
 
+# FIX 1: Increased max_tokens across all call sites
+# Chat responses: 4096 → handles long analytical responses without mid-sentence cut
+# Export generation: 6144 → handles full reports with large deal tables
+CHAT_MAX_TOKENS   = 4096
+EXPORT_MAX_TOKENS = 6144
+
 # =============================================================================
 # SERVER-SIDE SESSION STORE
-# Keeps the last query result per session so export endpoints can always
-# access the full raw dataset — no JSON embedding in messages, no truncation.
-# Key  : session_id (UUID string, generated once per browser tab)
-# Value: QueryResult dict with full rows + metadata
 # =============================================================================
-
 class QueryResult:
-    """Holds the full raw result of the most recent ClickHouse query in a session."""
     def __init__(self, sql: str, columns: List[str], rows: List[dict],
                  total_rows: int, captured_at: str, filters_applied: str = ""):
-        self.sql            = sql
-        self.columns        = columns
-        self.rows           = rows          # ALL rows, no cap
-        self.total_rows     = total_rows
-        self.captured_at    = captured_at
+        self.sql             = sql
+        self.columns         = columns
+        self.rows            = rows
+        self.total_rows      = total_rows
+        self.captured_at     = captured_at
         self.filters_applied = filters_applied
 
-_SESSION_STORE: Dict[str, QueryResult] = {}   # session_id → QueryResult
+_SESSION_STORE: Dict[str, QueryResult] = {}
 
 def _store_result(session_id: str, result: QueryResult):
     _SESSION_STORE[session_id] = result
@@ -181,8 +182,8 @@ def discover_schema() -> str:
             col_lines = []
             for col in cols:
                 if isinstance(col, dict):
-                    col_name = col.get("name") or col.get("column_name") or col.get("Field") or list(col.keys())[0]
-                    col_type = col.get("type") or col.get("data_type") or col.get("Type") or ""
+                    col_name    = col.get("name") or col.get("column_name") or col.get("Field") or list(col.keys())[0]
+                    col_type    = col.get("type") or col.get("data_type") or col.get("Type") or ""
                     col_comment = col.get("comment") or col.get("Comment") or ""
                     col_lines.append(f"  {col_name:<35} {col_type}" + (f"  — {col_comment}" if col_comment else ""))
                 else:
@@ -473,6 +474,8 @@ NOTE: Single quota tier only — no L1/L2/Committed split.
 
 6.  Match period grain: if actuals are for Q1 FY27, filter target table
     to fy = 'FY27' AND quarter = 'Q1'.
+    NEVER divide annual target by 4 to get quarterly target.
+    ALWAYS filter the target table by the specific quarter: WHERE fy='FY27' AND quarter='Q1'
 
 7.  ATTAINMENT = round(actual / nullIf(target, 0) * 100, 1)
     COVERAGE   = round(pipeline / nullIf(revenue_target, 0), 1)
@@ -484,14 +487,55 @@ NOTE: Single quota tier only — no L1/L2/Committed split.
     performance use gs_partner_targets_region_wise.
 
 =================================================================
-6. DASHBOARD DEFINITIONS
+6. MQL CALCULATION RULES — MANDATORY
+=================================================================
+When computing MQL actuals from hs_analytics.contacts FINAL, ALWAYS apply
+ALL THREE of these filters together. Missing any one produces inflated counts.
+
+MANDATORY MQL FILTERS:
+  1. lifecycle_stage = 'marketingqualifiedlead'
+     AND date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
+  2. company_priority IN ('P1','P2','P3','P4','P5','P6','P7')
+     — excludes contacts with no company priority (unqualified / unknown accounts)
+  3. lead_status != 'Bad Data'
+     — excludes records flagged as dirty / invalid by the ops team
+
+CORRECT MQL ACTUALS PATTERN:
+  SELECT
+    region,
+    original_source,
+    toYYYYMM(toDate(LEFT(date_entered_marketing_qualified_lead_lifecycle_stage_pipeline,10))) AS ym,
+    countDistinct(contact_id) AS mql_count
+  FROM hs_analytics.contacts FINAL
+  WHERE lifecycle_stage = 'marketingqualifiedlead'
+    AND date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
+    AND company_priority IN ('P1','P2','P3','P4','P5','P6','P7')
+    AND lead_status != 'Bad Data'
+    AND <date range filter on date_entered_... column>
+  GROUP BY region, original_source, ym
+
+MQL TARGET PATTERN — always filter by exact quarter, NEVER divide annual by 4:
+  SELECT
+    region,
+    original_source,
+    SUM(toFloat64OrZero(mql_target)) AS mql_tgt
+  FROM kore_ai_hubspot.gs_marketing_targets
+  WHERE fy = 'FY27' AND quarter = 'Q1'   -- ← ALWAYS use quarter filter
+  GROUP BY region, original_source
+
+FILTER CONFIRMATION: After any MQL query, always state in the Filters Applied block:
+  - Company Priority: P1–P7 (excludes unranked contacts)
+  - Lead Status: excludes 'Bad Data'
+  - MQL date range: <the date range used>
+
+=================================================================
+7. DASHBOARD DEFINITIONS
 =================================================================
 When a user asks about a specific dashboard, apply the correct logic below.
 If unclear, ask the user which dashboard context they want.
 
 ── DASHBOARD 1: EOP (End-of-Period) DASHBOARD ──────────────────
-PURPOSE: Tracks pipeline health and attainment against EOP targets
-at the end of each fiscal quarter.
+PURPOSE: Tracks pipeline health and attainment against EOP targets.
 
 KEY METRICS:
   • EOP Pipeline Value — total amount of active deals within EOP date window
@@ -503,66 +547,25 @@ KEY METRICS:
 FILTERS: Mandatory base filters + close_date within current quarter end
 window + deal_stage IN active stages (20%–75%) + pipeline = 'default'
 
-TYPICAL QUERIES: "EOP pipeline vs target for Q2 FY27", "EOP attainment
-by region", "Gap to EOP target this quarter"
-
 ── DASHBOARD 2: EXEC KPI DASHBOARD ─────────────────────────────
-PURPOSE: Senior leadership view of pipeline performance, win rates,
-and revenue attainment across all regions.
+PURPOSE: Senior leadership view of pipeline performance.
 
 KEY METRICS:
-  • Total Active Pipeline ($M) — sum(amount) on active deals
-  • Closed Won ($M) — sum(amount) where deal_stage = 'Closed Won'
+  • Total Active Pipeline ($M)
+  • Closed Won ($M)
   • Closed Won Attainment % — Closed Won ÷ gs_closed_won_quotas × 100
   • Win Rate % — Closed Won ÷ (Closed Won + Closed Lost) × 100
   • Pipeline Coverage — Active Pipeline ÷ Revenue Target
-  • New Logo Count — countDistinct(deal_id) where deal_type = 'New Logo'
-  • ACV Weighted Pipeline — (stage_probability × amount) summed
-
-FILTERS: Mandatory base filters + FY27 date range on close_date +
-exclude deal_stage IN ('Closed Won','Closed Lost') for active pipeline
-
-TYPICAL QUERIES: "Executive KPI summary for FY27", "Closed Won
-attainment vs quota by region", "Win rate trend by quarter"
+  • New Logo Count
 
 ── DASHBOARD 3: CS (Customer Success) DASHBOARD ────────────────
-PURPOSE: Tracks existing customer pipeline — renewals, upsells,
-expansions — and CS team performance.
-
-KEY METRICS:
-  • Renewal Pipeline ($M) — deals where deal_type LIKE '%Renewal%'
-  • Upsell / Expansion Pipeline ($M) — deal_type LIKE '%Upsell%' or LIKE '%Expansion%'
-  • Renewal Win Rate % — Closed Won renewals ÷ total renewals × 100
-  • Net Revenue Retention (NRR) — (Renewals + Upsells) ÷ Base ARR
-  • At-Risk Deals — active deals with stale last_contacted date
-  • CS AE Performance — pipeline/closed won by owner filtered to CS team
-
-FILTERS: Mandatory base filters + deal_type IN ('Renewal','Upsell','Expansion') + FY27
-
-TYPICAL QUERIES: "CS renewal pipeline for FY27", "Upsell attainment
-by AE", "At-risk renewals this quarter"
+PURPOSE: Tracks renewals, upsells, expansions and CS team performance.
 
 ── DASHBOARD 4: GLOBAL PIPELINE GOVERNANCE DASHBOARD ───────────
-PURPOSE: Executive governance view comparing pipeline across all
-regions, sources, and partner types against global targets.
-
-KEY METRICS:
-  • Global Pipeline by Region ($M) — broken down by region + stage
-  • Partner Pipeline ($M) — deals from partner sources (deal_source_rollup LIKE '%Partner%')
-  • Partner Attainment % — vs gs_partner_targets_region_wise
-  • Partner PSD Attainment % — vs gs_partner_targets_psd
-  • Pipeline Coverage Ratio — by region vs gs_pipeline_quotas_v1
-  • Closed Won Governance — actual vs gs_closed_won_quotas by region/quarter
-  • Marketing Sourced Pipeline — deals from marketing sources vs gs_marketing_targets
-
-FILTERS: Mandatory base filters + FY27 date range + appropriate partner
-source filters for partner metrics
-
-TYPICAL QUERIES: "Global pipeline governance report for FY27",
-"Partner pipeline attainment by region", "Closed Won vs quota by quarter"
+PURPOSE: Executive governance view across all regions, sources, partner types.
 
 =================================================================
-7. CORE BUSINESS RULES
+8. CORE BUSINESS RULES
 =================================================================
 
 ── FISCAL YEAR ──────────────────────────────────────────────────
@@ -571,7 +574,6 @@ FY27 = Apr 2026 – Mar 2027. Default to FY27 unless user specifies.
   Q3: Oct–Dec 2026  |  Q4: Jan–Mar 2027
 
 FY calculation: if month >= 4, FY = year + 1, else FY = year.
-Example: Oct 2026 → FY27. Jan 2027 → FY27. Apr 2027 → FY28.
 
 ── REGION MAPPING (display only — use in SELECT, not WHERE) ──────
   japac        → JAPAC
@@ -598,14 +600,6 @@ Only apply deal_stage filter for active pipeline IF the user explicitly
 asks for "active" pipeline. Do not assume active unless stated.
 
 ── REGISTERED DEALS (REG DEALS) DEFINITION ──────────────────────
-For registered/created deals filtered to a specific funnel stage,
-the entry date is the became_[stage]_deal_date for that stage,
-NOT the deal create_date.
-
-Example: "Deals that became 20% in Q1 FY27"
-  → Filter on became_20_deal_date between '2026-04-01' and '2026-06-30'
-  → Also apply deal_stage filter for that stage if user asks for active
-
 Stage-to-column mapping:
   5%  → became_5_deal_date
   10% → became_10_deal_date
@@ -620,18 +614,18 @@ Stage-to-column mapping:
 2.  FINAL on all hs_analytics tables.
 3.  Apply all 3 mandatory base filters on every deals query.
 4.  For LIST queries: NO LIMIT unless user says "top N" or "first N".
-    Return ALL matching rows — the system handles display safely.
 5.  countDistinct(deal_id) for unique deal counts, never count().
 6.  round(sum(amount)/1e6, 1) for $M amounts.
 7.  Dates: toDate(LEFT(coalesce(col,'1900-01-01'),10))
-8.  Always tell the user the TOTAL row count (e.g. "Found 256 deals").
+8.  Always tell the user the TOTAL row count.
 9.  NEVER use numbers from memory or cache. Every metric must be
-    queried live from the database. Never state a count, amount,
-    or percentage without running a query first.
+    queried live from the database.
 
 ── RESPONSE FORMAT ───────────────────────────────────────────────
 Answer in clean markdown. Use tables for data. Bold key numbers.
 Never fabricate numbers. Never run destructive SQL.
+COMPLETE your full response — never stop mid-sentence or mid-table.
+If the response is long, finish all sections before ending.
 
 FILTER CONFIRMATION RULE — MANDATORY
 
@@ -645,23 +639,146 @@ Please verify these filters are correct.
 Would you like any changes to the filters before I continue the analysis?
 ---
 
-Examples:
+=================================================================
+9. VISUAL / CHART GENERATION RULES
+=================================================================
+When producing a chart or visual summary, output it as a COMPLETE HTML
+block inside a fenced code block tagged as "html".
 
-Filters Applied:
-- FY27
-- Region: North America
-- Stage: 20% Deals
-- Deal Source: Partner
+CRITICAL VISUAL RULES:
+1. ALWAYS generate the COMPLETE HTML — never truncate, never use "..." placeholders.
+2. Every row in a bar chart MUST have its bar width pre-computed as:
+   PCT = round((value / max_value) * 100, 1)
+3. Use vivid, high-contrast gradients — not flat single colors.
+4. Charts must be self-contained — no external dependencies.
+5. Never output emoji (🏆🔴🟡) as data indicators — use CSS colored elements.
 
-Please verify these filters are correct.
-Would you like any changes to the filters before I continue the analysis?
+── ENHANCED BAR CHART TEMPLATE ─────────────────────────────────
+Use this exact structure. Replace ALL_CAPS placeholders with real values.
+
+```html
+<div style="background:linear-gradient(160deg,#0D1B3E 0%,#0a1628 100%);
+            border-radius:16px;padding:24px 28px;
+            font-family:'Inter',system-ui,sans-serif;color:white;
+            max-width:580px;box-shadow:0 8px 32px rgba(0,0,0,0.4);
+            border:1px solid rgba(255,255,255,0.06);">
+
+  <!-- Header -->
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;">
+    <div>
+      <div style="font-size:11px;font-weight:700;letter-spacing:1.2px;
+                  text-transform:uppercase;color:#4FC3F7;margin-bottom:4px;">
+        CHART SUBTITLE
+      </div>
+      <div style="font-size:17px;font-weight:700;color:#FFFFFF;line-height:1.3;">
+        CHART TITLE
+      </div>
+    </div>
+    <div style="background:rgba(79,195,247,0.15);border:1px solid rgba(79,195,247,0.3);
+                border-radius:8px;padding:6px 12px;font-size:11px;color:#4FC3F7;font-weight:600;">
+      FY27
+    </div>
+  </div>
+
+  <!-- BAR ROW — repeat for each data row -->
+  <div style="margin-bottom:16px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+      <span style="font-size:13px;color:#B0C4DE;font-weight:500;">ROW_LABEL</span>
+      <div style="display:flex;gap:12px;align-items:center;">
+        <span style="font-size:13px;font-weight:700;color:#FFFFFF;">MAIN_VALUE</span>
+        <span style="font-size:11px;color:#78909C;">SECONDARY_INFO</span>
+      </div>
+    </div>
+    <div style="height:10px;background:rgba(255,255,255,0.07);border-radius:6px;overflow:hidden;position:relative;">
+      <!-- Bar color rules:
+           ≥100% attainment → linear-gradient(90deg,#00C853,#69F0AE)
+           75–99%           → linear-gradient(90deg,#FF8F00,#FFD54F)
+           <75%             → linear-gradient(90deg,#E53935,#EF9A9A)
+           Data / pipeline  → linear-gradient(90deg,#1565C0,#42A5F5) 
+           Use PCT (0–100) computed from value/max_value*100           -->
+      <div style="height:100%;width:PCT%;
+                  background:linear-gradient(90deg,#1565C0,#42A5F5);
+                  border-radius:6px;
+                  box-shadow:0 0 8px rgba(66,165,245,0.5);
+                  transition:width 0.6s ease;"></div>
+    </div>
+    <!-- Optional: percentage label inside/beside bar -->
+    <div style="font-size:10px;color:#546E7A;margin-top:3px;text-align:right;">PCT% of total</div>
+  </div>
+  <!-- END BAR ROW -->
+
+  <!-- Footer -->
+  <div style="margin-top:20px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.06);
+              display:flex;justify-content:space-between;align-items:center;">
+    <span style="font-size:10px;color:#546E7A;">SOURCE / FILTER CONTEXT</span>
+    <span style="font-size:10px;color:#546E7A;">TOTAL_VALUE total</span>
+  </div>
+</div>
+```
+
+── KPI SCORECARD TEMPLATE ───────────────────────────────────────
+Use for 3–4 metric summaries side by side:
+
+```html
+<div style="display:flex;flex-wrap:wrap;gap:14px;margin:10px 0;font-family:'Inter',system-ui,sans-serif;">
+
+  <!-- KPI CARD — repeat for each metric -->
+  <div style="background:linear-gradient(145deg,#0D1B3E,#0a1628);
+              border-radius:14px;padding:18px 22px;min-width:140px;flex:1;
+              border:1px solid rgba(255,255,255,0.07);
+              box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+    <div style="font-size:10px;font-weight:700;text-transform:uppercase;
+                letter-spacing:0.8px;color:#4FC3F7;margin-bottom:8px;">METRIC_NAME</div>
+    <div style="font-size:26px;font-weight:800;color:white;line-height:1;margin-bottom:6px;">METRIC_VALUE</div>
+    <!-- delta: green for positive (#00E676), red for negative (#FF5252) -->
+    <div style="font-size:12px;font-weight:600;color:#00E676;">▲ CHANGE_LABEL</div>
+  </div>
+  <!-- END KPI CARD -->
+
+</div>
+```
+
+── ATTAINMENT GAUGE TEMPLATE ────────────────────────────────────
+For showing a single % attainment with color-coded status:
+
+```html
+<div style="background:linear-gradient(160deg,#0D1B3E,#0a1628);border-radius:16px;
+            padding:20px 24px;font-family:'Inter',system-ui,sans-serif;
+            max-width:340px;border:1px solid rgba(255,255,255,0.07);
+            box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+  <div style="font-size:10px;font-weight:700;letter-spacing:1px;
+              text-transform:uppercase;color:#4FC3F7;margin-bottom:12px;">METRIC_LABEL</div>
+  <div style="font-size:42px;font-weight:800;color:GAUGE_COLOR;line-height:1;">PCT%</div>
+  <div style="margin-top:12px;height:8px;background:rgba(255,255,255,0.07);
+              border-radius:4px;overflow:hidden;">
+    <div style="height:100%;width:min(PCT%, 100)%;
+                background:linear-gradient(90deg,GRADIENT_START,GRADIENT_END);
+                border-radius:4px;box-shadow:0 0 10px rgba(GLOW_COLOR,0.6);"></div>
+  </div>
+  <div style="display:flex;justify-content:space-between;margin-top:6px;
+              font-size:10px;color:#546E7A;">
+    <span>0%</span><span>Target: 100%</span>
+  </div>
+  <div style="margin-top:10px;font-size:12px;color:#78909C;">
+    Actual: ACTUAL_VAL vs Target: TARGET_VAL
+  </div>
+</div>
+```
+
+GAUGE COLOR RULES:
+  ≥100% → color:#00E676; gradient: #00C853 → #69F0AE; glow: 0,200,83
+  75–99% → color:#FFD740; gradient: #FF8F00 → #FFD54F; glow: 255,143,0
+  <75%   → color:#FF5252; gradient: #E53935 → #EF9A9A; glow: 229,57,53
+
+CHART COMPLETION RULE:
+  Generate the ENTIRE HTML in one pass.
+  Do NOT write partial HTML then stop.
+  If multiple charts are needed, generate ALL of them completely
+  before ending your response.
 
 =================================================================
-8. SAMPLE QUESTIONS & QUERY GUIDANCE FOR DIUD
+10. SAMPLE QUESTIONS & QUERY GUIDANCE FOR DIUD
 =================================================================
-The following examples show what the user might ask and what filters
-or logic DIUD must apply. Use these to calibrate interpretation.
-
 ACTIVE PIPELINE:
   Q: "What is our active pipeline for FY27?"
   → deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
@@ -669,129 +786,35 @@ ACTIVE PIPELINE:
     AND close_date BETWEEN '2026-04-01' AND '2027-03-31'
     + mandatory base filters
 
-  Q: "Show me active pipeline by region"
-  → Same as above, GROUP BY region
-
 REG / COHORT DEALS:
   Q: "How many deals became 20% in Q1 FY27?"
   → Filter on became_20_deal_date BETWEEN '2026-04-01' AND '2026-06-30'
-    Do NOT use close_date. Do NOT apply deal_stage filter unless user
-    also says "active".
-
-  Q: "Show me deals that entered 40% stage this quarter"
-  → Filter on became_40_deal_date in current quarter range
 
 CLOSED WON:
   Q: "What is our Closed Won for FY27 by AE?"
   → deal_stage = 'Closed Won'
     AND close_date BETWEEN '2026-04-01' AND '2027-03-31'
-    GROUP BY deal_owner
-    + mandatory base filters
+    GROUP BY deal_owner + mandatory base filters
+
+MQL:
+  Q: "MQL actuals vs target for Q1 FY27?"
+  → Actuals from contacts with ALL THREE mandatory MQL filters
+    Target from gs_marketing_targets WHERE fy='FY27' AND quarter='Q1'
+    NEVER divide by 4 to get quarterly target
 
 TARGETS & ATTAINMENT:
   Q: "Pipeline attainment vs target by region for Q1 FY27?"
   → Use CTE pattern: actual CTE from deals, target CTE from
-    gs_pipeline_quotas_v1 WHERE fy='FY27' AND quarter='Q1',
-    JOIN on fy, quarter, month, deal source, region, compute attainment %
-
-  Q: "Partner pipeline vs target?"
-  → Actual from deals WHERE deal_source_rollup LIKE '%Partner%'
-    Target from gs_partner_targets_region_wise
-
-  Q: "AE quota attainment?"
-  → Actual Closed Won from deals, quota from gs_closed_won_quotas
-    JOIN on deal_owner = ae
-
-MQL / MARKETING:
-  Q: "MQL actuals vs target by source?"
-  → Actuals from hs_analytics.contacts FINAL, counting on
-    date_entered_marketing_qualified_lead_lifecycle_stage_pipeline
-    Targets from gs_marketing_targets
-    JOIN on region + original_source + month
-
-INDUSTRY / REGION DISPLAY:
-  Q: "Pipeline by industry?"
-  → Use kore_primary_industry column, apply industry mapping in
-    SELECT (CASE WHEN) for display grouping, not in WHERE
-
-NEW LOGO vs RENEWAL:
-  Q: "New logo pipeline this FY?"
-  → deal_type = 'New Logo' + active pipeline filters
-
-  Q: "Renewal pipeline at risk?"
-  → deal_type LIKE '%Renewal%' + active pipeline filters
-  
-=================================================================
-9. VISUAL / CHART GENERATION RULES
-=================================================================
-When producing a chart or visual summary, output it as an HTML
-block inside a fenced code block tagged as "html". Do NOT use
-ASCII art, monospace characters, repeated box symbols, or emoji
-(🏆🔴🟡) as data indicators. Use real CSS colored elements.
-
-BAR CHART — use this exact structure, fill in values:
-```html
-<div style="background:#0D1B3E;border-radius:12px;padding:20px 24px;
-            font-family:Inter,system-ui,sans-serif;color:white;max-width:560px;">
-  <div style="font-size:11px;font-weight:600;letter-spacing:.8px;
-              text-transform:uppercase;color:#546E7A;margin-bottom:16px;">
-    CHART TITLE
-  </div>
-
-  <!-- Repeat this block for each row: -->
-  <div style="margin-bottom:14px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
-      <span style="font-size:12.5px;color:#B0BEC5;">ROW LABEL</span>
-      <span style="font-size:13px;font-weight:600;color:white;">VALUE</span>
-    </div>
-    <div style="height:8px;background:rgba(255,255,255,.08);border-radius:4px;overflow:hidden;">
-      <div style="height:100%;width:PCT%;background:linear-gradient(90deg,#1565C0,#1E88E5);
-                  border-radius:4px;"></div>
-    </div>
-  </div>
-
-  <div style="margin-top:16px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08);
-              font-size:10.5px;color:#546E7A;">
-    SOURCE / FILTER CONTEXT
-  </div>
-</div>
-```
-
-KPI CARDS — use for metric summaries (3-4 numbers side by side):
-```html
-<div style="display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;">
-  <div style="background:#0D1B3E;border-radius:10px;padding:16px 20px;
-              min-width:130px;flex:1;border:1px solid rgba(255,255,255,.07);">
-    <div style="font-size:10px;font-weight:600;text-transform:uppercase;
-                letter-spacing:.6px;color:#546E7A;margin-bottom:6px;">METRIC</div>
-    <div style="font-size:22px;font-weight:700;color:white;">VALUE</div>
-    <div style="font-size:11px;color:#4CAF50;margin-top:4px;">▲ CHANGE</div>
-  </div>
-</div>
-```
-
-RULES:
-1. PCT = round((row_value / max_row_value) * 100, 1). Always compute this.
-2. Attainment bar color: ≥100% use #4CAF50 (green), 75-99% use #FFA726 (amber),
-   <75% use #EF5350 (red). Change the background gradient on the inner div.
-3. Positive delta text: color #4CAF50. Negative: color #EF5350.
-4. Every chart must have a title (top) and a source/filter line (bottom).
-5. Never output trophy or circle emojis as performance signals.
+    gs_pipeline_quotas_v1 WHERE fy='FY27' AND quarter='Q1'
 
 """
 
 _SYSTEM_PROMPT = _build_system_prompt()
 
 # =============================================================================
-# ClickHouse query runner — stores full result in session, returns display text
+# ClickHouse query runner
 # =============================================================================
 def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
-    """
-    Execute SQL against ClickHouse.
-    - Stores the FULL result set in _SESSION_STORE[session_id] (no row cap).
-    - Returns a chat-display string capped at CHAT_DISPLAY_LIMIT rows.
-    The export layer reads from the session store and gets all rows.
-    """
     base_url = _base_url()
     token    = _token()
 
@@ -830,7 +853,6 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
 
         payload = resp.json()
 
-        # Normalise to list of rows
         if isinstance(payload, list):
             rows = payload
         elif isinstance(payload, dict):
@@ -844,12 +866,10 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
         if not rows:
             return "Query returned 0 rows."
 
-        # Normalise rows to list-of-dicts
         if isinstance(rows[0], dict):
             columns = list(rows[0].keys())
             norm_rows = rows
         else:
-            # List-of-lists — use index keys
             if api_columns and len(api_columns) == len(rows[0]):
                 columns = [c["name"] if isinstance(c, dict) else c for c in api_columns]
             else:
@@ -858,18 +878,16 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
 
         total_rows = len(norm_rows)
 
-        # ── Store FULL result in session (no row cap) ──────────────────
         if session_id:
             _store_result(session_id, QueryResult(
                 sql          = sql,
                 columns      = columns,
-                rows         = norm_rows,   # ALL rows
+                rows         = norm_rows,
                 total_rows   = total_rows,
                 captured_at  = datetime.utcnow().isoformat() + "Z",
                 filters_applied = _extract_filters_from_sql(sql),
             ))
 
-        # ── Build chat display (capped at 100 rows for readability) ───
         CHAT_DISPLAY_LIMIT = 100
         header = " | ".join(columns)
         lines  = [header, "-" * min(len(header), 140)]
@@ -897,7 +915,6 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
 
 
 def _extract_filters_from_sql(sql: str) -> str:
-    """Extract a human-readable summary of WHERE filters from SQL."""
     sql_upper = sql.upper()
     filters = []
     if "PIPELINE = 'DEFAULT'" in sql_upper:
@@ -916,6 +933,13 @@ def _extract_filters_from_sql(sql: str) -> str:
         m = re.search(r"region\s*=\s*'([^']+)'", sql, re.IGNORECASE)
         if m:
             filters.append(f"Region: {m.group(1)}")
+    # FIX 2: detect MQL filters
+    if "COMPANY_PRIORITY" in sql_upper:
+        filters.append("Company Priority: P1–P7")
+    if "LEAD_STATUS" in sql_upper and "BAD DATA" in sql_upper:
+        filters.append("Lead Status: excludes 'Bad Data'")
+    if "LIFECYCLE_STAGE" in sql_upper and "MARKETINGQUALIFIEDLEAD" in sql_upper:
+        filters.append("Lifecycle: MQL only")
     return "; ".join(filters) if filters else "Standard base filters applied"
 
 
@@ -979,13 +1003,14 @@ class ExportPreviewRequest(BaseModel):
 
 class ExportDownloadRequest(BaseModel):
     format: Literal["pdf", "pptx", "csv"]
-    content: Optional[str] = None    # markdown content (pdf/pptx)
+    content: Optional[str] = None
     title: str = "Pipeline Intelligence Report"
     session_id: Optional[str] = None
 
 
 # =============================================================================
-# Claude tool loop — passes session_id so query runner can store results
+# Claude tool loop
+# FIX 1: max_tokens raised to CHAT_MAX_TOKENS (4096) for chat
 # =============================================================================
 def _extract_text(content_blocks) -> str:
     return "\n".join(
@@ -993,11 +1018,11 @@ def _extract_text(content_blocks) -> str:
     ).strip()
 
 
-def _call_claude(messages: list, max_tokens: int = 2048, session_id: Optional[str] = None, model: str = "sonnet") -> str:
-    
+def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
+                 session_id: Optional[str] = None, model: str = "sonnet") -> str:
+
     selected_model = ALLOWED_MODELS.get(model, ALLOWED_MODELS["sonnet"])
 
-    # Strip tool_use/tool_result blocks from history (can't replay them)
     safe_messages = []
     for m in messages:
         content = m.get("content", "")
@@ -1052,7 +1077,7 @@ def _call_claude(messages: list, max_tokens: int = 2048, session_id: Optional[st
 
         safe_messages = safe_messages + [
             {"role": "assistant", "content": response.content},
-            {"role": "user", "content": tool_result_blocks},
+            {"role": "user",      "content": tool_result_blocks},
         ]
 
         is_last_round = (round_num == MAX_ROUNDS - 1)
@@ -1060,8 +1085,6 @@ def _call_claude(messages: list, max_tokens: int = 2048, session_id: Optional[st
             model=selected_model,
             system=_SYSTEM_PROMPT,
             messages=safe_messages,
-            # On the final round, withhold tools so Claude is forced to
-            # summarize in text instead of issuing yet another tool call.
             tools=[] if is_last_round else [_QUERY_TOOL],
             temperature=0,
             max_tokens=max_tokens,
@@ -1070,9 +1093,6 @@ def _call_claude(messages: list, max_tokens: int = 2048, session_id: Optional[st
     reply = _extract_text(response.content)
 
     if not reply:
-        # Still empty even after forcing a text-only round. This means the
-        # model returned no text at all (rare) — surface the real cause
-        # instead of a generic "connectivity" message.
         if last_error:
             reply = (
                 "⚠️ I couldn't complete this query. The last database error was:\n\n"
@@ -1147,12 +1167,13 @@ def chat(payload: ChatRequest):
     print(f"💬 [chat] session={payload.session_id} msg={payload.message[:80]}")
 
     try:
-        reply = _call_claude(messages, session_id=payload.session_id, model=payload.model)
+        # FIX 1: pass CHAT_MAX_TOKENS explicitly
+        reply = _call_claude(messages, max_tokens=CHAT_MAX_TOKENS,
+                             session_id=payload.session_id, model=payload.model)
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Claude error: {exc}")
 
-    # Surface whether there is a stored dataset for this session
     has_dataset = payload.session_id is not None and payload.session_id in _SESSION_STORE
     stored = _SESSION_STORE.get(payload.session_id) if payload.session_id else None
 
@@ -1165,49 +1186,20 @@ def chat(payload: ChatRequest):
 
 
 # =============================================================================
-# Retry — re-runs the last user message with fresh LLM call
+# Retry
 # =============================================================================
-
 class RetryRequest(BaseModel):
-    """
-    Re-run the most recent user message with a fresh LLM call.
-
-    history    : full conversation UP TO AND INCLUDING the last user message.
-                 The last item must be role='user'. Any prior assistant reply
-                 for that turn is intentionally excluded so the model generates
-                 a new response.
-    session_id : existing session — query results from previous turns are
-                 preserved in the session store so exports still work.
-    """
     history:    List[ChatMessage] = []
     session_id: Optional[str] = None
-    model:      str = "sonnet" 
+    model:      str = "sonnet"
 
 
 @app.post("/chat/retry")
 def chat_retry(payload: RetryRequest):
-    """
-    Regenerate the last assistant response without adding a new user message.
-
-    Steps:
-    1. Validate that the last history entry is a user message.
-    2. Remove the last assistant message if present (prevents duplicate in history).
-    3. Call Claude fresh with the same conversation context.
-    4. Return the new reply with the same response shape as /chat.
-
-    This preserves:
-    - Full conversation context (all prior turns)
-    - Session store (dataset / query results)
-    - Dashboard context embedded in history
-    """
     if not payload.history:
         raise HTTPException(status_code=400, detail="history must not be empty for retry.")
 
-    # Walk backwards: find the last user message and strip any trailing assistant
-    # message so we don't send the old answer as context for the regeneration.
     clean_history = list(payload.history)
-
-    # Remove trailing assistant message(s) — they are the stale response being retried
     while clean_history and clean_history[-1].role == "assistant":
         clean_history.pop()
 
@@ -1218,7 +1210,7 @@ def chat_retry(payload: RetryRequest):
         )
 
     last_user_msg = clean_history[-1].content
-    prior_history = clean_history[:-1]   # everything before the last user message
+    prior_history = clean_history[:-1]
 
     print(f"🔄 [retry] session={payload.session_id} retrying: {last_user_msg[:80]}")
 
@@ -1226,7 +1218,7 @@ def chat_retry(payload: RetryRequest):
     messages.append({"role": "user", "content": last_user_msg})
 
     try:
-        reply = _call_claude(messages, session_id=payload.session_id)
+        reply = _call_claude(messages, max_tokens=CHAT_MAX_TOKENS, session_id=payload.session_id)
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Claude error on retry: {exc}")
@@ -1244,7 +1236,7 @@ def chat_retry(payload: RetryRequest):
 
 
 # =============================================================================
-# Session info — lets the frontend know what's stored
+# Session info
 # =============================================================================
 @app.get("/session/{session_id}/dataset-info")
 def session_dataset_info(session_id: str):
@@ -1262,7 +1254,8 @@ def session_dataset_info(session_id: str):
 
 
 # =============================================================================
-# Export preview — generates AI narrative + injects full table
+# Export preview
+# FIX 1: uses EXPORT_MAX_TOKENS (6144) for long reports
 # =============================================================================
 @app.post("/export/preview")
 async def export_preview(req: ExportPreviewRequest):
@@ -1271,7 +1264,6 @@ async def export_preview(req: ExportPreviewRequest):
 
     print(f"📄 [export/preview] session={req.session_id} type={req.export_type}")
 
-    # Fetch stored dataset (may be None for summary-only exports)
     stored = _get_result(req.session_id) if req.session_id else None
 
     try:
@@ -1298,13 +1290,12 @@ async def export_preview(req: ExportPreviewRequest):
 
 
 # =============================================================================
-# Export download — PDF, PPTX, or CSV, all from session store
+# Export download
 # =============================================================================
 @app.post("/export/download")
 async def export_download(req: ExportDownloadRequest):
     print(f"⬇️  [export/download] format={req.format} session={req.session_id}")
 
-    # ── CSV: purely from session store, no AI involvement ────────────────
     if req.format == "csv":
         stored = _get_result(req.session_id) if req.session_id else None
         if not stored:
@@ -1325,7 +1316,6 @@ async def export_download(req: ExportDownloadRequest):
             },
         )
 
-    # ── PDF / PPTX: from pre-generated content (passed from preview step) ─
     if not req.content:
         raise HTTPException(status_code=400, detail="content is required for PDF/PPTX export.")
 
@@ -1366,12 +1356,10 @@ def _strip_md(t: str) -> str:
 
 
 # =============================================================================
-# CSV builder — generates UTF-8 CSV from session store (all rows, no cap)
+# CSV builder
 # =============================================================================
 def _build_csv(stored: QueryResult) -> bytes:
     buf = io.StringIO()
-
-    # Metadata header
     buf.write(f"# Title: {stored.sql[:80]}\n")
     buf.write(f"# Generated: {date.today().isoformat()}\n")
     buf.write(f"# Total Records: {stored.total_rows}\n")
@@ -1386,7 +1374,7 @@ def _build_csv(stored: QueryResult) -> bytes:
         lineterminator = "\n",
     )
     writer.writeheader()
-    for row in stored.rows:   # ALL rows from session store
+    for row in stored.rows:
         writer.writerow(row)
 
     return buf.getvalue().encode("utf-8")
@@ -1394,6 +1382,7 @@ def _build_csv(stored: QueryResult) -> bytes:
 
 # =============================================================================
 # Export content generation
+# FIX 1: EXPORT_MAX_TOKENS used here for long document generation
 # =============================================================================
 def _generate_export_content(
     conversation:    List[ChatMessage],
@@ -1402,13 +1391,8 @@ def _generate_export_content(
     detail_level:    str = "detailed",
     stored_dataset:  Optional[QueryResult] = None,
 ) -> str:
-    """
-    Claude writes the narrative (summary, insights, recommendations).
-    The full deal table (if any) is injected directly from the session store —
-    not reconstructed from chat text, not subject to any token/row limits.
-    """
+    selected_model = ALLOWED_MODELS["sonnet"]
 
-    # Clean conversation: strip any old embedded JSON blocks from previous iterations
     conv_text = "\n\n".join(
         f"{'USER' if m.role == 'user' else 'DIUD AGENT'}: {m.content}"
         for m in conversation
@@ -1452,20 +1436,19 @@ REQUIREMENTS:
 - If this is a deal list export, include [DEAL_TABLE_PLACEHOLDER] where the full table belongs
 - Bold key numbers; clean professional tone
 - Today: {date.today().strftime('%B %d, %Y')}
+- Generate the COMPLETE document — do not truncate or stop early
 
 Generate the document now:"""
 
     response = _ai_client.messages.create(
-        model=selected_model,
-        system  = "You are a professional business report writer. Generate clean, well-structured documents.",
+        model   = selected_model,
+        system  = "You are a professional business report writer. Generate clean, well-structured, COMPLETE documents. Never truncate mid-section.",
         messages= [{"role": "user", "content": prompt}],
         temperature = 0,
-        max_tokens  = 4096,
+        max_tokens  = EXPORT_MAX_TOKENS,   # FIX 1: was hardcoded 4096
     )
     ai_text = _extract_text(response.content)
 
-    # ── Inject full deal table from session store ──────────────────────────
-    # Claude is NOT trusted to reproduce the table — we do it ourselves.
     if stored_dataset and stored_dataset.total_rows > 0:
         table_md  = _rows_to_markdown_table(stored_dataset)
         meta_line = (
@@ -1484,7 +1467,6 @@ Generate the document now:"""
 
 
 def _rows_to_markdown_table(stored: QueryResult) -> str:
-    """Convert session-store rows to a markdown table (all rows, no cap)."""
     if not stored.rows:
         return "_No data._"
 
@@ -1493,7 +1475,7 @@ def _rows_to_markdown_table(stored: QueryResult) -> str:
     sep    = "| " + " | ".join("---" for _ in cols) + " |"
     lines  = [header, sep]
 
-    for row in stored.rows:   # all rows from session store
+    for row in stored.rows:
         cells = [str(row.get(c, "")).replace("|", "\\|") for c in cols]
         lines.append("| " + " | ".join(cells) + " |")
 
@@ -1567,11 +1549,6 @@ def _parse_sections(text: str):
 
 
 def _build_pdf(title: str, report_text: str) -> bytes:
-    """
-    Build a PDF from markdown content.
-    Markdown tables (| col | col |) are rendered as native ReportLab tables
-    so that deal lists with many columns stay readable.
-    """
     buf     = io.BytesIO()
     styles  = _pdf_styles()
     sections = _parse_sections(report_text)
@@ -1628,13 +1605,11 @@ def _build_pdf(title: str, report_text: str) -> bytes:
             ))
             story.append(Spacer(1, 6))
 
-            # Detect markdown table blocks vs normal lines
             lines = sec_body.split("\n")
             i = 0
             while i < len(lines):
                 line = lines[i].strip()
 
-                # Start of a markdown table
                 if line.startswith("|") and i + 1 < len(lines) and "---" in lines[i + 1]:
                     table_lines = []
                     while i < len(lines) and lines[i].strip().startswith("|"):
@@ -1663,10 +1638,9 @@ def _build_pdf(title: str, report_text: str) -> bytes:
 
 
 def _md_table_to_rl(table_lines: list, styles: dict):
-    """Convert markdown table lines to a ReportLab Table element."""
     data = []
     for idx, line in enumerate(table_lines):
-        if "---" in line:    # separator row — skip
+        if "---" in line:
             continue
         cells = [c.strip().replace("\\|", "|") for c in line.strip("|").split("|")]
         if idx == 0:
@@ -1774,7 +1748,6 @@ def _build_pptx(title: str, slide_text: str) -> bytes:
             if k in t: return c
         return _C_BLUE_P
 
-    # Cover
     cover = prs.slides.add_slide(blank)
     _pptx_bg(cover, _C_NAVY_P)
     _pptx_rect(cover, 0, 3.2, 13.33, 0.06, _C_BLUE_P)
