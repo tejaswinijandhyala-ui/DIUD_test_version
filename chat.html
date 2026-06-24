@@ -696,21 +696,15 @@
           <div class="model-dropdown" id="model-dropdown">
             <div class="model-option active" id="opt-sonnet" onclick="selectModel('sonnet')">
               <div class="model-option-name">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-                     style="width:13px;height:13px;color:var(--accent)">
-                  <circle cx="12" cy="12" r="10"/><polyline points="20 6 9 17 4 12"/>
-                </svg>
-                claude-sonnet-4-5
+                ...
+                claude-sonnet-4-6
               </div>
               <div class="model-option-desc">Fast · Best for most queries</div>
             </div>
             <div class="model-option" id="opt-opus" onclick="selectModel('opus')">
               <div class="model-option-name" style="color:#7C3AED;">
-                <svg viewBox="0 0 24 24" fill="none" stroke="#7C3AED" stroke-width="2.5"
-                     style="width:13px;height:13px;opacity:0">
-                  <circle cx="12" cy="12" r="10"/><polyline points="20 6 9 17 4 12"/>
-                </svg>
-                claude-opus-4-5
+                ...
+                claude-opus-4-6
               </div>
               <div class="model-option-desc">More powerful · Complex analysis</div>
             </div>
@@ -1253,7 +1247,12 @@
     hideFooter();
     previewContent = null;
     if (preselectedFormat) document.getElementById('ep-format').value = preselectedFormat;
-  }
+    document.getElementById('ep-dl-pdf').style.display   = 'none';
+    document.getElementById('ep-dl-pptx').style.display  = 'none';
+    document.getElementById('ep-dl-csv').style.display   = 'none';
+    document.getElementById('ep-progress-fill').style.width = '0%';
+    document.getElementById('ep-steps').innerHTML = '';
+}
   function closeExportPanel() {
     panelOpen = false;
     document.getElementById('export-panel').classList.remove('open');
@@ -1368,7 +1367,9 @@
     document.getElementById('ep-dl-pptx').style.display = 'none';
     const csvBtn = document.getElementById('ep-dl-csv');
     if (csvBtn) csvBtn.style.display = 'none';
-  });
+    document.getElementById('ep-progress-fill').style.width = '0%';
+    document.getElementById('ep-steps').innerHTML = '';
+});
 
   function setProgress(pct, label) {
     document.getElementById('ep-progress-fill').style.width = pct + '%';
@@ -1449,7 +1450,9 @@
       </div>`;
     updateDatasetBadge();
     if (panelOpen) closeExportPanel();
-  }
+    input.value = '';
+    input.style.height = 'auto';
+}
 
   /* ======================================================================
      TOAST
