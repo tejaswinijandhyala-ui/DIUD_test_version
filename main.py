@@ -756,6 +756,480 @@ TARGETS & ATTAINMENT:
 _SYSTEM_PROMPT = _build_system_prompt()
 
 # =============================================================================
+# SQL Guard Rail — validates every query before hitting ClickHouse
+# Built from system prompt rules: Sections 3, 4, 5, 6, 8
+# =============================================================================
+
+def _validate_sql_guardrail(sql: str) -> tuple[bool, str]:
+    """
+    Hard-blocks SQL that violates business rules.
+    Claude sees the returned error as tool output and self-corrects automatically
+    in the next round of the tool loop.
+
+    Returns: (is_valid, error_message)
+    """
+    sql_upper = sql.upper().strip()
+    errors    = []
+
+    # =========================================================================
+    # RULE 1: hs_analytics tables MUST use FINAL
+    # Source: Section 3 — "ALWAYS use FINAL keyword"
+    #         Section 8 Query Rules — "FINAL on all hs_analytics tables"
+    # =========================================================================
+    HS_TABLES = ['DEALS', 'OWNERS', 'COMPANIES', 'CONTACTS']
+    for tbl in HS_TABLES:
+        full_ref = f'HS_ANALYTICS.{tbl}'
+        if full_ref in sql_upper:
+            # Check FINAL appears immediately after the table name
+            # Allows optional alias between table and FINAL
+            has_final = bool(re.search(
+                rf'HS_ANALYTICS\.{tbl}\s+FINAL',
+                sql_upper
+            ))
+            if not has_final:
+                errors.append(
+                    f"RULE VIOLATION — MISSING FINAL KEYWORD:\n"
+                    f"  Table 'hs_analytics.{tbl.lower()}' must be queried with FINAL.\n"
+                    f"  Correct syntax: FROM hs_analytics.{tbl.lower()} FINAL\n"
+                    f"  Reason: hs_analytics uses ClickHouse MergeTree engine. Without FINAL,\n"
+                    f"  multiple versions of the same row are returned, causing:\n"
+                    f"  - Inflated deal counts (same deal counted 2-5x)\n"
+                    f"  - Wrong pipeline totals\n"
+                    f"  - Incorrect win rates and attainment %\n"
+                    f"  Fix: Add FINAL after every hs_analytics table reference."
+                )
+
+    # =========================================================================
+    # RULE 2: deals queries MUST have ALL 3 mandatory base filters
+    # Source: Section 3 — "MANDATORY BASE FILTERS (apply to every deals query)"
+    #         Section 8 Query Rules — "Apply all 3 mandatory base filters"
+    # =========================================================================
+    if 'HS_ANALYTICS.DEALS' in sql_upper:
+
+        # Filter A: pipeline = 'default'
+        if not re.search(r"PIPELINE\s*=\s*'DEFAULT'", sql_upper):
+            errors.append(
+                "RULE VIOLATION — MISSING MANDATORY BASE FILTER A:\n"
+                "  Every deals query must include: WHERE pipeline = 'default'\n"
+                "  Reason: Multiple pipelines exist. Without this filter,\n"
+                "  non-default pipeline deals pollute all metrics.\n"
+                "  Fix: Add pipeline = 'default' to your WHERE clause."
+            )
+
+        # Filter B: Partner-Led SMB exclusion
+        # Checks for the CASE WHEN pattern OR a simpler deal_type exclusion
+        has_partner_smb_filter = (
+            ('PARTNER' in sql_upper and 'SMB' in sql_upper) or
+            ("PARTNER-LED SMB" in sql_upper) or
+            ("PARTNER_LED_SMB" in sql_upper)
+        )
+        if not has_partner_smb_filter:
+            errors.append(
+                "RULE VIOLATION — MISSING MANDATORY BASE FILTER B:\n"
+                "  Every deals query must exclude Partner-Led SMB deals.\n"
+                "  Required pattern:\n"
+                "    CASE WHEN deal_type IS NULL THEN 'Not Assigned'\n"
+                "    ELSE deal_type END NOT IN ('Partner-Led SMB')\n"
+                "  Reason: Partner-Led SMB deals must be excluded from all pipeline metrics.\n"
+                "  Fix: Add this CASE WHEN expression to your WHERE clause."
+            )
+
+        # Filter C: gs_deal_ids_hs allowlist
+        if 'GS_DEAL_IDS_HS' not in sql_upper:
+            errors.append(
+                "RULE VIOLATION — MISSING MANDATORY BASE FILTER C:\n"
+                "  Every deals query must validate against the deal ID allowlist.\n"
+                "  Required pattern:\n"
+                "    toInt64(deal_id) IN (\n"
+                "      SELECT DISTINCT toInt64(deal_id_hs)\n"
+                "      FROM kore_ai_hubspot.gs_deal_ids_hs\n"
+                "    )\n"
+                "  Reason: Only deal IDs in gs_deal_ids_hs are valid for reporting.\n"
+                "  Fix: Add this subquery filter to your WHERE clause."
+            )
+
+    # =========================================================================
+    # RULE 3: countDistinct() not count() for deal-level aggregations
+    # Source: Section 3 — "always countDistinct(), never count()"
+    #         Section 8 Query Rules — "countDistinct(deal_id) for unique deal counts"
+    # =========================================================================
+    is_deals_or_contacts_query = (
+        'HS_ANALYTICS.DEALS'    in sql_upper or
+        'HS_ANALYTICS.CONTACTS' in sql_upper or
+        'DEAL_ID'               in sql_upper or
+        'CONTACT_ID'            in sql_upper
+    )
+    if is_deals_or_contacts_query:
+        # Match COUNT( NOT followed by DISTINCT, 1, or *
+        bad_count_match = re.search(
+            r'\bCOUNT\s*\(\s*(?!DISTINCT\b)(?!1\b)(?!\*\b)([A-Z_]+)',
+            sql_upper
+        )
+        if bad_count_match:
+            col_name = bad_count_match.group(1).lower()
+            errors.append(
+                f"RULE VIOLATION — WRONG AGGREGATION FUNCTION:\n"
+                f"  Found: COUNT({col_name})\n"
+                f"  Required: countDistinct({col_name})\n"
+                f"  Reason: hs_analytics tables without FINAL return duplicate rows.\n"
+                f"  count() inflates results — same deal counted multiple times.\n"
+                f"  Rule: ALWAYS use countDistinct() for deal_id and contact_id.\n"
+                f"  Fix: Replace COUNT({col_name}) with countDistinct({col_name})."
+            )
+
+    # =========================================================================
+    # RULE 4: MQL queries MUST have ALL 3 mandatory MQL filters
+    # Source: Section 6 — "MANDATORY MQL FILTERS"
+    #         "Missing any one produces inflated counts"
+    # =========================================================================
+    is_mql_query = (
+        'HS_ANALYTICS.CONTACTS' in sql_upper and (
+            'MARKETINGQUALIFIEDLEAD' in sql_upper or
+            'LIFECYCLE_STAGE'        in sql_upper or
+            'DATE_ENTERED_MARKETING' in sql_upper or
+            'MQL'                    in sql_upper
+        )
+    )
+    if is_mql_query:
+        mql_missing = []
+
+        # MQL Filter 1: lifecycle_stage + date_entered IS NOT NULL
+        if 'MARKETINGQUALIFIEDLEAD' not in sql_upper:
+            mql_missing.append(
+                "lifecycle_stage = 'marketingqualifiedlead'\n"
+                "     AND date_entered_marketing_qualified_lead_lifecycle_stage_pipeline"
+                " IS NOT NULL"
+            )
+
+        # MQL Filter 2: company_priority P1-P7
+        if 'COMPANY_PRIORITY' not in sql_upper:
+            mql_missing.append(
+                "company_priority IN ('P1','P2','P3','P4','P5','P6','P7')\n"
+                "     [excludes contacts with no company priority — unqualified accounts]"
+            )
+
+        # MQL Filter 3: exclude Bad Data
+        if 'BAD DATA' not in sql_upper and 'BAD_DATA' not in sql_upper:
+            mql_missing.append(
+                "lead_status != 'Bad Data'\n"
+                "     [excludes records flagged as dirty/invalid by ops team]"
+            )
+
+        if mql_missing:
+            errors.append(
+                "RULE VIOLATION — MISSING MANDATORY MQL FILTERS:\n"
+                "  MQL queries on hs_analytics.contacts require ALL THREE filters.\n"
+                "  You are missing:\n" +
+                "\n".join(f"  {i+1}. {f}" for i, f in enumerate(mql_missing)) +
+                "\n  Reason: Missing any one filter produces inflated MQL counts.\n"
+                "  Fix: Add ALL missing filters before running this query."
+            )
+
+    # =========================================================================
+    # RULE 5: Target table columns MUST be cast with toFloat64OrZero()
+    # Source: Section 4 — "NULLABLE STRING CASTING — MANDATORY"
+    #         Section 5 Rule 2 — "CAST ALL NUMERIC COLUMNS"
+    # =========================================================================
+    TARGET_TABLES = [
+        'GS_PIPELINE_QUOTAS_V1',
+        'GS_PARTNER_TARGETS_REGION_WISE',
+        'GS_PARTNER_TARGETS_PSD',
+        'GS_CLOSED_WON_QUOTAS',
+        'GS_MARKETING_TARGETS',
+    ]
+    is_target_query = any(t in sql_upper for t in TARGET_TABLES)
+    if is_target_query:
+        # Detect SUM/AVG on target/quota/amount columns without toFloat64OrZero cast
+        raw_agg_match = re.search(
+            r'\b(SUM|AVG)\s*\(\s*(?!TOFLOAT64ORZERO\b)([A-Z0-9_]*'
+            r'(?:TARGET|QUOTA|AMOUNT|MQL)[A-Z0-9_]*)',
+            sql_upper
+        )
+        if raw_agg_match:
+            agg_fn  = raw_agg_match.group(1)
+            col_raw = raw_agg_match.group(2).lower()
+            errors.append(
+                f"RULE VIOLATION — MISSING NULLABLE STRING CAST:\n"
+                f"  Found: {agg_fn}({col_raw})\n"
+                f"  Required: {agg_fn}(toFloat64OrZero({col_raw}))\n"
+                f"  Reason: ALL target/quota table columns are Nullable(String) in ClickHouse.\n"
+                f"  Raw SUM/AVG on Nullable(String) throws a type error or returns NULL.\n"
+                f"  Rule: ALWAYS wrap target columns: toFloat64OrZero(column_name)\n"
+                f"  Fix: Replace {agg_fn}({col_raw}) with "
+                f"{agg_fn}(toFloat64OrZero({col_raw}))."
+            )
+
+    # =========================================================================
+    # RULE 6: Target queries must NOT fan-out join deals to target tables
+    # Source: Section 5 Rule 3 — "NO FAN-OUT JOINS"
+    #         "One quota row × N matching deals = quota multiplied N times"
+    # =========================================================================
+    if is_target_query and 'HS_ANALYTICS.DEALS' in sql_upper:
+        # Fan-out risk: direct JOIN between deals and target table
+        # Safe pattern uses CTEs (WITH keyword separates them)
+        has_cte = sql_upper.strip().startswith('WITH')
+        has_direct_join = bool(re.search(
+            r'JOIN\s+(?:KORE_AI_HUBSPOT\.)?(?:' +
+            '|'.join(TARGET_TABLES) +
+            r')',
+            sql_upper
+        ))
+        if has_direct_join and not has_cte:
+            errors.append(
+                "RULE VIOLATION — FAN-OUT JOIN DETECTED:\n"
+                "  You are directly JOINing hs_analytics.deals to a target table.\n"
+                "  This causes quota multiplication: 1 quota row × N deals = wrong totals.\n"
+                "  Example of the bug: if a region has 50 deals and 1 quota row,\n"
+                "  SUM(quota) returns quota_value × 50, not quota_value × 1.\n"
+                "  Required pattern: Use independent CTEs — compute actuals and\n"
+                "  targets separately, then JOIN the aggregated results:\n"
+                "    WITH actual AS (SELECT region, SUM(amount) FROM deals GROUP BY region),\n"
+                "         target AS (SELECT region, SUM(toFloat64OrZero(amount_target_20))\n"
+                "                    FROM target_table GROUP BY region)\n"
+                "    SELECT * FROM actual LEFT JOIN target USING (region)\n"
+                "  Fix: Rewrite using the CTE pattern above."
+            )
+
+    # =========================================================================
+    # RULE 7: Target period grain must match — use quarter filter, not /4
+    # Source: Section 5 Rule 6 — "NEVER divide annual target by 4"
+    #         "ALWAYS filter the target table by the specific quarter"
+    # =========================================================================
+    if is_target_query:
+        # Detect division by 4 applied to target columns (annual ÷ 4 anti-pattern)
+        divide_by_4 = re.search(
+            r'(?:TARGET|QUOTA)[A-Z0-9_]*\s*/\s*4\b',
+            sql_upper
+        )
+        if divide_by_4:
+            errors.append(
+                "RULE VIOLATION — INCORRECT QUARTERLY TARGET CALCULATION:\n"
+                "  Found: dividing a target column by 4 to get quarterly target.\n"
+                "  This is WRONG — target tables already store quarterly values.\n"
+                "  Dividing by 4 produces targets that are 4x too small.\n"
+                "  Required pattern: Filter target table directly by quarter:\n"
+                "    WHERE fy = 'FY27' AND quarter = 'Q1'\n"
+                "  The quarterly total is the direct SUM of those filtered rows.\n"
+                "  Fix: Remove the /4 division. Add WHERE quarter = 'Q1' instead."
+            )
+
+        # Warn if no quarter/month/fy filter on target table
+        has_period_filter = (
+            re.search(r"QUARTER\s*=\s*'Q\d'", sql_upper) or
+            re.search(r"FY\s*=\s*'FY\d+'"  , sql_upper) or
+            re.search(r"MONTH\s*=\s*'",      sql_upper)
+        )
+        if not has_period_filter:
+            errors.append(
+                "RULE VIOLATION — MISSING PERIOD FILTER ON TARGET TABLE:\n"
+                "  Target table query has no fy/quarter/month filter.\n"
+                "  Without a period filter, SUM aggregates ALL years and quarters,\n"
+                "  producing a target that is many times larger than intended.\n"
+                "  Required: Add at minimum fy = 'FY27' AND quarter = 'Q1'\n"
+                "  (or the specific period the user asked about).\n"
+                "  Fix: Add WHERE fy = 'FY27' AND quarter = '<quarter>' to the\n"
+                "  target table CTE or subquery."
+            )
+
+    # =========================================================================
+    # RULE 8: nullIf() required in division to prevent divide-by-zero
+    # Source: Section 5 Rule 5 — "Use nullIf(target, 0) in division"
+    #         Section 5 Rule 7 — "ATTAINMENT = round(actual / nullIf(target,0)*100,1)"
+    # =========================================================================
+    if is_target_query:
+        # Detect division where denominator is a target/quota column without nullIf
+        raw_division = re.search(
+            r'/\s*(?!NULLIF\b)(?!0\b)([A-Z_]*(?:TARGET|QUOTA|AMOUNT)[A-Z_0-9]*)',
+            sql_upper
+        )
+        if raw_division:
+            col = raw_division.group(1).lower()
+            errors.append(
+                f"RULE VIOLATION — MISSING nullIf() IN DIVISION:\n"
+                f"  Found: / {col} (raw division by target/quota column)\n"
+                f"  Required: / nullIf({col}, 0)\n"
+                f"  Reason: If target is 0 or NULL, division throws an error or\n"
+                f"  returns infinity/NULL, breaking attainment calculations.\n"
+                f"  Rule: ATTAINMENT = round(actual / nullIf(target, 0) * 100, 1)\n"
+                f"  Fix: Replace '/ {col}' with '/ nullIf({col}, 0)'."
+            )
+
+    # =========================================================================
+    # RULE 9: Stage cohort queries — MUST exclude lower stages + handle
+    #         Closed Won correctly
+    # Source: Section 8 — "REGISTERED DEALS (REG DEALS) DEFINITION"
+    #         Missing rule (now added):
+    #         - became_10_deal_date cohort must EXCLUDE became_1_deal_date
+    #           and became_5_deal_date records (not just filter on became_10)
+    #         - Closed Won cohort must INCLUDE '90% - Deal Desk Review' stage
+    #           because deals pass through 90% before closing
+    # =========================================================================
+
+    # Detect stage cohort queries (queries filtering on became_XX_deal_date columns)
+    COHORT_COLUMNS = {
+        'BECAME_5_DEAL_DATE' : 5,
+        'BECAME_10_DEAL_DATE': 10,
+        'BECAME_20_DEAL_DATE': 20,
+        'BECAME_30_DEAL_DATE': 30,
+        'BECAME_40_DEAL_DATE': 40,
+        'BECAME_60_DEAL_DATE': 60,
+        'BECAME_75_DEAL_DATE': 75,
+    }
+
+    referenced_cohorts = [
+        (col, stage) for col, stage in COHORT_COLUMNS.items()
+        if col in sql_upper
+    ]
+
+    if referenced_cohorts:
+        for col, stage in referenced_cohorts:
+
+            # ── RULE 9a: Lower-stage exclusion ────────────────────────────
+            # When querying became_10_deal_date cohort, records that only
+            # reached 1% or 5% (but never progressed further) must be excluded.
+            # Same logic applies upward: became_20 should exclude those that
+            # never made it past 10%, etc.
+            # The correct pattern: filter the cohort date IS NOT NULL
+            # AND the previous lower stage date IS NULL (pure cohort) OR
+            # use the date range on the specific cohort column only.
+            # We check: if querying became_10+, make sure became_1/became_5
+            # are not being INCLUDED without exclusion logic.
+
+            if stage >= 10:
+                # Check if query is pulling in lower stage records without exclusion
+                # Heuristic: if became_5_deal_date appears in SELECT or JOIN
+                # without IS NULL exclusion, flag it
+                has_lower_stage = 'BECAME_5_DEAL_DATE' in sql_upper
+                has_exclusion   = bool(re.search(
+                    r'BECAME_5_DEAL_DATE\s+IS\s+NULL',
+                    sql_upper
+                ))
+                # Only flag if lower stage column is referenced in a way
+                # that suggests inclusion, not exclusion
+                if has_lower_stage and not has_exclusion:
+                    # Check it's in SELECT (not just WHERE IS NULL)
+                    in_select = bool(re.search(
+                        r'SELECT.*BECAME_5_DEAL_DATE',
+                        sql_upper,
+                        re.DOTALL
+                    ))
+                    if in_select:
+                        errors.append(
+                            f"RULE VIOLATION — COHORT CONTAMINATION (Stage {stage}%):\n"
+                            f"  Query references became_5_deal_date in SELECT without\n"
+                            f"  excluding records that did not progress beyond 5%.\n"
+                            f"  When building a {stage}% cohort, you must EXCLUDE deals\n"
+                            f"  that only reached 1% or 5% and never progressed further.\n"
+                            f"  Required exclusion pattern:\n"
+                            f"    WHERE became_{stage}_deal_date IS NOT NULL\n"
+                            f"    -- To get PURE {stage}% cohort, also exclude lower stages:\n"
+                            f"    AND became_5_deal_date IS NULL  -- never reached 5% before {stage}%\n"
+                            f"  OR use the cohort date column filter exclusively:\n"
+                            f"    WHERE became_{stage}_deal_date BETWEEN '<start>' AND '<end>'\n"
+                            f"  Fix: Add exclusion filters for lower stage date columns."
+                        )
+
+        # ── RULE 9b: Closed Won cohort must include 90% Deal Desk Review ──
+        # Source: Missing rule now added —
+        # Deals transition: ... → 75% → 90% Deal Desk Review → Closed Won
+        # A Closed Won count that excludes '90% - Deal Desk Review' is incomplete
+        # because some deals sit in 90% at query time but are effectively won.
+        # When querying Closed Won stage, ALWAYS include 90% Deal Desk Review.
+
+        is_closed_won_query = (
+            "CLOSED WON"    in sql_upper or
+            "CLOSED_WON"    in sql_upper or
+            "'CLOSED WON'"  in sql_upper
+        )
+        if is_closed_won_query:
+            has_90_stage = (
+                '90%'                  in sql_upper or
+                'DEAL DESK'            in sql_upper or
+                'DEAL_DESK'            in sql_upper or
+                '90% - DEAL DESK'      in sql_upper
+            )
+            if not has_90_stage:
+                errors.append(
+                    "RULE VIOLATION — INCOMPLETE CLOSED WON DEFINITION:\n"
+                    "  Query filters for 'Closed Won' stage but EXCLUDES\n"
+                    "  '90% - Deal Desk Review' stage.\n"
+                    "  Reason: Deals transition through 90% Deal Desk Review\n"
+                    "  before reaching Closed Won. Excluding 90% understates\n"
+                    "  the won pipeline because deals in Deal Desk Review are\n"
+                    "  effectively won but not yet stamped as Closed Won.\n"
+                    "  Required: Include both stages in your filter:\n"
+                    "    deal_stage IN ('Closed Won', '90% - Deal Desk Review')\n"
+                    "  Fix: Add '90% - Deal Desk Review' to your deal_stage filter."
+                )
+
+    # =========================================================================
+    # RULE 10: Association table queries must use DISTINCT
+    # Source: Section 3 — "Association tables: DISTINCT in subquery"
+    # =========================================================================
+    if 'GS_DEALCONTACTASSOCIATION' in sql_upper:
+        # Check if DISTINCT is used when selecting from association table
+        assoc_block = re.search(
+            r'FROM\s+(?:KORE_AI_HUBSPOT\.)?GS_DEALCONTACTASSOCIATION(.*?)(?:WHERE|GROUP|ORDER|LIMIT|$)',
+            sql_upper,
+            re.DOTALL
+        )
+        if assoc_block and 'DISTINCT' not in sql_upper:
+            errors.append(
+                "RULE VIOLATION — MISSING DISTINCT ON ASSOCIATION TABLE:\n"
+                "  Queries on gs_DealContactAssociation must use DISTINCT\n"
+                "  to avoid duplicate contact-deal pairs.\n"
+                "  Required pattern:\n"
+                "    SELECT DISTINCT contact_id, deal_id\n"
+                "    FROM kore_ai_hubspot.gs_DealContactAssociation\n"
+                "  Fix: Add DISTINCT to your SELECT from gs_DealContactAssociation."
+            )
+
+    # =========================================================================
+    # RULE 11: No LIMIT on list queries unless user asked for "top N"
+    # Source: Section 8 Query Rules — "For LIST queries: NO LIMIT unless
+    #         user says 'top N' or 'first N'"
+    # This is a WARNING not a block — log it but don't fail the query
+    # =========================================================================
+    if re.search(r'\bLIMIT\s+\d+', sql_upper):
+        limit_match = re.search(r'\bLIMIT\s+(\d+)', sql_upper)
+        limit_val   = int(limit_match.group(1)) if limit_match else 0
+        # Only warn for small limits that would hide data
+        if limit_val > 0 and limit_val < 500:
+            print(
+                f"   ⚠️  [GUARD RAIL WARNING] LIMIT {limit_val} detected. "
+                f"If this is a list query (not top-N), remove the LIMIT so all rows are returned. "
+                f"System already caps display at 100 rows safely."
+            )
+            # NOTE: This is a WARNING only — we do NOT block the query.
+            # Claude sometimes legitimately uses LIMIT for exploratory queries.
+            # Blocking here would cause false positives.
+
+    # =========================================================================
+    # BUILD FINAL ERROR MESSAGE
+    # =========================================================================
+    if errors:
+        error_count = len(errors)
+        msg = (
+            f"⛔ SQL GUARD RAIL BLOCKED THIS QUERY\n"
+            f"   {error_count} rule violation{'s' if error_count > 1 else ''} found.\n"
+            f"   Fix ALL violations below, then call query_clickhouse again.\n\n"
+            f"{'='*60}\n\n"
+        )
+        for i, e in enumerate(errors, 1):
+            msg += f"VIOLATION {i}:\n{e}\n\n{'─'*50}\n\n"
+
+        msg += (
+            "ACTION REQUIRED:\n"
+            "Rewrite the SQL addressing every violation above.\n"
+            "Call query_clickhouse again with the corrected query.\n"
+            "Do NOT tell the user the query was blocked — "
+            "just fix and retry silently."
+        )
+        return False, msg
+
+    return True, ""
+
+# =============================================================================
 # ClickHouse query runner
 # =============================================================================
 def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
@@ -773,6 +1247,15 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
     for kw in FORBIDDEN_KEYWORDS:
         if re.search(rf'\b{kw}\b', stripped):
             return f"ERROR: Forbidden keyword: {kw}"
+    
+    # ── SQL GUARD RAIL ──────────────────────────────────────────────────────
+    is_valid, guard_error = _validate_sql_guardrail(sql)
+    if not is_valid:
+        print(f"   🚫 [GUARD RAIL BLOCKED]\n{guard_error[:300]}")
+        return guard_error  # Claude reads this → self-corrects → retries
+    # ───────────────────────────────────────────────────────────────────────
+
+    print(f"✅ [GUARD RAIL PASSED] SQL → {sql[:200]}")
 
     print(f"🔍 SQL (session={session_id}) → {sql[:200]}")
 
