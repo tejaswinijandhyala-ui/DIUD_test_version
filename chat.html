@@ -657,9 +657,8 @@
     <hr class="sidebar-divider"/>
 
     <div class="sidebar-label">📥 Export</div>
-    <button class="suggestion-chip" onclick="sendSuggestion('Export this conversation as a PDF report')">📄 Export as PDF report</button>
+    <button class="suggestion-chip" onclick="sendSuggestion('Export this conversation as a PDF report')">📄 Export as report</button>
     <button class="suggestion-chip" onclick="sendSuggestion('Create a presentation from this conversation')">📊 Create a presentation</button>
-    <button class="suggestion-chip" onclick="sendSuggestion('Download a summary of today\'s analysis')">📋 Download summary</button>
 
     <div id="conn-badge" class="conn-badge checking" style="margin-top:auto;"
          onclick="checkConn()" title="Click to recheck ClickHouse connection">
@@ -759,7 +758,7 @@
           <div class="ep-input-group" id="ep-detail-group">
             <div class="ep-label">Detail Level</div>
             <select class="ep-select" id="ep-detail">
-              <option value="detailed">Detailed</option>
+              <option value="detailed">Entire Conversation</option>
               <option value="summary">Summary</option>
             </select>
           </div>
@@ -1271,91 +1270,102 @@
   /* ======================================================================
      GENERATE PREVIEW
      ====================================================================== */
-  async function generatePreview() {
-    if (exportBusy) return;
-    if (history.length === 0) { showToast('Start a conversation first before exporting.', 'error'); return; }
-    const title  = document.getElementById('ep-title').value.trim() || 'Pipeline Intelligence Report';
-    const format = document.getElementById('ep-format').value;
-    const detail = document.getElementById('ep-detail').value;
+async function generatePreview() {
+  if (exportBusy) return;
+  if (history.length === 0) { showToast('Start a conversation first before exporting.', 'error'); return; }
+  const title  = document.getElementById('ep-title').value.trim() || 'Pipeline Intelligence Report';
+  const format = document.getElementById('ep-format').value;
+  const detail = document.getElementById('ep-detail').value;
 
-    if (format === 'csv') {
-      if (!datasetRows || datasetRows === 0) { showToast('No dataset found. Run a query first, then export.', 'error'); return; }
-      showPanelState('preview');
-      document.getElementById('ep-preview-content').innerHTML = `
-        <div style="display:flex;flex-direction:column;gap:12px;padding:4px 0;">
-          <div style="display:flex;align-items:center;gap:10px;padding:12px 14px;background:#E8F5E9;border:1px solid #C8E6C9;border-radius:8px;">
-            <svg viewBox="0 0 24 24" fill="none" stroke="#2E7D32" stroke-width="2.5" style="width:20px;height:20px;flex-shrink:0;"><polyline points="20 6 9 17 4 12"/></svg>
-            <span style="color:#1B5E20;font-weight:600;font-size:14px;">${datasetRows.toLocaleString()} rows ready to export</span>
-          </div>
-          <p style="color:#555;font-size:13px;line-height:1.6;margin:0;">The CSV will contain the raw data with the original column headers from the database — no AI summary or formatting added.</p>
-        </div>`;
-      document.getElementById('ep-preview-meta-text').textContent = `${datasetRows.toLocaleString()} rows · Raw data · No AI summary`;
-      document.getElementById('ep-dl-pdf').style.display  = 'none';
-      document.getElementById('ep-dl-pptx').style.display = 'none';
-      const csvBtn = document.getElementById('ep-dl-csv');
-      if (csvBtn) {
-        csvBtn.style.display = 'flex';
-        const csvLabel = document.getElementById('ep-csv-label');
-        if (csvLabel) csvLabel.textContent = `Download All ${datasetRows.toLocaleString()} Rows (CSV)`;
-      }
-      showFooter();
-      return;
+  if (format === 'csv') {
+    if (!datasetRows || datasetRows === 0) { showToast('No dataset found. Run a query first, then export.', 'error'); return; }
+    showPanelState('preview');
+    document.getElementById('ep-preview-content').innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:12px;padding:4px 0;">
+        <div style="display:flex;align-items:center;gap:10px;padding:12px 14px;background:#E8F5E9;border:1px solid #C8E6C9;border-radius:8px;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#2E7D32" stroke-width="2.5" style="width:20px;height:20px;flex-shrink:0;"><polyline points="20 6 9 17 4 12"/></svg>
+          <span style="color:#1B5E20;font-weight:600;font-size:14px;">${datasetRows.toLocaleString()} rows ready to export</span>
+        </div>
+        <p style="color:#555;font-size:13px;line-height:1.6;margin:0;">The CSV will contain the raw data with the original column headers from the database — no AI summary or formatting added.</p>
+      </div>`;
+    document.getElementById('ep-preview-meta-text').textContent = `${datasetRows.toLocaleString()} rows · Raw data · No AI summary`;
+    document.getElementById('ep-dl-pdf').style.display  = 'none';
+    document.getElementById('ep-dl-pptx').style.display = 'none';
+    const csvBtn = document.getElementById('ep-dl-csv');
+    if (csvBtn) {
+      csvBtn.style.display = 'flex';
+      const csvLabel = document.getElementById('ep-csv-label');
+      if (csvLabel) csvLabel.textContent = `Download All ${datasetRows.toLocaleString()} Rows (CSV)`;
     }
-
-    exportBusy = true;
-    document.getElementById('ep-generate-btn').disabled = true;
-    hideFooter();
-    showPanelState('loading');
-    const steps = ['Reading conversation context…','Extracting data & metrics…','Structuring document sections…','Formatting content…'];
-    const stepsEl = document.getElementById('ep-steps');
-    stepsEl.innerHTML = '';
-    setProgress(5, steps[0]);
-    for (let i = 0; i < steps.length; i++) {
-      await sleep(i === 0 ? 200 : 600);
-      const step = document.createElement('div');
-      step.className = 'ep-loading-step';
-      step.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>${steps[i]}`;
-      stepsEl.appendChild(step);
-      setProgress(15 + i * 20, steps[Math.min(i + 1, steps.length - 1)]);
-    }
-    try {
-      setProgress(75, 'AI generating document…');
-      const res = await fetch('/export/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversation: history, title, export_type: format, detail_level: detail, session_id: SESSION_ID }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      previewContent = data.content;
-      if (data.total_rows > 0) datasetRows = data.total_rows;
-      setProgress(100, 'Done!');
-      await sleep(400);
-      document.getElementById('ep-preview-content').innerHTML = marked.parse(previewContent);
-      const rowNote = data.total_rows > 0 ? ` · ${data.total_rows.toLocaleString()} rows` : '';
-      document.getElementById('ep-preview-meta-text').textContent =
-        `Preview ready${rowNote} · ${data.word_count} words · ${data.generated_at}`;
-      if (data.filters) {
-        document.getElementById('ep-preview-meta-text').textContent += ` · Filters: ${data.filters}`;
-      }
-      showPanelState('preview');
-      showFooter();
-      document.getElementById('ep-dl-pdf').style.display  = format === 'pdf'  ? 'flex' : 'none';
-      document.getElementById('ep-dl-pptx').style.display = format === 'pptx' ? 'flex' : 'none';
-      const csvBtn2 = document.getElementById('ep-dl-csv');
-      if (csvBtn2) csvBtn2.style.display = 'none';
-    } catch(err) {
-      showPanelState('empty');
-      showToast('Preview generation failed: ' + err.message, 'error');
-      appendBubble('assistant', `⚠️ **Export preview failed:** ${err.message}`);
-    } finally {
-      exportBusy = false;
-      document.getElementById('ep-generate-btn').disabled = false;
-    }
+    showFooter();
+    return;
   }
+
+  exportBusy = true;
+  document.getElementById('ep-generate-btn').disabled = true;
+  hideFooter();
+  showPanelState('loading');
+  const steps = ['Reading conversation context…','Extracting data & metrics…','Structuring document sections…','Formatting content…'];
+  const stepsEl = document.getElementById('ep-steps');
+  stepsEl.innerHTML = '';
+  setProgress(5, steps[0]);
+  for (let i = 0; i < steps.length; i++) {
+    await sleep(i === 0 ? 200 : 600);
+    const step = document.createElement('div');
+    step.className = 'ep-loading-step';
+    step.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>${steps[i]}`;
+    stepsEl.appendChild(step);
+    setProgress(15 + i * 20, steps[Math.min(i + 1, steps.length - 1)]);
+  }
+  try {
+    setProgress(75, 'AI generating document…');
+    const res = await fetch('/export/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversation: history,
+        title,
+        export_type: format,
+        detail_level: detail,
+        session_id: SESSION_ID
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    previewContent = data.content;
+    if (data.total_rows > 0) datasetRows = data.total_rows;
+    setProgress(100, 'Done!');
+    await sleep(400);
+
+    // Render preview
+    document.getElementById('ep-preview-content').innerHTML = marked.parse(previewContent);
+    const rowNote = data.total_rows > 0 ? ` · ${data.total_rows.toLocaleString()} rows` : '';
+    let metaText = `Preview ready${rowNote} · ${data.word_count} words · ${data.generated_at}`;
+    if (data.filters) metaText += ` · Filters: ${data.filters}`;
+    document.getElementById('ep-preview-meta-text').textContent = metaText;
+
+    showPanelState('preview');
+
+    // Show correct download button
+    document.getElementById('ep-dl-pdf').style.display  = format === 'pdf'  ? 'flex' : 'none';
+    document.getElementById('ep-dl-pptx').style.display = format === 'pptx' ? 'flex' : 'none';
+    const csvBtn2 = document.getElementById('ep-dl-csv');
+    if (csvBtn2) csvBtn2.style.display = 'none';
+
+    showFooter();
+
+  } catch(err) {
+    showPanelState('empty');
+    showToast('Preview generation failed: ' + err.message, 'error');
+    appendBubble('assistant', `⚠️ **Export preview failed:** ${err.message}`);
+  } finally {
+    exportBusy = false;
+    document.getElementById('ep-generate-btn').disabled = false;
+  }
+}
 
   document.getElementById('ep-format').addEventListener('change', function() {
     const isCsv = this.value === 'csv';
