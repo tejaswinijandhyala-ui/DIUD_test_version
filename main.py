@@ -1203,7 +1203,62 @@ def _validate_sql_guardrail(sql: str) -> tuple[bool, str]:
             # NOTE: This is a WARNING only — we do NOT block the query.
             # Claude sometimes legitimately uses LIMIT for exploratory queries.
             # Blocking here would cause false positives.
-
+    
+     # =========================================================================
+    # RULE 12: Date columns MUST be normalized before use
+    # Required pattern: DATE(LEFT(coalesce(col,'1900-01-01'),10))
+    # Reason: Date columns may be Nullable(String)/DateTime with inconsistent
+    #         formats (full timestamps, NULLs). Wrapping guarantees a clean,
+    #         comparable Date value with a safe default for NULLs.
+    # =========================================================================
+    DATE_FUNC_BLOCKLIST = {
+        'DATE', 'DATE_TRUNC', 'DATEDIFF', 'DATE_ADD', 'DATE_SUB',
+        'DATEADD', 'DATESUB', 'TODATE', 'TODATE32', 'TODATETIME',
+        'TODATETIME64', 'TODAY', 'TODAYS', 'FORMATDATETIME',
+        'PARSEDATETIME', 'PARSEDATETIMEBESTEFFORT', 'TOSTARTOFMONTH',
+        'TOSTARTOFQUARTER', 'TOSTARTOFYEAR', 'TOSTARTOFWEEK',
+        'TOSTARTOFDAY', 'TOYYYYMM', 'TOYYYYMMDD', 'CURRENT_DATE',
+        'CURDATE', 'TODATEORZERO', 'TODATEORNULL', 'TODATETIMEORZERO',
+        'TODATETIMEORNULL',
+    }
+ 
+    wrapped_pattern = re.compile(
+        r"DATE\s*\(\s*LEFT\s*\(\s*COALESCE\s*\(\s*([A-Z][A-Z0-9_.]*DATE[A-Z0-9_]*)"
+        r"\s*,\s*'1900-01-01'\s*\)\s*,\s*10\s*\)\s*\)"
+    )
+    sql_no_wrapped = wrapped_pattern.sub(' ', sql_upper)
+ 
+    date_col_candidates = set(re.findall(
+        r'\b([A-Z][A-Z0-9_]*DATE[A-Z0-9_]*)\b', sql_upper
+    )) - DATE_FUNC_BLOCKLIST
+ 
+    unwrapped_date_cols = []
+    for col in sorted(date_col_candidates):
+        if re.search(rf'\b{re.escape(col)}\b', sql_no_wrapped):
+            unwrapped_date_cols.append(col)
+ 
+    if unwrapped_date_cols:
+        examples = "\n".join(
+            f"    {c.lower()}  →  DATE(LEFT(coalesce({c.lower()},'1900-01-01'),10))"
+            for c in unwrapped_date_cols
+        )
+        errors.append(
+            "RULE VIOLATION — DATE COLUMN NOT NORMALIZED:\n"
+            "  The following date column(s) are referenced without the required\n"
+            "  normalization wrapper:\n"
+            f"{examples}\n"
+            "  Required pattern for ANY date field before comparing, filtering,\n"
+            "  grouping, or selecting it:\n"
+            "    DATE(LEFT(coalesce(<column>,'1900-01-01'),10))\n"
+            "  Reason: Date columns may contain NULLs or full timestamp strings\n"
+            "  in inconsistent formats. coalesce(...,'1900-01-01') supplies a safe\n"
+            "  default for NULLs, LEFT(...,10) trims to the YYYY-MM-DD portion,\n"
+            "  and DATE(...) casts it to a proper Date type for reliable\n"
+            "  comparisons, joins, and date arithmetic.\n"
+            "  Fix: Replace every raw reference to the column(s) above with\n"
+            "  DATE(LEFT(coalesce(<column>,'1900-01-01'),10)) before using it."
+        )
+        
     # =========================================================================
     # BUILD FINAL ERROR MESSAGE
     # =========================================================================
