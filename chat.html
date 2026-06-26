@@ -657,8 +657,8 @@
     <hr class="sidebar-divider"/>
 
     <div class="sidebar-label">📥 Export</div>
-    <button class="suggestion-chip" onclick="sendSuggestion('Export this conversation as a PDF report')">📄 Export as report</button>
-    <button class="suggestion-chip" onclick="sendSuggestion('Create a presentation from this conversation')">📊 Create a presentation</button>
+    <button class="suggestion-chip" onclick="openExportPanel('pdf')">📄 Export as report</button>
+    <button class="suggestion-chip" onclick="openExportPanel('pptx')">📊 Create a presentation</button>
 
     <div id="conn-badge" class="conn-badge checking" style="margin-top:auto;"
          onclick="checkConn()" title="Click to recheck ClickHouse connection">
