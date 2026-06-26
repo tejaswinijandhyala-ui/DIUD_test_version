@@ -23,16 +23,68 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
     msg = user_message or ""
     intent: Dict[str, Any] = {}
 
+    # ── Cohort stage detection ───────────────────────────────────────────────
+    # Pattern 1: explicit arrow notation  "20% → Closed Won", "20% to CW"
     m = re.search(r'(\d+)\s*%\s*(→|->|to)\s*(closed\s*won|cw)\b', msg, re.I)
     if m:
         intent["cohort_stage"] = m.group(1)
 
-    if re.search(r'\b(list|show me all|which deals|deals (with|where))\b', msg, re.I):
+    # Pattern 2: funnel/cohort keyword BEFORE the percentage
+    #   "funnel from 20%", "cohort starting at 10%", "pipeline from 30% stage"
+    if not intent.get("cohort_stage"):
+        m2 = re.search(
+            r'\b(funnel|cohort|pipeline\s+from|starting\s+(?:at|from)|from\s+stage)\b'
+            r'.*?(\d+)\s*%',
+            msg, re.I
+        )
+        if m2:
+            intent["cohort_stage"] = m2.group(2)
+
+    # Pattern 3: percentage BEFORE funnel/cohort keyword
+    #   "20% funnel", "20% cohort analysis", "30% stage breakdown", "20% conversion"
+    if not intent.get("cohort_stage"):
+        m3 = re.search(
+            r'(\d+)\s*%.*?\b(funnel|cohort|stage\s+breakdown|conversion|progression)\b',
+            msg, re.I
+        )
+        if m3:
+            intent["cohort_stage"] = m3.group(1)
+
+    # Pattern 4: generic stage-progression language with a percentage anywhere
+    #   "show me how deals progress after 20%", "deals that reached 20"
+    if not intent.get("cohort_stage"):
+        m4 = re.search(
+            r'\b(progress|reached|entered|qualified\s+at|moved\s+(?:past|beyond|to))\b'
+            r'.*?(\d+)\s*%',
+            msg, re.I
+        )
+        if not m4:
+            m4 = re.search(
+                r'(\d+)\s*%.*?\b(progress|reached|entered|qualified\s+at|moved\s+(?:past|beyond|to))\b',
+                msg, re.I
+            )
+        if m4:
+            for grp in m4.groups():
+                if grp and grp.isdigit():
+                    intent["cohort_stage"] = grp
+                    break
+
+    # Pattern 5: fall back to SQL structure — if the model used became_N_deal_date,
+    #   the intent is cohort regardless of what the user typed
+    if not intent.get("cohort_stage") and sql:
+        sql_m = re.search(r'became_(\d+)_deal_date', sql, re.I)
+        if sql_m:
+            intent["cohort_stage"] = sql_m.group(1)
+
+    # ── List query detection ─────────────────────────────────────────────────
+    if re.search(r'\b(list|show me all|which deals|deals\s+(with|where))\b', msg, re.I):
         intent["query_type"] = "list"
 
+    # ── Top-N cap detection ──────────────────────────────────────────────────
     if re.search(r'\btop\s+\d+\b|\bfirst\s+\d+\b', msg, re.I):
         intent["top_n"] = True
 
+    # ── Metric detection ─────────────────────────────────────────────────────
     if re.search(r'\bMQL\b', msg, re.I):
         intent["metric"] = "mql"
 
@@ -42,8 +94,8 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
     if re.search(r'\bactive pipeline\b', msg, re.I):
         intent["metric"] = intent.get("metric") or "active_pipeline"
 
-    if re.search(r'\bMANDATORY_BASE_FILTERS\b', sql):
-        # placeholder token left in by a lazy generation — should never reach here
+    # ── Generation hygiene ───────────────────────────────────────────────────
+    if sql and re.search(r'\bMANDATORY_BASE_FILTERS\b', sql):
         intent["placeholder_leak"] = True
 
     return intent
@@ -222,6 +274,38 @@ RULES: List[Dict[str, Any]] = [
             for s in ["20% - Solution", "30% - Proof", "40% - Proposal", "60% - Price Negotiation", "75% - Contract Review"]
         ),
         "message": "Active pipeline query missing one or more of the 5 required active deal_stage values.",
+    },
+    # ---- §8b SQL-structure-triggered cohort checks (bypass intent detection) ---
+    {
+        "id": "cohort_sql_triggered_exclusion",
+        "section": "§8b — SQL-triggered cohort exclusion check",
+        "applies_when": lambda sql: bool(re.search(r'became_\d+_deal_date', sql, re.I)),
+        "check": lambda sql: bool(re.search(r'\bNOT\s+IN\b', sql, re.I)),
+        "message": (
+            "SQL references became_<N>_deal_date (cohort anchor) but is missing "
+            "the NOT IN exclusion of prior stages. Every cohort query MUST exclude "
+            "deals currently in all stages prior to the cohort starting stage (§8b)."
+        ),
+    },
+    {
+        "id": "cohort_sql_triggered_cte",
+        "section": "§8b — Cohort must use CTE pattern",
+        "applies_when": lambda sql: bool(re.search(r'became_\d+_deal_date', sql, re.I)),
+        "check": lambda sql: sql.strip().upper().startswith("WITH"),
+        "message": (
+            "SQL references became_<N>_deal_date but is not structured as a CTE. "
+            "All cohort funnel queries MUST use the WITH-cohort CTE pattern from §8b."
+        ),
+    },
+    {
+        "id": "cohort_sql_triggered_count_distinct",
+        "section": "§8b — Cohort must use countDistinct(deal_id)",
+        "applies_when": lambda sql: bool(re.search(r'became_\d+_deal_date', sql, re.I)),
+        "check": lambda sql: bool(re.search(r'countDistinct\s*\(\s*deal_id\s*\)', sql, re.I)),
+        "message": (
+            "Cohort funnel SQL is not using countDistinct(deal_id). "
+            "Never use count() in cohort queries — each deal must be counted exactly once."
+        ),
     },
 ]
 
