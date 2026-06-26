@@ -1192,6 +1192,15 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
 
     selected_model = ALLOWED_MODELS.get(model, ALLOWED_MODELS["sonnet"])
 
+    # FIX: original_user_message was referenced below but never defined —
+    # this caused "NameError: name 'original_user_message' is not defined"
+    # on every request that triggered the tool loop.
+    original_user_message = next(
+        (m.get("content", "") for m in reversed(messages)
+         if m.get("role") == "user" and isinstance(m.get("content", ""), str)),
+        ""
+    )
+
     safe_messages = []
     for m in messages:
         content = m.get("content", "")
@@ -1231,7 +1240,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
         for tool_block in tool_blocks:
             sql = tool_block.input.get("sql", "")
 
-            # --- NEW: pre-execution rule gate -------------------------------
+            # --- pre-execution rule gate -------------------------------
             sql_violations = validate_sql_against_rules(sql, original_user_message)
             _log_rule_audit(session_id, sql, sql_violations, "pre_execute", original_user_message)
 
@@ -1248,12 +1257,9 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                     "DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"
                 ])
 
-                # --- NEW: post-execution result-level rule check ------------
+                # --- post-execution result-level rule check ------------
                 if not is_error:
-                    try:
-                        parsed_rows = json.loads(query_result).get("rows", [])
-                    except Exception:
-                        parsed_rows = []
+                    parsed_rows = _parse_rows_for_validation(query_result, session_id)
                     result_violations = validate_result_against_rules(
                         parsed_rows, original_user_message, sql
                     )
