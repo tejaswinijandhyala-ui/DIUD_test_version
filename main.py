@@ -939,7 +939,7 @@ def _validate_sql_guardrail(sql: str) -> tuple[bool, str]:
     ]
     is_target_query = any(t in sql_upper for t in TARGET_TABLES)
     if is_target_query:
-    raw_agg_match = re.search(
+        raw_agg_match = re.search(
         r'\b(SUM|AVG)\s*\(\s*(?!TOFLOAT64ORZERO\b)([A-Z0-9_]*'
         r'(?:_TARGET|_QUOTA|MQL_TARGET|AMOUNT_TARGET|AMOUNT_PK|_AMOUNT_QUOTA)[A-Z0-9_]*)',
         sql_upper
