@@ -939,12 +939,11 @@ def _validate_sql_guardrail(sql: str) -> tuple[bool, str]:
     ]
     is_target_query = any(t in sql_upper for t in TARGET_TABLES)
     if is_target_query:
-        # Detect SUM/AVG on target/quota/amount columns without toFloat64OrZero cast
-        raw_agg_match = re.search(
-            r'\b(SUM|AVG)\s*\(\s*(?!TOFLOAT64ORZERO\b)([A-Z0-9_]*'
-            r'(?:TARGET|QUOTA|AMOUNT|MQL)[A-Z0-9_]*)',
-            sql_upper
-        )
+    raw_agg_match = re.search(
+        r'\b(SUM|AVG)\s*\(\s*(?!TOFLOAT64ORZERO\b)([A-Z0-9_]*'
+        r'(?:_TARGET|_QUOTA|MQL_TARGET|AMOUNT_TARGET|AMOUNT_PK|_AMOUNT_QUOTA)[A-Z0-9_]*)',
+        sql_upper
+    )
         if raw_agg_match:
             agg_fn  = raw_agg_match.group(1)
             col_raw = raw_agg_match.group(2).lower()
@@ -1205,42 +1204,26 @@ def _validate_sql_guardrail(sql: str) -> tuple[bool, str]:
             # Blocking here would cause false positives.
     
     # =========================================================================
-    # RULE 12: Date columns MUST be normalized before use
-    # Required pattern: toDate(LEFT(coalesce(col,'1900-01-01'),10))
+    # RULE 12: Nullable(String) date columns MUST be normalized before use
+    # Only applies to became_XX_deal_date and date_entered_marketing_...
+    # Does NOT apply to close_date / create_date (native Date types in CH)
     # =========================================================================
-    DATE_FUNC_BLOCKLIST = {
-        'DATE', 'DATE_TRUNC', 'DATEDIFF', 'DATE_ADD', 'DATE_SUB',
-        'DATEADD', 'DATESUB', 'TODATE', 'TODATE32', 'TODATETIME',
-        'TODATETIME64', 'TODAY', 'TODAYS', 'FORMATDATETIME',
-        'PARSEDATETIME', 'PARSEDATETIMEBESTEFFORT', 'TOSTARTOFMONTH',
-        'TOSTARTOFQUARTER', 'TOSTARTOFYEAR', 'TOSTARTOFWEEK',
-        'TOSTARTOFDAY', 'TOYYYYMM', 'TOYYYYMMDD', 'CURRENT_DATE',
-        'CURDATE', 'TODATEORZERO', 'TODATEORNULL', 'TODATETIMEORZERO',
-        'TODATETIMEORNULL',
+    NULLABLE_STRING_DATES = {
+        'BECAME_5_DEAL_DATE', 'BECAME_10_DEAL_DATE', 'BECAME_20_DEAL_DATE',
+        'BECAME_30_DEAL_DATE', 'BECAME_40_DEAL_DATE', 'BECAME_60_DEAL_DATE',
+        'BECAME_75_DEAL_DATE',
+        'DATE_ENTERED_MARKETING_QUALIFIED_LEAD_LIFECYCLE_STAGE_PIPELINE',
     }
-
-    # Strip BOTH DATE(...) and toDate(...) wrapped patterns so they
-    # are not re-flagged as unwrapped
-    wrapped_pattern_date = re.compile(
-        r"DATE\s*\(\s*LEFT\s*\(\s*COALESCE\s*\(\s*([A-Z][A-Z0-9_.]*DATE[A-Z0-9_]*)"
+    # Strip both DATE(...) and toDate(...) wrapper variants
+    wrapped_pattern = re.compile(
+        r"(?:TODATE|DATE)\s*\(\s*LEFT\s*\(\s*COALESCE\s*\(\s*([A-Z][A-Z0-9_.]*DATE[A-Z0-9_]*)"
         r"\s*,\s*'1900-01-01'\s*\)\s*,\s*10\s*\)\s*\)"
     )
-    wrapped_pattern_todate = re.compile(
-        r"TODATE\s*\(\s*LEFT\s*\(\s*COALESCE\s*\(\s*([A-Z][A-Z0-9_.]*DATE[A-Z0-9_]*)"
-        r"\s*,\s*'1900-01-01'\s*\)\s*,\s*10\s*\)\s*\)"
-    )
-    sql_no_wrapped = wrapped_pattern_date.sub(' ', sql_upper)
-    sql_no_wrapped = wrapped_pattern_todate.sub(' ', sql_no_wrapped)
-
-    date_col_candidates = set(re.findall(
-        r'\b([A-Z][A-Z0-9_]*DATE[A-Z0-9_]*)\b', sql_upper
-    )) - DATE_FUNC_BLOCKLIST
-
-    unwrapped_date_cols = []
-    for col in sorted(date_col_candidates):
-        if re.search(rf'\b{re.escape(col)}\b', sql_no_wrapped):
-            unwrapped_date_cols.append(col)
-
+    sql_no_wrapped = wrapped_pattern.sub(' ', sql_upper)
+    unwrapped_date_cols = [
+        c for c in NULLABLE_STRING_DATES
+        if c in sql_upper and re.search(rf'\b{re.escape(c)}\b', sql_no_wrapped)
+    ]
     if unwrapped_date_cols:
         examples = "\n".join(
             f"    {c.lower()}  →  toDate(LEFT(coalesce({c.lower()},'1900-01-01'),10))"
@@ -1248,16 +1231,11 @@ def _validate_sql_guardrail(sql: str) -> tuple[bool, str]:
         )
         errors.append(
             "RULE VIOLATION — DATE COLUMN NOT NORMALIZED:\n"
-            "  The following date column(s) are referenced without the required\n"
-            "  normalization wrapper:\n"
+            "  The following Nullable(String) date column(s) need wrapping:\n"
             f"{examples}\n"
-            "  Required pattern (ClickHouse syntax):\n"
-            "    toDate(LEFT(coalesce(<column>,'1900-01-01'),10))\n"
-            "  Reason: Date columns may contain NULLs or full timestamp strings.\n"
-            "  coalesce(...,'1900-01-01') handles NULLs, LEFT(...,10) trims to\n"
-            "  YYYY-MM-DD, toDate() casts to ClickHouse Date type.\n"
-            "  Fix: Replace every raw reference with:\n"
-            "  toDate(LEFT(coalesce(<column>,'1900-01-01'),10))"
+            "  Required pattern: toDate(LEFT(coalesce(<column>,'1900-01-01'),10))\n"
+            "  NOTE: close_date and create_date are native Date types — do NOT wrap them.\n"
+            "  Fix: Replace raw references to the above columns only."
         )
     # =========================================================================
     # BUILD FINAL ERROR MESSAGE
