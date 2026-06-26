@@ -1056,14 +1056,21 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
         total_rows = len(norm_rows)
 
         if session_id:
-            _store_result(session_id, QueryResult(
-                sql          = sql,
-                columns      = columns,
-                rows         = norm_rows,
-                total_rows   = total_rows,
-                captured_at  = datetime.utcnow().isoformat() + "Z",
-                filters_applied = _extract_filters_from_sql(sql),
-            ))
+            existing = _SESSION_STORE.get(session_id)
+            # Only overwrite if this result is larger than what's already stored.
+            # This prevents a trivial follow-up query (e.g. export intent confirmation)
+            # from replacing a large deal-list result with 1 row.
+            if not existing or total_rows > existing.total_rows:
+                _store_result(session_id, QueryResult(
+                    sql             = sql,
+                    columns         = columns,
+                    rows            = norm_rows,
+                    total_rows      = total_rows,
+                    captured_at     = datetime.utcnow().isoformat() + "Z",
+                    filters_applied = _extract_filters_from_sql(sql),
+                ))
+            else:
+                print(f"   ⏭️  Skipping session store update — {total_rows} row(s) won't overwrite existing {existing.total_rows} rows.")
 
         CHAT_DISPLAY_LIMIT = 100
         header = " | ".join(columns)
