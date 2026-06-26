@@ -6,6 +6,7 @@ import os
 import re
 import traceback
 import uuid
+from rules import validate_sql_against_rules, validate_result_against_rules, get_intent
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Literal, Optional
 
@@ -98,6 +99,22 @@ def _cleanup_sessions():
         print(f"🧹 Cleaned {len(expired)} expired sessions.")
     threading.Timer(3600, _cleanup_sessions).start()
 
+_RULE_AUDIT_LOG: List[dict] = []   # most-recent-first, capped
+
+def _log_rule_audit(session_id: Optional[str], sql: str, violations: List[str],
+                     stage: str, user_message: str):
+    entry = {
+        "ts": datetime.utcnow().isoformat(),
+        "session_id": session_id,
+        "stage": stage,                # "pre_execute" | "post_execute"
+        "violations": violations,
+        "sql_preview": sql[:300],
+        "user_message": user_message[:200],
+    }
+    _RULE_AUDIT_LOG.insert(0, entry)
+    del _RULE_AUDIT_LOG[200:]          # cap log size
+    if violations:
+        print(f"[RULE-AUDIT][{stage}] session={session_id} violations={violations}")
 
 # =============================================================================
 # ClickHouse HTTP proxy — base helpers
@@ -1212,11 +1229,44 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
 
         tool_result_blocks = []
         for tool_block in tool_blocks:
-            sql          = tool_block.input.get("sql", "")
-            query_result = run_clickhouse_query(sql, session_id=session_id)
-            is_error     = any(query_result.startswith(p) for p in [
-                "DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"
-            ])
+            sql = tool_block.input.get("sql", "")
+
+            # --- NEW: pre-execution rule gate -------------------------------
+            sql_violations = validate_sql_against_rules(sql, original_user_message)
+            _log_rule_audit(session_id, sql, sql_violations, "pre_execute", original_user_message)
+
+            if sql_violations:
+                query_result = (
+                    "RULE VIOLATION — query rejected, NOT executed against the database:\n"
+                    + "\n".join(f"- {v}" for v in sql_violations)
+                    + "\n\nRewrite the SQL to satisfy these rules, then call the tool again."
+                )
+                is_error = True
+            else:
+                query_result = run_clickhouse_query(sql, session_id=session_id)
+                is_error = any(query_result.startswith(p) for p in [
+                    "DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"
+                ])
+
+                # --- NEW: post-execution result-level rule check ------------
+                if not is_error:
+                    try:
+                        parsed_rows = json.loads(query_result).get("rows", [])
+                    except Exception:
+                        parsed_rows = []
+                    result_violations = validate_result_against_rules(
+                        parsed_rows, original_user_message, sql
+                    )
+                    _log_rule_audit(session_id, sql, result_violations, "post_execute", original_user_message)
+                    if result_violations:
+                        query_result += (
+                            "\n\n⚠️ RESULT RULE VIOLATION:\n"
+                            + "\n".join(f"- {v}" for v in result_violations)
+                            + "\nThis result is likely wrong — re-derive using the single-CTE "
+                              "cohort pattern from §8b and call the tool again."
+                        )
+                        is_error = True
+
             if is_error:
                 last_error = query_result
 
