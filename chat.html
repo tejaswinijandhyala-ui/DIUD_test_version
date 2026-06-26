@@ -1238,34 +1238,31 @@
   /* ======================================================================
      EXPORT PANEL OPEN / CLOSE
      ====================================================================== */
-  function openExportPanel(preselectedFormat) {
+function openExportPanel(preselectedFormat) {
     panelOpen = true;
     document.getElementById('export-panel').classList.add('open');
     document.getElementById('body-wrap').classList.add('panel-open');
+    previewContent = null;
+    
+    // Set format BEFORE resetting state so the change listener doesn't fight it
+    if (preselectedFormat) {
+        // Temporarily disable the change listener while setting format
+        const formatEl = document.getElementById('ep-format');
+        formatEl.value = preselectedFormat;
+        
+        // Show/hide detail group based on format
+        document.getElementById('ep-detail-group').style.display = 
+            preselectedFormat === 'csv' ? 'none' : '';
+    }
+    
     showPanelState('empty');
     hideFooter();
-    previewContent = null;
-    if (preselectedFormat) document.getElementById('ep-format').value = preselectedFormat;
     document.getElementById('ep-dl-pdf').style.display   = 'none';
     document.getElementById('ep-dl-pptx').style.display  = 'none';
     document.getElementById('ep-dl-csv').style.display   = 'none';
     document.getElementById('ep-progress-fill').style.width = '0%';
     document.getElementById('ep-steps').innerHTML = '';
 }
-  function closeExportPanel() {
-    panelOpen = false;
-    document.getElementById('export-panel').classList.remove('open');
-    document.getElementById('body-wrap').classList.remove('panel-open');
-  }
-
-  function showPanelState(state) {
-    document.getElementById('ep-empty').style.display   = state === 'empty'   ? 'flex' : 'none';
-    document.getElementById('ep-loading').classList.toggle('visible', state === 'loading');
-    document.getElementById('ep-preview').classList.toggle('visible', state === 'preview');
-    document.getElementById('ep-progress-wrap').classList.toggle('visible', state === 'loading');
-  }
-  function hideFooter() { document.getElementById('ep-footer').classList.add('hidden'); }
-  function showFooter() { document.getElementById('ep-footer').classList.remove('hidden'); }
 
   /* ======================================================================
      GENERATE PREVIEW
