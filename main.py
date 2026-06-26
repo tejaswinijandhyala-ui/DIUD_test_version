@@ -88,6 +88,10 @@ _SESSION_TIMESTAMPS: Dict[str, datetime]    = {}
 def _store_result(session_id: str, result: QueryResult):
     _SESSION_STORE[session_id]      = result
     _SESSION_TIMESTAMPS[session_id] = datetime.utcnow()
+    
+def _get_result(session_id: str) -> Optional[QueryResult]:
+    """Retrieve stored query result for a session. Returns None if not found."""
+    return _SESSION_STORE.get(session_id)
 
 def _cleanup_sessions():
     cutoff  = datetime.utcnow() - timedelta(hours=4)
@@ -1092,10 +1096,12 @@ def _extract_filters_from_sql(sql: str) -> str:
     filters = []
     if "PIPELINE = 'DEFAULT'" in sql_upper:
         filters.append("Pipeline: default")
-    if "BECAME_20_DEAL_DATE" in sql_upper:
-        filters.append("Cohort: 20% qualified deals")
-    if "BECAME_5_DEAL_DATE" in sql_upper:
-        filters.append("Cohort: 5% IQM deals")
+    
+    # Dynamically detect any cohort stage (5, 10, 20, 30, 40, 60, 75)
+    cohort_stages = re.findall(r'BECAME_(\d+)_DEAL_DATE', sql_upper)
+    for stage in cohort_stages:
+        filters.append(f"Cohort: {stage}% qualified deals")
+    
     if "CLOSE_DATE" in sql_upper and "2026-04-01" in sql:
         filters.append("FY27 active pipeline")
     if "DEAL_STAGE" in sql_upper:
@@ -1106,7 +1112,6 @@ def _extract_filters_from_sql(sql: str) -> str:
         m = re.search(r"region\s*=\s*'([^']+)'", sql, re.IGNORECASE)
         if m:
             filters.append(f"Region: {m.group(1)}")
-    # FIX 2: detect MQL filters
     if "COMPANY_PRIORITY" in sql_upper:
         filters.append("Company Priority: P1–P7")
     if "LEAD_STATUS" in sql_upper and "BAD DATA" in sql_upper:
