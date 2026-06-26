@@ -254,9 +254,11 @@ executive-grade insights. You never fabricate numbers and never run destructive 
 RULE PRIORITY ORDER (highest → lowest):
   1. Greeting Rule (§1)
   2. Safety — SELECT/WITH only, no destructive SQL ever
-  3. Tool Usage (§2)
-  4. Business & SQL Rules (§3–§8)
-  5. Formatting & Chart Rules (§9–§10)
+  3. MANDATORY_BASE_FILTERS (§3) — pipeline, deal_type, allowlist
+  4. COHORT FUNNEL RULE (§8b) ← same weight as base filters — DO NOT SKIP
+  5. Tool Usage (§2)
+  6. Business & SQL Rules (§4–§8)
+  7. Formatting & Chart Rules (§9–§10)
 
 ═══════════════════════════════════════════════════════════════
 §1  GREETING RULE — HIGHEST PRIORITY
@@ -738,6 +740,12 @@ Stage | Column to filter on
 ═══════════════════════════════════════════════════════════════
 §8b  COHORT FUNNEL RULE — MANDATORY BUSINESS RULE
 ═══════════════════════════════════════════════════════════════
+⚠️  STOP before writing any funnel SQL. Verify all 4 checks:
+  □ became_<N>_deal_date IS NOT NULL — cohort anchor present?
+  □ deal_stage NOT IN (<all stages before N%>) — exclusion present?
+  □ Query starts with WITH — CTE pattern used?
+  □ countDistinct(deal_id) — not count(*) or count(deal_id)?
+If any box is unchecked, fix the SQL before calling the tool.
 When a user requests a funnel analysis with a specified STARTING COHORT stage
 (e.g. "5% → Closed Won", "20% → Closed Won", "10% → Closed Won"), apply ALL
 of the following rules without exception.
@@ -1258,12 +1266,52 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
             _log_rule_audit(session_id, sql, sql_violations, "pre_execute", original_user_message)
 
             if sql_violations:
-                query_result = (
-                    "RULE VIOLATION — query rejected, NOT executed against the database:\n"
-                    + "\n".join(f"- {v}" for v in sql_violations)
-                    + "\n\nRewrite the SQL to satisfy these rules, then call the tool again."
+                cohort_violations = [v for v in sql_violations if "cohort" in v.lower() or "8b" in v.lower()]
+
+                if cohort_violations:
+                    query_result = (
+                        "RULE VIOLATION — cohort funnel SQL rejected (§8b). NOT executed.\n\n"
+                        "Violations:\n"
+                        + "\n".join(f"- {v}" for v in sql_violations)
+                        + """
+
+            ⚠️ REQUIRED: Rewrite from scratch using this exact skeleton:
+
+            WITH cohort AS (
+              SELECT deal_id, deal_stage, amount
+              FROM hs_analytics.deals FINAL
+              WHERE became_<N>_deal_date IS NOT NULL          -- cohort anchor
+                AND deal_stage NOT IN (                        -- exclude ALL stages before <N>%
+                    '1% - Prospect', '<stages before N%>'
                 )
+                AND pipeline = 'default'
+                AND CASE WHEN deal_type IS NULL THEN 'Not Assigned' ELSE deal_type END
+                    NOT IN ('Partner-Led SMB')
+                AND toInt64(deal_id) IN (
+                    SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs
+                )
+                AND toDate(LEFT(coalesce(became_<N>_deal_date, '1900-01-01'), 10))
+                    BETWEEN '<start_date>' AND '<end_date>'
+            )
+            SELECT
+                deal_stage,
+                countDistinct(deal_id)       AS deal_count,
+                round(SUM(amount) / 1e6, 1) AS pipeline_m
+            FROM cohort
+            GROUP BY deal_stage
+            ORDER BY deal_count DESC
+
+            Fill in <N> and the stage exclusion list from §8b, then resubmit.
+            """
+                    )
+                else:
+                    query_result = (
+                        "RULE VIOLATION — query rejected, NOT executed against the database:\n"
+                        + "\n".join(f"- {v}" for v in sql_violations)
+                        + "\n\nRewrite the SQL to satisfy these rules, then call the tool again."
+                    )
                 is_error = True
+
             else:
                 query_result = run_clickhouse_query(sql, session_id=session_id)
                 is_error = any(query_result.startswith(p) for p in [
