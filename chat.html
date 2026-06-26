@@ -1032,7 +1032,7 @@
       }
       const data = await res.json();
       removeTyping(typingId);
-      if (data.dataset_rows > 0) { datasetRows = data.dataset_rows; updateDatasetBadge(); }
+      if (data.dataset_rows > datasetRows) { datasetRows = data.dataset_rows; updateDatasetBadge(); }
       if (data.export_intent) {
         const visibleReply = data.reply.replace('__EXPORT_INTENT__', '').trim();
         appendBubble('assistant', visibleReply);
@@ -1263,6 +1263,22 @@ function openExportPanel(preselectedFormat) {
     document.getElementById('ep-progress-fill').style.width = '0%';
     document.getElementById('ep-steps').innerHTML = '';
 }
+
+function closeExportPanel() {
+    panelOpen = false;
+    document.getElementById('export-panel').classList.remove('open');
+    document.getElementById('body-wrap').classList.remove('panel-open');
+  }
+
+  function showPanelState(state) {
+    document.getElementById('ep-empty').style.display   = state === 'empty'   ? 'flex' : 'none';
+    document.getElementById('ep-loading').classList.toggle('visible', state === 'loading');
+    document.getElementById('ep-preview').classList.toggle('visible', state === 'preview');
+    document.getElementById('ep-progress-wrap').classList.toggle('visible', state === 'loading');
+  }
+
+  function hideFooter() { document.getElementById('ep-footer').classList.add('hidden'); }
+  function showFooter() { document.getElementById('ep-footer').classList.remove('hidden'); }
 
   /* ======================================================================
      GENERATE PREVIEW
