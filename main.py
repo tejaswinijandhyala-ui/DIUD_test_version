@@ -1107,6 +1107,19 @@ def _extract_filters_from_sql(sql: str) -> str:
         filters.append("Lifecycle: MQL only")
     return "; ".join(filters) if filters else "Standard base filters applied"
 
+def _parse_rows_for_validation(query_result: str, session_id: Optional[str]) -> List[dict]:
+    """
+    run_clickhouse_query() returns a human-readable pipe-delimited text table,
+    not JSON, so we can't parse query_result directly. Instead, pull the
+    structured rows it already stored in _SESSION_STORE for this session.
+    """
+    if not session_id:
+        return []
+    stored = _SESSION_STORE.get(session_id)
+    if not stored:
+        return []
+    return stored.rows
+
 
 # =============================================================================
 # Startup
