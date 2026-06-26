@@ -1685,70 +1685,107 @@ def _generate_export_content(
 ) -> str:
     selected_model = ALLOWED_MODELS["sonnet"]
 
+    # ── Build readable conversation transcript ──────────────────────────
     conv_text = "\n\n".join(
         f"{'USER' if m.role == 'user' else 'DIUD AGENT'}: {m.content}"
         for m in conversation
     )
 
-    format_hint = (
-        "Format as a PowerPoint: use SLIDE: <title> for each slide, then bullet points."
-        if export_type == "pptx"
-        else "Format as a professional PDF report: ## section headers, narrative prose, tables."
-    )
-    detail_hint = (
-        "Include all metrics and insights. The full deal table will be appended automatically — "
-        "just write a [DEAL_TABLE_PLACEHOLDER] marker where it should appear."
-        if detail_level == "detailed"
-        else "Executive summary only — key metrics and top insights, no raw deal list."
-    )
+    # ── ENTIRE CONVERSATION — verbatim transcript, no AI rewriting ──────
+    if detail_level == "detailed":
+        if export_type == "pptx":
+            # For PPTX, structure transcript as slides
+            prompt = f"""Format the following chat conversation as a PowerPoint presentation transcript.
+Use SLIDE: <title> for each logical section, then bullet points (- ) summarising that part of the conversation.
+Preserve all data, numbers, and insights from the conversation exactly as discussed.
+Do not add analysis, commentary, or content not present in the conversation.
 
-    dataset_hint = ""
-    if stored_dataset:
-        dataset_hint = (
-            f"\n\nDATASET CONTEXT: The query returned {stored_dataset.total_rows} records "
-            f"with columns: {', '.join(stored_dataset.columns[:12])}. "
-            f"Filters: {stored_dataset.filters_applied}. "
-            f"The complete table will be injected at [DEAL_TABLE_PLACEHOLDER]."
+CONVERSATION:
+{conv_text}
+
+Today: {date.today().strftime('%B %d, %Y')}
+Title: {title}
+
+Generate the slide structure now:"""
+        else:
+            # For PDF — produce a clean formatted transcript
+            prompt = f"""Format the following chat conversation as a clean, professional PDF transcript document.
+
+Use this exact structure:
+## Conversation Transcript
+### [timestamp or turn number] User
+[user message verbatim]
+
+### [timestamp or turn number] DIUD Agent  
+[agent response verbatim]
+
+Rules:
+- Include EVERY message from the conversation in order
+- Do not summarise, paraphrase, or omit any messages
+- Do not add analysis, insights, or commentary not in the original conversation
+- Preserve all tables, numbers, and data exactly as they appeared
+- Use ## section headers only for major topic changes if helpful for readability
+- Today: {date.today().strftime('%B %d, %Y')}
+
+CONVERSATION TO TRANSCRIBE:
+{conv_text}
+
+Generate the complete transcript now:"""
+
+    # ── SUMMARY — AI-generated analytical report ────────────────────────
+    else:
+        format_hint = (
+            "Format as a PowerPoint: use SLIDE: <title> for each slide, then bullet points."
+            if export_type == "pptx"
+            else "Format as a professional PDF report: ## section headers, narrative prose, tables."
         )
 
-    prompt = f"""You are preparing a professional {export_type.upper()} export document.
+        dataset_hint = ""
+        if stored_dataset:
+            dataset_hint = (
+                f"\n\nDATASET CONTEXT: The query returned {stored_dataset.total_rows} records "
+                f"with columns: {', '.join(stored_dataset.columns[:12])}. "
+                f"Filters: {stored_dataset.filters_applied}."
+            )
+
+        prompt = f"""You are preparing a professional {export_type.upper()} summary report.
 
 CONVERSATION:
 {conv_text}
 {dataset_hint}
 
-TASK: Create "{title}"
+TASK: Create a concise executive summary titled "{title}"
 
 {format_hint}
-{detail_hint}
 
 REQUIREMENTS:
-- Executive summary at the start with key numbers
+- Executive summary at the start with key numbers only
 - Logical sections: summary, key metrics, insights, recommendations
-- If this is a deal list export, include [DEAL_TABLE_PLACEHOLDER] where the full table belongs
+- Keep it concise — highlight only the most important findings
 - Bold key numbers; clean professional tone
 - Today: {date.today().strftime('%B %d, %Y')}
-- Generate the COMPLETE document — do not truncate or stop early
+- Generate the COMPLETE document — do not truncate
 
-Generate the document now:"""
+Generate the summary report now:"""
 
     response = _ai_client.messages.create(
-        model   = selected_model,
-        system  = "You are a professional business report writer. Generate clean, well-structured, COMPLETE documents. Never truncate mid-section.",
-        messages= [{"role": "user", "content": prompt}],
-        temperature = 0,
-        max_tokens  = EXPORT_MAX_TOKENS,   # FIX 1: was hardcoded 4096
+        model      = selected_model,
+        system     = "You are a professional document formatter. Follow the instructions exactly. Never add content not requested.",
+        messages   = [{"role": "user", "content": prompt}],
+        temperature= 0,
+        max_tokens = EXPORT_MAX_TOKENS,
     )
     ai_text = _extract_text(response.content)
 
-    if stored_dataset and stored_dataset.total_rows > 0:
+    # Append dataset table only for summary mode (detailed is verbatim)
+    if detail_level == "summary" and stored_dataset and stored_dataset.total_rows > 0:
         table_md  = _rows_to_markdown_table(stored_dataset)
         meta_line = (
             f"**Total records:** {stored_dataset.total_rows:,} | "
             f"**Filters:** {stored_dataset.filters_applied} | "
             f"**Exported:** {date.today().strftime('%B %d, %Y')}"
         )
-        full_section = f"\n\n## Deal List ({stored_dataset.total_rows:,} records)\n\n{meta_line}\n\n{table_md}"
+        full_section = f"\n\n## Data Export ({stored_dataset.total_rows:,} records)\n\n{meta_line}\n\n{table_md}"
 
         if "[DEAL_TABLE_PLACEHOLDER]" in ai_text:
             ai_text = ai_text.replace("[DEAL_TABLE_PLACEHOLDER]", full_section)
@@ -1756,7 +1793,6 @@ Generate the document now:"""
             ai_text = ai_text.rstrip() + full_section
 
     return ai_text
-
 
 def _rows_to_markdown_table(stored: QueryResult) -> str:
     if not stored.rows:
