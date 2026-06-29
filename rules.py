@@ -501,3 +501,63 @@ def validate_result_against_rules(rows: List[dict], user_message: str, sql: str 
 def get_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
     """Exposed for logging/debugging in main.py."""
     return detect_intent(user_message, sql)
+    
+    
+# =============================================================================
+# FACT-BINDING VERIFIER — checks Claude's prose summary against the numbers
+# that actually appeared in the query results, to catch invented figures.
+# =============================================================================
+_NUM_PATTERN = re.compile(r'-?\$?\d[\d,]*\.?\d*%?')
+
+
+def extract_numbers(text: str) -> Set[float]:
+    """Pull every numeric token out of a string, normalized to a float."""
+    raw = _NUM_PATTERN.findall(text)
+    out: Set[float] = set()
+    for tok in raw:
+        cleaned = tok.replace('$', '').replace(',', '').replace('%', '')
+        try:
+            out.add(round(float(cleaned), 2))
+        except ValueError:
+            continue
+    return out
+
+
+def extract_numbers_from_rows(rows: List[dict]) -> Set[float]:
+    """Pull every numeric value that actually appeared in the SQL result rows."""
+    out: Set[float] = set()
+    for row in rows:
+        for v in row.values():
+            try:
+                out.add(round(float(v), 2))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def validate_summary_against_facts(
+    summary_text: str,
+    allowed_rows: List[dict],
+    tolerance: float = 0.5,
+) -> List[str]:
+    """
+    Returns violation strings if the summary contains numbers that cannot be
+    traced back to the actual query result rows (within a rounding tolerance,
+    since the LLM may legitimately compute %s/sums/$M conversions from raw rows).
+    """
+    claimed = extract_numbers(summary_text)
+    actual = extract_numbers_from_rows(allowed_rows)
+
+    if not actual:
+        return []  # no data to check against — don't false-positive on greetings etc.
+
+    violations = []
+    for c in claimed:
+        if c in (0, 100):  # common safe derived values (0%, 100%)
+            continue
+        matches_raw   = any(abs(c - a) <= tolerance for a in actual)
+        matches_m     = any(abs(c - a / 1_000_000) <= tolerance for a in actual)
+        matches_scale = any(abs(c * 1_000_000 - a) <= tolerance for a in actual)
+        if not (matches_raw or matches_m or matches_scale):
+            violations.append(f"Unverified number in summary: {c}")
+    return violations
