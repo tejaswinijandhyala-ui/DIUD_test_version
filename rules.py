@@ -46,7 +46,7 @@ MQL TARGET PATTERN — always filter by exact quarter, never divide annual by 4:
 A deal qualifies as ACTIVE pipeline when ALL of the following are true:
 1. deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
                   '60% - Price Negotiation','75% - Contract Review')
-2. Primary filter is close_date (NOT became_10_deal_date)
+2. Primary filter is close_date (not any became_<stage>_deal_date)
 3. All MANDATORY_BASE_FILTERS applied (pipeline='default', deal_type exclusion,
    gs_deal_ids_hs allowlist)
 Apply the deal_stage filter ONLY when the user explicitly requests "active" pipeline.
@@ -97,10 +97,17 @@ Pattern:
 6. ATTAINMENT = round(actual / nullIf(target, 0) * 100, 1)
 7. SOURCE MAPPING for Pattern C: Executive Outreach + Investor → 'Executive Outreach'
    (this differs from Pattern A/B where they stay separate).
-8. FY anchor for became_N_deal_date MUST MATCH the stage being targeted:
-   - 10% targets → became_10_deal_date
-   - 20% targets → became_20_deal_date
-   - 5% targets  → became_5_deal_date
+8. FY anchor MUST use the became_<stage>_deal_date corresponding
+to the stage requested.
+
+Examples:
+5%  → became_5_deal_date
+10% → became_10_deal_date
+20% → became_20_deal_date
+30% → became_30_deal_date
+40% → became_40_deal_date
+60% → became_60_deal_date
+75% → became_75_deal_date
 """,
 
     "closed_won": """
@@ -144,9 +151,10 @@ def get_rulebook_entry(topic: str) -> str:
 
 def _is_pattern_a(sql: str) -> bool:
     """
-    Pattern A: cumulative OR-chain stage counting.
-    FY is always anchored on became_10_deal_date.
-    """
+Pattern A: cumulative OR-chain stage counting.
+FY is anchored on the became_<stage>_deal_date corresponding
+to the stage requested by the user.
+"""
     if re.search(r'--\s*Pattern\s*A', sql, re.I):
         return True
 
@@ -186,9 +194,9 @@ _STAGE_COLUMN_MAP = {
 
 def _expected_became_column(intent: Dict[str, Any]) -> str:
     """
-    Pattern C and cohort queries should use the became date
-    corresponding to the stage requested by the user.
-    Pattern A intentionally always uses became_10_deal_date.
+    Returns the became_<stage>_deal_date corresponding
+    to the stage requested by the user.
+    Used for all stage-based queries.
     """
     stage = (
         intent.get("stage")
@@ -481,24 +489,27 @@ RULES: List[Dict[str, Any]] = [
         ),
     },
     {
-        "id": "pattern_a_fy_anchor",
-        "section": "§6 Pattern A — FY anchor must be became_10_deal_date",
-        "applies_when": lambda sql: _is_pattern_a(sql),
-        "check": lambda sql: "became_10_deal_date" in sql,
+        {
+        "id": "pattern_a_stage_anchor",
+        "section": "§6 Pattern A — stage-specific FY anchor",
+        "applies_when": lambda sql, intent: _is_pattern_a(sql),
+        "check": lambda sql, intent: (
+            _expected_became_column(intent) in sql
+        ),
         "message": (
-            "Pattern A query is missing became_10_deal_date. "
-            "In Pattern A the FY/quarter is ALWAYS anchored to became_10_deal_date "
-            "regardless of which stage is being counted."
+            "Pattern A must use the became_<stage>_deal_date "
+            "corresponding to the stage requested by the user."
         ),
     },
 
+
     # -------------------------------------------------------------------------
     # Pattern B — deal-level detail (§7)
-    # Primary filter must be close_date, not became_10_deal_date.
+    # Primary filter must be close_date, (not any became_<stage>_deal_date).
     # -------------------------------------------------------------------------
     {
         "id": "pattern_b_close_date_filter",
-        "section": "§7 Pattern B — primary filter is close_date, not became_10_deal_date",
+        "section": "§7 Pattern B — primary filter is close_date, (not any became_<stage>_deal_date),
         "applies_when": lambda sql, intent: (
             intent.get("metric") == "active_pipeline"
             and not _is_pattern_a(sql)
