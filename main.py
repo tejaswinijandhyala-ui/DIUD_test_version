@@ -1683,72 +1683,53 @@ def _generate_export_content(
     detail_level:    str = "detailed",
     stored_dataset:  Optional[QueryResult] = None,
 ) -> str:
-    selected_model = ALLOWED_MODELS["sonnet"]
 
-    # ── Build readable conversation transcript ──────────────────────────
+    # ── VERBATIM MODE: no AI, just raw chat history ──────────────────────
+    if detail_level == "detailed":
+        lines = [f"# {title}", f"*Exported: {date.today().strftime('%B %d, %Y')}*", ""]
+
+        if export_type == "pptx":
+            # Structure as slides by turn
+            for i, m in enumerate(conversation):
+                role = "User" if m.role == "user" else "DIUD Agent"
+                lines.append(f"SLIDE: {role} — Turn {i + 1}")
+                # Each line of the message becomes a bullet
+                for part in m.content.strip().split("\n"):
+                    part = part.strip()
+                    if part:
+                        lines.append(f"- {part}")
+        else:
+            # PDF: plain transcript
+            for i, m in enumerate(conversation):
+                role = "**User**" if m.role == "user" else "**DIUD Agent**"
+                lines.append(f"### Turn {i + 1} — {role}")
+                lines.append(m.content.strip())
+                lines.append("")
+
+        return "\n".join(lines)
+
+    # ── SUMMARY MODE: AI-generated analytical report ─────────────────────
+    selected_model = ALLOWED_MODELS["sonnet"]
     conv_text = "\n\n".join(
         f"{'USER' if m.role == 'user' else 'DIUD AGENT'}: {m.content}"
         for m in conversation
     )
 
-    # ── ENTIRE CONVERSATION — verbatim transcript, no AI rewriting ──────
-    if detail_level == "detailed":
-        if export_type == "pptx":
-            # For PPTX, structure transcript as slides
-            prompt = f"""Format the following chat conversation as a PowerPoint presentation transcript.
-Use SLIDE: <title> for each logical section, then bullet points (- ) summarising that part of the conversation.
-Preserve all data, numbers, and insights from the conversation exactly as discussed.
-Do not add analysis, commentary, or content not present in the conversation.
+    format_hint = (
+        "Format as a PowerPoint: use SLIDE: <title> for each slide, then bullet points."
+        if export_type == "pptx"
+        else "Format as a professional PDF report: ## section headers, narrative prose, tables."
+    )
 
-CONVERSATION:
-{conv_text}
-
-Today: {date.today().strftime('%B %d, %Y')}
-Title: {title}
-
-Generate the slide structure now:"""
-        else:
-            # For PDF — produce a clean formatted transcript
-            prompt = f"""Format the following chat conversation as a clean, professional PDF transcript document.
-
-Use this exact structure:
-## Conversation Transcript
-### [timestamp or turn number] User
-[user message verbatim]
-
-### [timestamp or turn number] DIUD Agent  
-[agent response verbatim]
-
-Rules:
-- Include EVERY message from the conversation in order
-- Do not summarise, paraphrase, or omit any messages
-- Do not add analysis, insights, or commentary not in the original conversation
-- Preserve all tables, numbers, and data exactly as they appeared
-- Use ## section headers only for major topic changes if helpful for readability
-- Today: {date.today().strftime('%B %d, %Y')}
-
-CONVERSATION TO TRANSCRIBE:
-{conv_text}
-
-Generate the complete transcript now:"""
-
-    # ── SUMMARY — AI-generated analytical report ────────────────────────
-    else:
-        format_hint = (
-            "Format as a PowerPoint: use SLIDE: <title> for each slide, then bullet points."
-            if export_type == "pptx"
-            else "Format as a professional PDF report: ## section headers, narrative prose, tables."
+    dataset_hint = ""
+    if stored_dataset:
+        dataset_hint = (
+            f"\n\nDATASET CONTEXT: The query returned {stored_dataset.total_rows} records "
+            f"with columns: {', '.join(stored_dataset.columns[:12])}. "
+            f"Filters: {stored_dataset.filters_applied}."
         )
 
-        dataset_hint = ""
-        if stored_dataset:
-            dataset_hint = (
-                f"\n\nDATASET CONTEXT: The query returned {stored_dataset.total_rows} records "
-                f"with columns: {', '.join(stored_dataset.columns[:12])}. "
-                f"Filters: {stored_dataset.filters_applied}."
-            )
-
-        prompt = f"""You are preparing a professional {export_type.upper()} summary report.
+    prompt = f"""You are preparing a professional {export_type.upper()} summary report.
 
 CONVERSATION:
 {conv_text}
@@ -1777,8 +1758,7 @@ Generate the summary report now:"""
     )
     ai_text = _extract_text(response.content)
 
-    # Append dataset table only for summary mode (detailed is verbatim)
-    if detail_level == "summary" and stored_dataset and stored_dataset.total_rows > 0:
+    if stored_dataset and stored_dataset.total_rows > 0:
         table_md  = _rows_to_markdown_table(stored_dataset)
         meta_line = (
             f"**Total records:** {stored_dataset.total_rows:,} | "
