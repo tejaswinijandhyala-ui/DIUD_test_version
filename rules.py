@@ -11,9 +11,113 @@ and self-contained, so the registry can grow without anything else changing.
 """
 
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
+
+# =============================================================================
+# RULEBOOK — on-demand rule text, pulled out of the always-loaded system prompt
+# =============================================================================
+RULEBOOK: Dict[str, str] = {
+    "mql": """
+§6 MQL CALCULATION RULES — MANDATORY
+When computing MQL actuals from hs_analytics.contacts FINAL, ALL THREE filters
+below are mandatory. Missing any one produces inflated counts.
+
+1. lifecycle_stage = 'marketingqualifiedlead'
+   AND date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
+2. company_priority IN ('P1','P2','P3','P4','P5','P6','P7')
+3. lead_status != 'Bad Data'
+
+MQL TARGET PATTERN — always filter by exact quarter, never divide annual by 4:
+  SELECT region, original_source, SUM(toFloat64OrZero(mql_target)) AS mql_tgt
+  FROM kore_ai_hubspot.gs_marketing_targets
+  WHERE fy = 'FY27' AND quarter = 'Q1'
+  GROUP BY region, original_source
+""",
+
+    "active_pipeline": """
+§8 ACTIVE PIPELINE DEFINITION
+A deal qualifies as ACTIVE pipeline when ALL of the following are true:
+1. deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
+                  '60% - Price Negotiation','75% - Contract Review')
+2. close_date >= '2026-04-01' AND close_date <= '2027-03-31' (FY27)
+3. All MANDATORY_BASE_FILTERS applied
+Apply the deal_stage filter ONLY when the user explicitly requests "active" pipeline.
+""",
+
+    "cohort_funnel": """
+§8b COHORT FUNNEL RULE — MANDATORY
+Before writing any funnel SQL, verify all 4 checks:
+  - became_<N>_deal_date IS NOT NULL — cohort anchor present
+  - deal_stage NOT IN (<all stages before N%>) — exclusion present
+  - Query starts with WITH — CTE pattern used
+  - countDistinct(deal_id) — not count(*) or count(deal_id)
+
+Exclusion logic by starting stage:
+  10% -> CW : exclude 1%, 5%
+  20% -> CW : exclude 1%, 5%, 10%
+  30% -> CW : exclude 1%, 5%, 10%, 20%
+  40% -> CW : exclude 1%, 5%, 10%, 20%, 30%
+  60% -> CW : exclude 1%, 5%, 10%, 20%, 30%, 40%
+  75% -> CW : exclude 1%, 5%, 10%, 20%, 30%, 40%, 60%
+
+Pattern:
+  WITH cohort AS (
+    SELECT deal_id, deal_stage, amount
+    FROM hs_analytics.deals FINAL
+    WHERE became_<N>_deal_date IS NOT NULL
+      AND deal_stage NOT IN (<stages before N%>)
+      AND <MANDATORY_BASE_FILTERS>
+      AND <date range on became_<N>_deal_date>
+  )
+  SELECT deal_stage, countDistinct(deal_id) AS deal_count,
+         round(SUM(amount)/1e6, 1) AS pipeline_m
+  FROM cohort GROUP BY deal_stage ORDER BY deal_count DESC
+""",
+
+    "attainment": """
+§5 TARGET SQL RULES
+1. DEFAULT TIER = L2 (no-prefix in T1; l2_ prefix in T2/T3). Switch only if user
+   explicitly says L1/stretch/committed.
+2. CAST ALL NUMERIC TARGET COLUMNS: SUM(toFloat64OrZero(amount_target_20))
+3. NO FAN-OUT JOINS — never join raw deals to a target table then SUM. Use
+   independent CTEs (actual CTE + target CTE), combined with LEFT JOIN at the end.
+4. Use nullIf(target, 0) in every division.
+5. PERIOD GRAIN MUST MATCH — filter target table to the exact quarter, never
+   divide an annual target by 4.
+6. ATTAINMENT = round(actual / nullIf(target, 0) * 100, 1)
+""",
+
+    "closed_won": """
+CLOSED WON RULES
+  deal_stage = 'Closed Won' AND close_date BETWEEN '<fy_start>' AND '<fy_end>'
+  GROUP BY deal_owner + MANDATORY_BASE_FILTERS
+  Quota source: kore_ai_hubspot.gs_closed_won_quotas, cast with toFloat64OrZero().
+  No L1/L2/Committed split in this table — single quota tier only.
+""",
+
+    "partner_targets": """
+PARTNER TARGET RULES
+  Table T2 gs_partner_targets_region_wise: l2_/l1_/committed_ prefixes.
+  Table T3 gs_partner_targets_psd: COMMITTED ONLY, no L1/L2 — use T2 for those.
+  Filter partner_team_type to isolate 'Hyperscaler' vs 'GSI/SI' vs 'Reseller/BPO/TSD'.
+  committed_amount_target_10 / _5 do NOT exist in T2 — do not query them there.
+""",
+
+    "dashboard_definitions": """
+DASHBOARD DEFINITIONS (abbreviated — ask user which dashboard if ambiguous)
+  EOP: pipeline vs EOP target, active stages only, current quarter end window.
+  EXEC KPI: total active pipeline, closed won, CW attainment %, win rate, coverage.
+  PIPEGEN: 5/10/20% pipeline amount + deal count vs gs_pipeline_quotas_v1.
+  PARTNERSHIP: partner pipeline vs partner target tables, PSD/hyperscaler splits.
+  MARKETING: MQL actual vs target, source/region performance, conversion rate.
+  AE FOCUS: AE pipeline, CW ARR, quota attainment, win rate, avg deal size.
+  BDR FOCUS: meetings created, opportunities generated, PipeGen by BDR.
+""",
+}
 
 
+def get_rulebook_entry(topic: str) -> str:
+    return RULEBOOK.get(topic, f"No rulebook entry found for topic '{topic}'.")
 # =============================================================================
 # Intent detection — light NLP on the user's message + the SQL itself.
 # This is intentionally simple (regex, not another LLM call) so it's fast,
