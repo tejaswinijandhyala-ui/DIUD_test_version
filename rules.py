@@ -140,30 +140,22 @@ def get_rulebook_entry(topic: str) -> str:
 
 # =============================================================================
 # PATTERN DETECTION
-# Determines which of Pattern A / B / C (or cohort) applies to a given SQL
-# string, so rules can target the right pattern and not cross-fire.
 # =============================================================================
 
 def _is_pattern_a(sql: str) -> bool:
     """
     Pattern A: cumulative OR-chain stage counting.
-    The model is instructed to add `-- Pattern A` at the top of such queries.
-    We also detect it heuristically via the OR-chain structure.
+    FY is always anchored on became_10_deal_date.
     """
     if re.search(r'--\s*Pattern\s*A', sql, re.I):
         return True
-    # Heuristic: multiple became_N_deal_date columns joined with OR
-    dates_mentioned = re.findall(r'became_(\d+)_deal_date', sql, re.I)
-    if len(set(dates_mentioned)) >= 3 and "OR" in sql.upper():
-        return True
-    return False
+
+    dates = re.findall(r'became_(\d+)_deal_date', sql, re.I)
+
+    return len(set(dates)) >= 3 and "OR" in sql.upper()
 
 
 def _is_cohort_query(sql: str, intent: dict) -> bool:
-    """
-    True only for genuine cohort funnel queries (not Pattern A / B / C).
-    Requires explicit cohort intent from the user AND the absence of Pattern A markers.
-    """
     if _is_pattern_a(sql):
         return False
     return intent.get("cohort_stage") is not None
@@ -174,71 +166,147 @@ def _has_became_date(sql: str) -> bool:
 
 
 def _is_pattern_c(sql: str, intent: dict) -> bool:
-    """Pattern C: attainment / vs-target queries using two-CTE structure."""
     return intent.get("metric") == "attainment"
+
+
+# -----------------------------------------------------------------------------
+# Stage helper
+# -----------------------------------------------------------------------------
+
+_STAGE_COLUMN_MAP = {
+    "5": "became_5_deal_date",
+    "10": "became_10_deal_date",
+    "20": "became_20_deal_date",
+    "30": "became_30_deal_date",
+    "40": "became_40_deal_date",
+    "60": "became_60_deal_date",
+    "75": "became_75_deal_date",
+}
+
+
+def _expected_became_column(intent: Dict[str, Any]) -> str:
+    """
+    Pattern C and cohort queries should use the became date
+    corresponding to the stage requested by the user.
+    Pattern A intentionally always uses became_10_deal_date.
+    """
+    stage = (
+        intent.get("stage")
+        or intent.get("cohort_stage")
+        or "10"
+    )
+
+    return _STAGE_COLUMN_MAP.get(stage, "became_10_deal_date")
 
 
 # =============================================================================
 # Intent detection
 # =============================================================================
+
 def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
+
     msg = user_message or ""
     intent: Dict[str, Any] = {}
 
-    # ── Cohort stage detection ───────────────────────────────────────────────
-    # Only detect cohort intent when the user clearly asks for a true cohort funnel
-    # (not Pattern A cumulative counts, which have their own section).
+    # ------------------------------------------------------------------
+    # Detect requested stage (5%,10%,20%,30%,40%,60%,75%)
+    # ------------------------------------------------------------------
 
-    # Pattern 1: explicit arrow notation  "20% → Closed Won", "20% to CW"
-    m = re.search(r'(\d+)\s*%\s*(→|->|to)\s*(closed\s*won|cw)\b', msg, re.I)
+    stage_match = re.search(r'\b(5|10|20|30|40|60|75)\s*%', msg)
+
+    if stage_match:
+        intent["stage"] = stage_match.group(1)
+
+    # ------------------------------------------------------------------
+    # Cohort detection
+    # ------------------------------------------------------------------
+
+    m = re.search(
+        r'(\d+)\s*%\s*(?:→|->|to)\s*(closed\s*won|cw)\b',
+        msg,
+        re.I,
+    )
+
     if m:
         intent["cohort_stage"] = m.group(1)
 
-    # Pattern 2: funnel/cohort keyword before percentage
     if not intent.get("cohort_stage"):
-        m2 = re.search(
+
+        m = re.search(
             r'\b(cohort|starting\s+(?:at|from))\b.*?(\d+)\s*%',
-            msg, re.I
+            msg,
+            re.I,
         )
-        if m2:
-            intent["cohort_stage"] = m2.group(2)
 
-    # Pattern 3: percentage before "cohort" keyword
+        if m:
+            intent["cohort_stage"] = m.group(2)
+
     if not intent.get("cohort_stage"):
-        m3 = re.search(r'(\d+)\s*%.*?\b(cohort)\b', msg, re.I)
-        if m3:
-            intent["cohort_stage"] = m3.group(1)
 
-    # NOTE: "funnel", "conversion", "progression", "stage breakdown" alone are
-    # no longer treated as cohort signals — they can equally describe Pattern A.
-    # Only use them if paired with explicit cohort language or the → arrow.
+        m = re.search(
+            r'(\d+)\s*%.*?\bcohort\b',
+            msg,
+            re.I,
+        )
 
-    # Pattern 4: fall back to SQL structure ONLY when Pattern A is NOT present
-    if not intent.get("cohort_stage") and sql and not _is_pattern_a(sql):
-        sql_m = re.search(r'became_(\d+)_deal_date', sql, re.I)
-        if sql_m and "NOT IN" in sql.upper():
-            intent["cohort_stage"] = sql_m.group(1)
+        if m:
+            intent["cohort_stage"] = m.group(1)
 
-    # ── List query detection ─────────────────────────────────────────────────
-    if re.search(r'\b(list|show me all|which deals|deals\s+(with|where))\b', msg, re.I):
+    if (
+        not intent.get("cohort_stage")
+        and sql
+        and not _is_pattern_a(sql)
+    ):
+
+        m = re.search(
+            r'became_(\d+)_deal_date',
+            sql,
+            re.I,
+        )
+
+        if m and "NOT IN" in sql.upper():
+            intent["cohort_stage"] = m.group(1)
+
+    # ------------------------------------------------------------------
+    # List queries
+    # ------------------------------------------------------------------
+
+    if re.search(
+        r'\b(list|show me all|which deals|deals\s+(with|where))\b',
+        msg,
+        re.I,
+    ):
         intent["query_type"] = "list"
 
-    # ── Top-N cap detection ──────────────────────────────────────────────────
-    if re.search(r'\btop\s+\d+\b|\bfirst\s+\d+\b', msg, re.I):
+    # ------------------------------------------------------------------
+    # Top N
+    # ------------------------------------------------------------------
+
+    if re.search(r'\b(top|first)\s+\d+\b', msg, re.I):
         intent["top_n"] = True
 
-    # ── Metric detection ─────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
     if re.search(r'\bMQL\b', msg, re.I):
         intent["metric"] = "mql"
 
-    if re.search(r'\battainment\b|\bvs\.?\s*target\b|\bquota\b|\bcoverage\b|\bgap.to.target\b', msg, re.I):
-        intent["metric"] = intent.get("metric") or "attainment"
+    if re.search(
+        r'\b(attainment|quota|coverage|vs\.?\s*target|gap\s*to\s*target)\b',
+        msg,
+        re.I,
+    ):
+        intent["metric"] = "attainment"
 
     if re.search(r'\bactive pipeline\b', msg, re.I):
-        intent["metric"] = intent.get("metric") or "active_pipeline"
+        intent["metric"] = "active_pipeline"
 
-    # ── Generation hygiene ───────────────────────────────────────────────────
-    if sql and re.search(r'\bMANDATORY_BASE_FILTERS\b', sql):
+    # ------------------------------------------------------------------
+    # Placeholder leakage
+    # ------------------------------------------------------------------
+
+    if sql and "MANDATORY_BASE_FILTERS" in sql:
         intent["placeholder_leak"] = True
 
     return intent
@@ -476,23 +544,37 @@ RULES: List[Dict[str, Any]] = [
         ),
     },
     {
-        "id": "pattern_c_source_merge",
-        "section": "§8 Pattern C — Executive Outreach + Investor merged in source mapping",
-        "applies_when": lambda sql, intent: (
-            _is_pattern_c(sql, intent)
-            and "deal_source_rollup" in sql
-            and "Executive Outreach" in sql
-        ),
-        "check": lambda sql, intent: (
-            # Either Investor is remapped to Executive Outreach, or the query has no Investor rows
-            ("Investor" in sql and "Executive Outreach" in sql)
-            or "Investor" not in sql
-        ),
-        "message": (
-            "Pattern C source mapping must merge 'Investor' into 'Executive Outreach' "
-            "to match the quota table bucket. This differs from Pattern A/B where they stay separate."
-        ),
+    "id": "pattern_c_stage_anchor",
+    "section": "§8 Pattern C — stage-specific became date",
+
+    "applies_when": lambda sql, intent:
+        _is_pattern_c(sql, intent),
+
+    "check": lambda sql, intent:
+        _expected_became_column(intent) in sql,
+
+    "message": (
+        "Pattern C must use the became_<stage>_deal_date corresponding "
+        "to the stage requested by the user."
+    ),
     },
+    {
+    "id": "pattern_c_source_merge",
+    "section": "§8 Pattern C — Executive Outreach + Investor merged in source mapping",
+    "applies_when": lambda sql, intent: (
+        _is_pattern_c(sql, intent)
+        and "deal_source_rollup" in sql
+        and "Executive Outreach" in sql
+    ),
+    "check": lambda sql, intent: (
+        ("Investor" in sql and "Executive Outreach" in sql)
+        or "Investor" not in sql
+    ),
+    "message": (
+        "Pattern C source mapping must merge 'Investor' into 'Executive Outreach' "
+        "to match the quota table bucket. This differs from Pattern A/B where they stay separate."
+    ),
+},
     {
         "id": "pattern_c_target_tier_default",
         "section": "§4 Pattern C — default tier is L2 (no prefix / l2_ prefix)",
@@ -515,10 +597,13 @@ RULES: List[Dict[str, Any]] = [
         "id": "cohort_anchor_sentinel",
         "section": "§8b Cohort anchor — became_<N>_deal_date != '1900-01-01'",
         "applies_when": lambda sql, intent: _is_cohort_query(sql, intent),
-        "check": lambda sql, intent: (
-            f"became_{intent['cohort_stage']}_deal_date" in sql
-            and "'1900-01-01'" in sql
-        ),
+        "check": lambda sql, intent: bool(
+        re.search(
+            rf"{_expected_became_column(intent)}\s*!=\s*'1900-01-01'",
+            sql,
+            re.I,
+        )
+    ),
         "message": (
             "Cohort query missing `became_<N>_deal_date != '1900-01-01'` sentinel anchor. "
             "Do NOT use IS NOT NULL — use the sentinel check instead."
