@@ -6,9 +6,15 @@ import os
 import re
 import traceback
 import uuid
-from rules import validate_sql_against_rules, validate_result_against_rules, get_intent
+from rules import (
+    validate_sql_against_rules,
+    validate_result_against_rules,
+    get_intent,
+    get_rulebook_entry,
+    validate_summary_against_facts,
+)
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Callable
 
 import httpx
 import anthropic
@@ -1138,6 +1144,86 @@ def _extract_filters_from_sql(sql: str) -> str:
         filters.append("Lifecycle: MQL only")
     return "; ".join(filters) if filters else "Standard base filters applied"
 
+def _is_numericish(v) -> bool:
+    try:
+        float(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _to_float(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _compute_deterministic_headline(stored: Optional["QueryResult"]) -> Optional[str]:
+    """For small aggregate results, compute totals/averages in Python so Claude
+    never has to do the arithmetic itself when writing the summary."""
+    if not stored or not stored.rows or len(stored.rows) > 20:
+        return None
+
+    numeric_cols = [
+        c for c in stored.columns
+        if any(_is_numericish(r.get(c)) for r in stored.rows)
+    ]
+    if not numeric_cols:
+        return None
+
+    parts = []
+    for col in numeric_cols:
+        total = sum(_to_float(r.get(col)) for r in stored.rows)
+        parts.append(f"{col}_total={total:,.2f}")
+        if len(stored.rows) > 1:
+            avg = total / len(stored.rows)
+            parts.append(f"{col}_avg={avg:,.2f}")
+    return " | ".join(parts)
+
+
+_METRIC_FNS: Dict[str, Callable[[List[dict]], float]] = {
+    "win_rate": lambda rows: (
+        sum(1 for r in rows if r.get("deal_stage") == "Closed Won")
+        / max(sum(1 for r in rows if r.get("deal_stage") in ("Closed Won", "Closed Lost")), 1)
+        * 100
+    ),
+    "active_pipeline_total": lambda rows: sum(
+        _to_float(r.get("amount")) for r in rows
+        if r.get("deal_stage") in (
+            "20% - Solution", "30% - Proof", "40% - Proposal",
+            "60% - Price Negotiation", "75% - Contract Review",
+        )
+    ) / 1_000_000,
+    "avg_deal_size": lambda rows: (
+        sum(_to_float(r.get("amount")) for r in rows) / max(len(rows), 1)
+    ),
+    "closed_won_total": lambda rows: sum(
+        _to_float(r.get("amount")) for r in rows if r.get("deal_stage") == "Closed Won"
+    ) / 1_000_000,
+    "mql_count": lambda rows: float(len(rows)),
+    "attainment_pct": lambda rows: (
+        sum(_to_float(r.get("achieved_m")) for r in rows)
+        / max(sum(_to_float(r.get("target_m")) for r in rows), 0.0001) * 100
+    ),
+}
+
+
+def compute_verified_metric(metric_name: str, session_id: Optional[str]) -> str:
+    stored = _get_result(session_id) if session_id else None
+    if not stored or not stored.rows:
+        return "ERROR: No stored query result for this session — run a query first."
+    fn = _METRIC_FNS.get(metric_name)
+    if not fn:
+        return f"ERROR: Unknown metric '{metric_name}'."
+    try:
+        value = fn(stored.rows)
+        return f"VERIFIED {metric_name} = {value:,.2f}"
+    except Exception as e:
+        return f"ERROR computing {metric_name}: {e}"
+        
+        
+        
 def _parse_rows_for_validation(query_result: str, session_id: Optional[str]) -> List[dict]:
     """
     run_clickhouse_query() returns a human-readable pipe-delimited text table,
@@ -1191,6 +1277,52 @@ _QUERY_TOOL = {
             }
         },
         "required": ["sql"],
+    },
+}
+
+_RULEBOOK_TOOL = {
+    "name": "lookup_business_rule",
+    "description": (
+        "Look up the exact business rule for a specific metric/topic BEFORE "
+        "writing SQL for it. ALWAYS call this before generating SQL for MQL, "
+        "active pipeline, cohort funnels, attainment/targets, closed won, "
+        "partner targets, or dashboard-specific questions."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "topic": {
+                "type": "string",
+                "enum": [
+                    "mql", "active_pipeline", "cohort_funnel", "attainment",
+                    "closed_won", "partner_targets", "dashboard_definitions",
+                ],
+            }
+        },
+        "required": ["topic"],
+    },
+}
+
+_COMPUTE_METRIC_TOOL = {
+    "name": "compute_verified_metric",
+    "description": (
+        "Compute a verified metric (win_rate, active_pipeline_total, "
+        "avg_deal_size, closed_won_total, mql_count, attainment_pct) from the "
+        "current session's query results. ALWAYS use this instead of computing "
+        "percentages or sums yourself from the raw row dump."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "metric_name": {
+                "type": "string",
+                "enum": [
+                    "win_rate", "active_pipeline_total", "avg_deal_size",
+                    "closed_won_total", "mql_count", "attainment_pct",
+                ],
+            },
+        },
+        "required": ["metric_name"],
     },
 }
 
@@ -1264,7 +1396,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
         model=selected_model,
         system=_SYSTEM_PROMPT,
         messages=safe_messages,
-        tools=[_QUERY_TOOL],
+        tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL],
         temperature=0,
         max_tokens=max_tokens,
     )
@@ -1282,6 +1414,29 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
 
         tool_result_blocks = []
         for tool_block in tool_blocks:
+
+            # --- rulebook lookup branch ----------------------------
+            if tool_block.name == "lookup_business_rule":
+                topic = tool_block.input.get("topic", "")
+                tool_result_blocks.append({
+                    "type":        "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "content":     get_rulebook_entry(topic),
+                    "is_error":    False,
+                })
+                continue
+
+            # --- deterministic metric branch ------------------------
+            if tool_block.name == "compute_verified_metric":
+                metric_name = tool_block.input.get("metric_name", "")
+                tool_result_blocks.append({
+                    "type":        "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "content":     compute_verified_metric(metric_name, session_id),
+                    "is_error":    False,
+                })
+                continue
+
             sql = tool_block.input.get("sql", "")
 
             # --- pre-execution rule gate -------------------------------
@@ -1303,8 +1458,8 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
             WITH cohort AS (
               SELECT deal_id, deal_stage, amount
               FROM hs_analytics.deals FINAL
-              WHERE became_<N>_deal_date IS NOT NULL          -- cohort anchor
-                AND deal_stage NOT IN (                        -- exclude ALL stages before <N>%
+              WHERE became_<N>_deal_date IS NOT NULL
+                AND deal_stage NOT IN (
                     '1% - Prospect', '<stages before N%>'
                 )
                 AND pipeline = 'default'
@@ -1356,6 +1511,14 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                               "cohort pattern from §8b and call the tool again."
                         )
                         is_error = True
+                    else:
+                        # --- deterministic headline injection ------
+                        headline = _compute_deterministic_headline(_get_result(session_id))
+                        if headline:
+                            query_result += (
+                                f"\n\n[VERIFIED TOTALS — use these exact figures, "
+                                f"do not recompute]: {headline}"
+                            )
 
             if is_error:
                 last_error = query_result
@@ -1371,18 +1534,50 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
             {"role": "assistant", "content": response.content},
             {"role": "user",      "content": tool_result_blocks},
         ]
-
         is_last_round = (round_num == MAX_ROUNDS - 1)
         response = _ai_client.messages.create(
             model=selected_model,
             system=_SYSTEM_PROMPT,
             messages=safe_messages,
-            tools=[] if is_last_round else [_QUERY_TOOL],
+            tools=[] if is_last_round else [_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL],
             temperature=0,
             max_tokens=max_tokens,
         )
 
     reply = _extract_text(response.content)
+
+    # ── FACT-BINDING VERIFIER ───────────────────────────────────────
+    if reply and session_id:
+        stored = _get_result(session_id)
+        if stored and stored.rows:
+            violations = validate_summary_against_facts(reply, stored.rows)
+            if violations:
+                _log_rule_audit(session_id, "summary_check", violations, "post_summary", original_user_message)
+                print(f"⚠️ Unverified numbers in summary: {violations}")
+                retry_messages = safe_messages + [
+                    {"role": "assistant", "content": reply},
+                    {"role": "user", "content": (
+                        "Your previous summary contained numeric values that do not "
+                        "appear in the query results or verified totals above. "
+                        "Rewrite the summary using ONLY numbers that literally appear "
+                        "in the returned rows, the [VERIFIED TOTALS] block, or a "
+                        "compute_verified_metric result. Do not invent or estimate "
+                        "any value."
+                    )},
+                ]
+                try:
+                    retry_response = _ai_client.messages.create(
+                        model=selected_model,
+                        system=_SYSTEM_PROMPT,
+                        messages=retry_messages,
+                        tools=[],
+                        temperature=0,
+                        max_tokens=max_tokens,
+                    )
+                    reply = _extract_text(retry_response.content) or reply
+                except Exception as e:
+                    print(f"⚠️ Fact-binding regeneration failed: {e}")
+                    # keep original reply rather than losing the response entirely
 
     if not reply:
         if last_error:
@@ -1398,7 +1593,6 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                 "(e.g. break it into smaller asks)?"
             )
     return reply
-
 
 # =============================================================================
 # Routes — chat
