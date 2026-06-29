@@ -500,6 +500,7 @@ RULES: List[Dict[str, Any]] = [
             "Pattern A must use the became_<stage>_deal_date "
             "corresponding to the stage requested by the user."
         ),
+        },
     },
 
 
