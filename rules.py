@@ -2,11 +2,18 @@
 rules.py
 =============================================================================
 Machine-checkable registry of MANDATORY business rules from the DIUD system
-prompt. Every SQL string the model produces (and, where relevant, the rows
-that come back) is run through this registry BEFORE being trusted.
+prompt (v4 — Pattern A / B / C architecture).
 
-Add new rules by appending to RULES / RESULT_RULES. Each rule is independent
-and self-contained, so the registry can grow without anything else changing.
+KEY CHANGES vs previous version:
+  - Pattern A (cumulative OR-chain stage counts) is explicitly whitelisted so
+    cohort rules do NOT fire against it.
+  - Pattern B / C are detected and validated separately.
+  - Sentinel for "date never set" is `!= '1900-01-01'`, not `IS NOT NULL`.
+  - SQL-triggered cohort checks now require a `-- Pattern A` comment to opt out,
+    so the model can selectively suppress them when using Pattern A.
+  - `FINAL` check handles LEFT JOIN patterns correctly.
+  - MQL filter checks tightened to match §11 exactly.
+  - Attainment / target checks aligned to §8 (Pattern C) two-CTE pattern.
 =============================================================================
 """
 
@@ -14,11 +21,11 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Set
 
 # =============================================================================
-# RULEBOOK — on-demand rule text, pulled out of the always-loaded system prompt
+# RULEBOOK
 # =============================================================================
 RULEBOOK: Dict[str, str] = {
     "mql": """
-§6 MQL CALCULATION RULES — MANDATORY
+§11 MQL CALCULATION RULES — MANDATORY
 When computing MQL actuals from hs_analytics.contacts FINAL, ALL THREE filters
 below are mandatory. Missing any one produces inflated counts.
 
@@ -35,19 +42,22 @@ MQL TARGET PATTERN — always filter by exact quarter, never divide annual by 4:
 """,
 
     "active_pipeline": """
-§8 ACTIVE PIPELINE DEFINITION
+§7 ACTIVE PIPELINE DEFINITION (Pattern B — Deal-Level Detail)
 A deal qualifies as ACTIVE pipeline when ALL of the following are true:
 1. deal_stage IN ('20% - Solution','30% - Proof','40% - Proposal',
                   '60% - Price Negotiation','75% - Contract Review')
-2. close_date >= '2026-04-01' AND close_date <= '2027-03-31' (FY27)
-3. All MANDATORY_BASE_FILTERS applied
+2. Primary filter is close_date (NOT became_10_deal_date)
+3. All MANDATORY_BASE_FILTERS applied (pipeline='default', deal_type exclusion,
+   gs_deal_ids_hs allowlist)
 Apply the deal_stage filter ONLY when the user explicitly requests "active" pipeline.
 """,
 
     "cohort_funnel": """
-§8b COHORT FUNNEL RULE — MANDATORY
-Before writing any funnel SQL, verify all 4 checks:
-  - became_<N>_deal_date IS NOT NULL — cohort anchor present
+§8b COHORT FUNNEL RULE — for true cohort queries only
+(Do NOT confuse with Pattern A cumulative OR-chain counts.)
+
+Before writing cohort SQL, verify all 4 checks:
+  - became_<N>_deal_date != '1900-01-01' — cohort anchor present (sentinel, NOT IS NOT NULL)
   - deal_stage NOT IN (<all stages before N%>) — exclusion present
   - Query starts with WITH — CTE pattern used
   - countDistinct(deal_id) — not count(*) or count(deal_id)
@@ -64,7 +74,7 @@ Pattern:
   WITH cohort AS (
     SELECT deal_id, deal_stage, amount
     FROM hs_analytics.deals FINAL
-    WHERE became_<N>_deal_date IS NOT NULL
+    WHERE became_<N>_deal_date != '1900-01-01'
       AND deal_stage NOT IN (<stages before N%>)
       AND <MANDATORY_BASE_FILTERS>
       AND <date range on became_<N>_deal_date>
@@ -75,7 +85,7 @@ Pattern:
 """,
 
     "attainment": """
-§5 TARGET SQL RULES
+§8 / Pattern C — TARGET SQL RULES (Actuals vs Target)
 1. DEFAULT TIER = L2 (no-prefix in T1; l2_ prefix in T2/T3). Switch only if user
    explicitly says L1/stretch/committed.
 2. CAST ALL NUMERIC TARGET COLUMNS: SUM(toFloat64OrZero(amount_target_20))
@@ -85,6 +95,12 @@ Pattern:
 5. PERIOD GRAIN MUST MATCH — filter target table to the exact quarter, never
    divide an annual target by 4.
 6. ATTAINMENT = round(actual / nullIf(target, 0) * 100, 1)
+7. SOURCE MAPPING for Pattern C: Executive Outreach + Investor → 'Executive Outreach'
+   (this differs from Pattern A/B where they stay separate).
+8. FY anchor for became_N_deal_date MUST MATCH the stage being targeted:
+   - 10% targets → became_10_deal_date
+   - 20% targets → became_20_deal_date
+   - 5% targets  → became_5_deal_date
 """,
 
     "closed_won": """
@@ -93,91 +109,114 @@ CLOSED WON RULES
   GROUP BY deal_owner + MANDATORY_BASE_FILTERS
   Quota source: kore_ai_hubspot.gs_closed_won_quotas, cast with toFloat64OrZero().
   No L1/L2/Committed split in this table — single quota tier only.
+  JOIN to deals on ae = deal_owner.
 """,
 
     "partner_targets": """
 PARTNER TARGET RULES
   Table T2 gs_partner_targets_region_wise: l2_/l1_/committed_ prefixes.
   Table T3 gs_partner_targets_psd: COMMITTED ONLY, no L1/L2 — use T2 for those.
-  Filter partner_team_type to isolate 'Hyperscaler' vs 'GSI/SI' vs 'Reseller/BPO/TSD'.
-  committed_amount_target_10 / _5 do NOT exist in T2 — do not query them there.
+  Filter partner_team_type IN ('Hyperscaler','GSI/SI','Reseller/BPO/TSD') as needed.
+  committed_amount_target_10 / committed_amount_target_5 do NOT exist in T2.
+  All columns are Nullable(String) — always SUM(toFloat64OrZero(col)).
 """,
 
     "dashboard_definitions": """
 DASHBOARD DEFINITIONS (abbreviated — ask user which dashboard if ambiguous)
-  EOP: pipeline vs EOP target, active stages only, current quarter end window.
-  EXEC KPI: total active pipeline, closed won, CW attainment %, win rate, coverage.
-  PIPEGEN: 5/10/20% pipeline amount + deal count vs gs_pipeline_quotas_v1.
+  EOP:         pipeline vs EOP target, active stages only, current quarter end window.
+  EXEC KPI:    total active pipeline, closed won, CW attainment %, win rate, coverage.
+  PIPEGEN:     5/10/20% pipeline amount + deal count vs gs_pipeline_quotas_v1.
   PARTNERSHIP: partner pipeline vs partner target tables, PSD/hyperscaler splits.
-  MARKETING: MQL actual vs target, source/region performance, conversion rate.
-  AE FOCUS: AE pipeline, CW ARR, quota attainment, win rate, avg deal size.
-  BDR FOCUS: meetings created, opportunities generated, PipeGen by BDR.
+  MARKETING:   MQL actual vs target (§11 filters), source/region performance.
+  AE FOCUS:    AE pipeline, CW ARR, quota attainment, win rate, avg deal size.
+  BDR FOCUS:   meetings created, opportunities generated, PipeGen by BDR.
 """,
 }
 
 
 def get_rulebook_entry(topic: str) -> str:
     return RULEBOOK.get(topic, f"No rulebook entry found for topic '{topic}'.")
+
+
 # =============================================================================
-# Intent detection — light NLP on the user's message + the SQL itself.
-# This is intentionally simple (regex, not another LLM call) so it's fast,
-# deterministic, and cheap to run on every tool call.
+# PATTERN DETECTION
+# Determines which of Pattern A / B / C (or cohort) applies to a given SQL
+# string, so rules can target the right pattern and not cross-fire.
+# =============================================================================
+
+def _is_pattern_a(sql: str) -> bool:
+    """
+    Pattern A: cumulative OR-chain stage counting.
+    The model is instructed to add `-- Pattern A` at the top of such queries.
+    We also detect it heuristically via the OR-chain structure.
+    """
+    if re.search(r'--\s*Pattern\s*A', sql, re.I):
+        return True
+    # Heuristic: multiple became_N_deal_date columns joined with OR
+    dates_mentioned = re.findall(r'became_(\d+)_deal_date', sql, re.I)
+    if len(set(dates_mentioned)) >= 3 and "OR" in sql.upper():
+        return True
+    return False
+
+
+def _is_cohort_query(sql: str, intent: dict) -> bool:
+    """
+    True only for genuine cohort funnel queries (not Pattern A / B / C).
+    Requires explicit cohort intent from the user AND the absence of Pattern A markers.
+    """
+    if _is_pattern_a(sql):
+        return False
+    return intent.get("cohort_stage") is not None
+
+
+def _has_became_date(sql: str) -> bool:
+    return bool(re.search(r'became_\d+_deal_date', sql, re.I))
+
+
+def _is_pattern_c(sql: str, intent: dict) -> bool:
+    """Pattern C: attainment / vs-target queries using two-CTE structure."""
+    return intent.get("metric") == "attainment"
+
+
+# =============================================================================
+# Intent detection
 # =============================================================================
 def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
     msg = user_message or ""
     intent: Dict[str, Any] = {}
 
     # ── Cohort stage detection ───────────────────────────────────────────────
+    # Only detect cohort intent when the user clearly asks for a true cohort funnel
+    # (not Pattern A cumulative counts, which have their own section).
+
     # Pattern 1: explicit arrow notation  "20% → Closed Won", "20% to CW"
     m = re.search(r'(\d+)\s*%\s*(→|->|to)\s*(closed\s*won|cw)\b', msg, re.I)
     if m:
         intent["cohort_stage"] = m.group(1)
 
-    # Pattern 2: funnel/cohort keyword BEFORE the percentage
-    #   "funnel from 20%", "cohort starting at 10%", "pipeline from 30% stage"
+    # Pattern 2: funnel/cohort keyword before percentage
     if not intent.get("cohort_stage"):
         m2 = re.search(
-            r'\b(funnel|cohort|pipeline\s+from|starting\s+(?:at|from)|from\s+stage)\b'
-            r'.*?(\d+)\s*%',
+            r'\b(cohort|starting\s+(?:at|from))\b.*?(\d+)\s*%',
             msg, re.I
         )
         if m2:
             intent["cohort_stage"] = m2.group(2)
 
-    # Pattern 3: percentage BEFORE funnel/cohort keyword
-    #   "20% funnel", "20% cohort analysis", "30% stage breakdown", "20% conversion"
+    # Pattern 3: percentage before "cohort" keyword
     if not intent.get("cohort_stage"):
-        m3 = re.search(
-            r'(\d+)\s*%.*?\b(funnel|cohort|stage\s+breakdown|conversion|progression)\b',
-            msg, re.I
-        )
+        m3 = re.search(r'(\d+)\s*%.*?\b(cohort)\b', msg, re.I)
         if m3:
             intent["cohort_stage"] = m3.group(1)
 
-    # Pattern 4: generic stage-progression language with a percentage anywhere
-    #   "show me how deals progress after 20%", "deals that reached 20"
-    if not intent.get("cohort_stage"):
-        m4 = re.search(
-            r'\b(progress|reached|entered|qualified\s+at|moved\s+(?:past|beyond|to))\b'
-            r'.*?(\d+)\s*%',
-            msg, re.I
-        )
-        if not m4:
-            m4 = re.search(
-                r'(\d+)\s*%.*?\b(progress|reached|entered|qualified\s+at|moved\s+(?:past|beyond|to))\b',
-                msg, re.I
-            )
-        if m4:
-            for grp in m4.groups():
-                if grp and grp.isdigit():
-                    intent["cohort_stage"] = grp
-                    break
+    # NOTE: "funnel", "conversion", "progression", "stage breakdown" alone are
+    # no longer treated as cohort signals — they can equally describe Pattern A.
+    # Only use them if paired with explicit cohort language or the → arrow.
 
-    # Pattern 5: fall back to SQL structure — if the model used became_N_deal_date,
-    #   the intent is cohort regardless of what the user typed
-    if not intent.get("cohort_stage") and sql:
+    # Pattern 4: fall back to SQL structure ONLY when Pattern A is NOT present
+    if not intent.get("cohort_stage") and sql and not _is_pattern_a(sql):
         sql_m = re.search(r'became_(\d+)_deal_date', sql, re.I)
-        if sql_m:
+        if sql_m and "NOT IN" in sql.upper():
             intent["cohort_stage"] = sql_m.group(1)
 
     # ── List query detection ─────────────────────────────────────────────────
@@ -192,7 +231,7 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
     if re.search(r'\bMQL\b', msg, re.I):
         intent["metric"] = "mql"
 
-    if re.search(r'\battainment\b|\bvs\.?\s*target\b|\bquota\b', msg, re.I):
+    if re.search(r'\battainment\b|\bvs\.?\s*target\b|\bquota\b|\bcoverage\b|\bgap.to.target\b', msg, re.I):
         intent["metric"] = intent.get("metric") or "attainment"
 
     if re.search(r'\bactive pipeline\b', msg, re.I):
@@ -210,249 +249,387 @@ def _arity(fn: Callable) -> int:
 
 
 def _call(fn: Callable, sql: str, intent: dict):
-    """Call a rule lambda whether it takes (sql) or (sql, intent)."""
     return fn(sql, intent) if _arity(fn) == 2 else fn(sql)
 
 
 # =============================================================================
-# SQL-TEXT RULES — checkable by inspecting the SQL string alone.
+# SQL-TEXT RULES
 # =============================================================================
 RULES: List[Dict[str, Any]] = [
 
-    # ---- §3 MANDATORY_BASE_FILTERS ----------------------------------------
+    # -------------------------------------------------------------------------
+    # §3 MANDATORY_BASE_FILTERS — apply to every deals query
+    # -------------------------------------------------------------------------
     {
         "id": "base_filter_pipeline",
-        "section": "§3 MANDATORY_BASE_FILTERS (1/3)",
+        "section": "§3 MANDATORY_BASE_FILTERS (1/3) — pipeline = 'default'",
         "applies_when": lambda sql: "hs_analytics.deals" in sql,
-        "check": lambda sql: re.search(r"pipeline\s*=\s*'default'", sql, re.I) is not None,
-        "message": "Missing `pipeline = 'default'` base filter.",
+        "check": lambda sql: bool(re.search(r"pipeline\s*=\s*'default'", sql, re.I)),
+        "message": "Missing `pipeline = 'default'` base filter on hs_analytics.deals query.",
     },
     {
         "id": "base_filter_deal_type",
-        "section": "§3 MANDATORY_BASE_FILTERS (2/3)",
+        "section": "§3 MANDATORY_BASE_FILTERS (2/3) — Partner-Led SMB exclusion",
         "applies_when": lambda sql: "hs_analytics.deals" in sql,
-        "check": lambda sql: "Partner-Led SMB" in sql and "NOT IN" in sql.upper(),
+        "check": lambda sql: "Partner-Led SMB" in sql and bool(re.search(r'\bNOT\s+IN\b', sql, re.I)),
         "message": "Missing deal_type NOT IN ('Partner-Led SMB') base filter.",
     },
     {
         "id": "base_filter_allowlist",
-        "section": "§3 MANDATORY_BASE_FILTERS (3/3)",
+        "section": "§3 MANDATORY_BASE_FILTERS (3/3) — gs_deal_ids_hs allowlist",
         "applies_when": lambda sql: "hs_analytics.deals" in sql,
         "check": lambda sql: "gs_deal_ids_hs" in sql,
-        "message": "Missing deal_id allowlist join against gs_deal_ids_hs.",
+        "message": "Missing deal_id allowlist subquery against kore_ai_hubspot.gs_deal_ids_hs.",
     },
 
-    # ---- §3 Duplicate record exclusion -------------------------------------
+    # -------------------------------------------------------------------------
+    # §3 Duplicate exclusion — FINAL on every hs_analytics.* reference
+    # -------------------------------------------------------------------------
     {
         "id": "final_keyword",
-        "section": "§3 Duplicate exclusion — FINAL",
+        "section": "§3 Duplicate exclusion — FINAL on hs_analytics.*",
         "applies_when": lambda sql: bool(re.search(r"hs_analytics\.\w+", sql)),
-        "check": lambda sql: bool(re.search(r"hs_analytics\.\w+\s+FINAL", sql, re.I)),
-        "message": "Missing FINAL on an hs_analytics.* table reference.",
+        "check": lambda sql: bool(re.search(r"hs_analytics\.\w+\s+(?:AS\s+\w+\s+)?FINAL|hs_analytics\.\w+\s+FINAL", sql, re.I)),
+        "message": "Missing FINAL on at least one hs_analytics.* table reference.",
     },
     {
         "id": "count_distinct_not_count",
-        "section": "§3 / §9.5 — countDistinct, never count()",
-        "applies_when": lambda sql: ("hs_analytics" in sql) and bool(re.search(r"(?<!\w)count\s*\(", sql, re.I)),
-        "check": lambda sql: bool(re.search(r"countDistinct\s*\(\s*(deal_id|contact_id)\s*\)", sql, re.I)),
-        "message": "Uses count() instead of countDistinct(deal_id)/countDistinct(contact_id).",
+        "section": "§3 / §13.4 — countDistinct, never count()",
+        "applies_when": lambda sql: "hs_analytics" in sql and bool(
+            re.search(r'(?<!\w)count\s*\((?!Distinct)', sql, re.I)
+        ),
+        "check": lambda sql: bool(
+            re.search(r'countDistinct\s*\(\s*(deal_id|contact_id)\s*\)', sql, re.I)
+        ),
+        "message": "Uses count() instead of countDistinct(deal_id) or countDistinct(contact_id).",
     },
     {
         "id": "distinct_in_association_subquery",
-        "section": "§3 Table 5 — DISTINCT in association subqueries",
-        "applies_when": lambda sql: "gs_DealContactAssociation" in sql and re.search(r"\(\s*SELECT", sql, re.I),
-        "check": lambda sql: bool(re.search(r"SELECT\s+DISTINCT", sql, re.I)),
-        "message": "Subquery against gs_DealContactAssociation missing DISTINCT.",
+        "section": "§3 Table 5 — DISTINCT in gs_DealContactAssociation subqueries",
+        "applies_when": lambda sql: "gs_DealContactAssociation" in sql and bool(re.search(r'\(\s*SELECT', sql, re.I)),
+        "check": lambda sql: bool(re.search(r'SELECT\s+DISTINCT', sql, re.I)),
+        "message": "Subquery against gs_DealContactAssociation is missing DISTINCT.",
     },
 
-    # ---- §9 Date handling standard -----------------------------------------
-    {
-        "id": "date_cast_standard",
-        "section": "§9 Date handling — toDate(LEFT(coalesce(...)))",
-        "applies_when": lambda sql: bool(
-            re.search(r"\b(close_date|became_\d+_deal_date)\b\s*(>=|<=|>|<|=)", sql, re.I)
-        ),
-        "check": lambda sql: "toDate(LEFT(coalesce(" in sql.replace(" ", "")
-        or "toDate(LEFT(coalesce(" in sql,
-        "message": "Raw date comparison without the mandatory toDate(LEFT(coalesce(col,'1900-01-01'),10)) cast.",
-    },
-
-    # ---- §9.4 No LIMIT on list queries --------------------------------------
-    {
-        "id": "no_limit_on_list",
-        "section": "§9.4 No LIMIT unless 'top N' / 'first N'",
-        "applies_when": lambda sql, intent: intent.get("query_type") == "list" and not intent.get("top_n"),
-        "check": lambda sql, intent: "LIMIT" not in sql.upper(),
-        "message": "LIMIT applied to a list query the user did not ask to cap with 'top N'/'first N'.",
-    },
-
-    # ---- §9.1/§9.2/§9.3 generic guardrails ---------------------------------
+    # -------------------------------------------------------------------------
+    # §9 / §13 General SQL guardrails
+    # -------------------------------------------------------------------------
     {
         "id": "select_or_with_only",
-        "section": "§9.1 SELECT/WITH only",
+        "section": "§13.1 SELECT/WITH only — no destructive SQL",
         "applies_when": lambda sql: True,
-        "check": lambda sql: sql.strip().upper().startswith(("SELECT", "WITH")),
-        "message": "Query does not start with SELECT or WITH.",
-    },
-    {
-        "id": "no_placeholder_tokens",
-        "section": "Generation hygiene",
-        "applies_when": lambda sql: True,
-        "check": lambda sql: "<MANDATORY_BASE_FILTERS>" not in sql and "<" not in sql.split("--")[0] or True,
-        "message": "SQL contains an unresolved placeholder token like <MANDATORY_BASE_FILTERS>.",
-        # Note: kept loose to avoid false positives on legitimate '<' comparisons;
-        # the placeholder_leak intent flag below does the strict check.
+        "check": lambda sql: sql.strip().upper().startswith(("SELECT", "WITH", "--")),
+        "message": "Query does not start with SELECT, WITH, or a comment. Only read queries are permitted.",
     },
     {
         "id": "no_placeholder_leak_strict",
-        "section": "Generation hygiene (strict)",
+        "section": "Generation hygiene — no unresolved placeholder tokens",
         "applies_when": lambda sql, intent: intent.get("placeholder_leak", False),
         "check": lambda sql, intent: False,
         "message": "Literal placeholder '<MANDATORY_BASE_FILTERS>' leaked into generated SQL — must be expanded.",
     },
-
-    # ---- §8b Cohort funnel rule ---------------------------------------------
     {
-        "id": "cohort_anchor",
-        "section": "§8b Cohort definition — became_<stage>_deal_date IS NOT NULL",
-        "applies_when": lambda sql, intent: intent.get("cohort_stage") is not None,
-        "check": lambda sql, intent: f"became_{intent['cohort_stage']}_deal_date" in sql
-        and "IS NOT NULL" in sql.upper(),
-        "message": "Cohort query missing became_<stage>_deal_date IS NOT NULL anchor.",
+        "id": "no_limit_on_list",
+        "section": "§13.5 — No LIMIT on list queries unless user says 'top N'/'first N'",
+        "applies_when": lambda sql, intent: intent.get("query_type") == "list" and not intent.get("top_n"),
+        "check": lambda sql, intent: "LIMIT" not in sql.upper(),
+        "message": "LIMIT applied to a list query the user did not ask to cap with 'top N' or 'first N'.",
+    },
+
+    # -------------------------------------------------------------------------
+    # §9 Fiscal year / date casting
+    # -------------------------------------------------------------------------
+    {
+        "id": "date_cast_standard",
+        "section": "§9 Date casting — CAST(LEFT(coalesce(col,'1900-01-01'),10) AS DATE)",
+        "applies_when": lambda sql: bool(
+            re.search(r"\b(close_date|became_\d+_deal_date)\b\s*(>=|<=|>|<|=)\s*'", sql, re.I)
+        ),
+        "check": lambda sql: bool(
+            re.search(r"CAST\s*\(\s*LEFT\s*\(\s*coalesce\s*\(", sql, re.I)
+        ),
+        "message": "Raw date string comparison without the mandatory CAST(LEFT(coalesce(col,'1900-01-01'),10) AS DATE) cast.",
+    },
+    {
+        "id": "sentinel_not_null_check",
+        "section": "§9 Sentinel '1900-01-01' — use != '1900-01-01', NOT IS NOT NULL",
+        "applies_when": lambda sql: _has_became_date(sql),
+        "check": lambda sql: not bool(
+            re.search(r"became_\d+_deal_date\s+IS\s+NOT\s+NULL", sql, re.I)
+        ),
+        "message": (
+            "Using `IS NOT NULL` on became_<N>_deal_date. "
+            "The sentinel for 'date not set' is '1900-01-01', so use `!= '1900-01-01'` instead."
+        ),
+    },
+
+    # -------------------------------------------------------------------------
+    # §4 Target table — nullable string casting
+    # -------------------------------------------------------------------------
+    {
+        "id": "target_table_float_cast",
+        "section": "§4 Target table — SUM(toFloat64OrZero(col))",
+        "applies_when": lambda sql: bool(
+            re.search(r"gs_pipeline_quotas_v1|gs_partner_targets|gs_closed_won_quotas|gs_marketing_targets", sql, re.I)
+        ),
+        "check": lambda sql: bool(re.search(r"toFloat64OrZero|toFloat32OrZero", sql, re.I)),
+        "message": (
+            "Target table columns are Nullable(String). "
+            "Always cast with SUM(toFloat64OrZero(col)) — raw arithmetic will silently produce NULLs."
+        ),
+    },
+    {
+        "id": "target_no_quarterly_divide",
+        "section": "§4 / §13.9 — Never derive quarterly target by dividing by 4",
+        "applies_when": lambda sql: bool(
+            re.search(r"gs_pipeline_quotas_v1|gs_partner_targets|gs_marketing_targets", sql, re.I)
+        ),
+        "check": lambda sql: not bool(re.search(r"/\s*4\b", sql)),
+        "message": "Target figure is being divided by 4 to derive a quarterly value — not permitted. Filter the target table to the exact quarter instead.",
+    },
+    {
+        "id": "nullif_in_division",
+        "section": "§4 / §13.7 — nullIf(denominator, 0) in every division",
+        "applies_when": lambda sql: "/" in sql and bool(
+            re.search(r"attainment|coverage|pct|rate|ratio", sql, re.I)
+        ),
+        "check": lambda sql: bool(re.search(r"nullIf\s*\(", sql, re.I)),
+        "message": "Division present without nullIf(denominator, 0) — risk of divide-by-zero.",
+    },
+
+    # -------------------------------------------------------------------------
+    # Pattern A — cumulative OR-chain stage counts (§6)
+    # No cohort rules apply here; validate the OR-chain structure instead.
+    # -------------------------------------------------------------------------
+    {
+        "id": "pattern_a_or_chain",
+        "section": "§6 Pattern A — cumulative OR-chain stage counting",
+        "applies_when": lambda sql: _is_pattern_a(sql),
+        "check": lambda sql: bool(re.search(r'\bOR\b', sql, re.I)),
+        "message": (
+            "Query is marked as Pattern A (cumulative stage counting) but contains "
+            "no OR conditions. Pattern A requires OR-chain conditions for each stage "
+            "— see §6 for the correct template."
+        ),
+    },
+    {
+        "id": "pattern_a_fy_anchor",
+        "section": "§6 Pattern A — FY anchor must be became_10_deal_date",
+        "applies_when": lambda sql: _is_pattern_a(sql),
+        "check": lambda sql: "became_10_deal_date" in sql,
+        "message": (
+            "Pattern A query is missing became_10_deal_date. "
+            "In Pattern A the FY/quarter is ALWAYS anchored to became_10_deal_date "
+            "regardless of which stage is being counted."
+        ),
+    },
+
+    # -------------------------------------------------------------------------
+    # Pattern B — deal-level detail (§7)
+    # Primary filter must be close_date, not became_10_deal_date.
+    # -------------------------------------------------------------------------
+    {
+        "id": "pattern_b_close_date_filter",
+        "section": "§7 Pattern B — primary filter is close_date, not became_10_deal_date",
+        "applies_when": lambda sql, intent: (
+            intent.get("metric") == "active_pipeline"
+            and not _is_pattern_a(sql)
+            and not _is_pattern_c(sql, intent)
+        ),
+        "check": lambda sql, intent: bool(re.search(r"close_date\s*>=", sql, re.I)),
+        "message": (
+            "Pattern B (active pipeline / deal-level) must filter on close_date >= <date>, "
+            "not became_10_deal_date. See §7."
+        ),
+    },
+    {
+        "id": "pattern_b_active_stages",
+        "section": "§7 Pattern B — active pipeline stage filter",
+        "applies_when": lambda sql, intent: intent.get("metric") == "active_pipeline",
+        "check": lambda sql, intent: all(
+            s in sql
+            for s in [
+                "20% - Solution", "30% - Proof", "40% - Proposal",
+                "60% - Price Negotiation", "75% - Contract Review",
+            ]
+        ),
+        "message": (
+            "Active pipeline query missing one or more of the 5 required deal_stage values: "
+            "20% - Solution, 30% - Proof, 40% - Proposal, 60% - Price Negotiation, 75% - Contract Review."
+        ),
+    },
+
+    # -------------------------------------------------------------------------
+    # Pattern C — attainment / vs-target (§8)
+    # -------------------------------------------------------------------------
+    {
+        "id": "pattern_c_two_cte",
+        "section": "§8 Pattern C — actuals CTE + targets CTE (never fan-out join)",
+        "applies_when": lambda sql, intent: _is_pattern_c(sql, intent),
+        "check": lambda sql, intent: (
+            sql.strip().upper().startswith("WITH")
+            and sql.upper().count("CTE") + sql.upper().count("AS (") >= 2
+        ),
+        "message": (
+            "Attainment/target query must use independent CTEs for actuals and targets, "
+            "then LEFT JOIN them. Never join raw deal rows directly to a target table."
+        ),
+    },
+    {
+        "id": "pattern_c_source_merge",
+        "section": "§8 Pattern C — Executive Outreach + Investor merged in source mapping",
+        "applies_when": lambda sql, intent: (
+            _is_pattern_c(sql, intent)
+            and "deal_source_rollup" in sql
+            and "Executive Outreach" in sql
+        ),
+        "check": lambda sql, intent: (
+            # Either Investor is remapped to Executive Outreach, or the query has no Investor rows
+            ("Investor" in sql and "Executive Outreach" in sql)
+            or "Investor" not in sql
+        ),
+        "message": (
+            "Pattern C source mapping must merge 'Investor' into 'Executive Outreach' "
+            "to match the quota table bucket. This differs from Pattern A/B where they stay separate."
+        ),
+    },
+    {
+        "id": "pattern_c_target_tier_default",
+        "section": "§4 Pattern C — default tier is L2 (no prefix / l2_ prefix)",
+        "applies_when": lambda sql, intent: _is_pattern_c(sql, intent),
+        "check": lambda sql, intent: not bool(
+            re.search(r'\b(l1_|_l1\b|committed_|_committed\b)', sql, re.I)
+        ),
+        "message": (
+            "Target query is using L1 or Committed tier columns. "
+            "Default is always L2 (no suffix in T1; l2_ prefix in T2/T3). "
+            "Use L1/Committed only when the user explicitly says so."
+        ),
+    },
+
+    # -------------------------------------------------------------------------
+    # True cohort funnel (§8b) — only fires when cohort intent is detected AND
+    # Pattern A is NOT present.
+    # -------------------------------------------------------------------------
+    {
+        "id": "cohort_anchor_sentinel",
+        "section": "§8b Cohort anchor — became_<N>_deal_date != '1900-01-01'",
+        "applies_when": lambda sql, intent: _is_cohort_query(sql, intent),
+        "check": lambda sql, intent: (
+            f"became_{intent['cohort_stage']}_deal_date" in sql
+            and "'1900-01-01'" in sql
+        ),
+        "message": (
+            "Cohort query missing `became_<N>_deal_date != '1900-01-01'` sentinel anchor. "
+            "Do NOT use IS NOT NULL — use the sentinel check instead."
+        ),
     },
     {
         "id": "cohort_exclusion",
         "section": "§8b Stage exclusion — NOT IN prior stages",
-        "applies_when": lambda sql, intent: intent.get("cohort_stage") is not None,
-        "check": lambda sql, intent: "NOT IN" in sql.upper(),
-        "message": "Cohort query missing NOT IN exclusion of pre-cohort stages.",
+        "applies_when": lambda sql, intent: _is_cohort_query(sql, intent),
+        "check": lambda sql, intent: bool(re.search(r'\bNOT\s+IN\b', sql, re.I)),
+        "message": "Cohort query missing NOT IN exclusion of all deal_stage values prior to the cohort starting stage.",
     },
     {
         "id": "cohort_single_cte",
-        "section": "§8b — funnel must be one CTE, not per-stage queries",
-        "applies_when": lambda sql, intent: intent.get("cohort_stage") is not None,
-        "check": lambda sql, intent: sql.strip().upper().startswith("WITH") and "GROUP BY" in sql.upper(),
-        "message": "Cohort funnel should be a single WITH-cohort CTE with GROUP BY deal_stage, not a one-off filter.",
+        "section": "§8b — cohort must be a single CTE with GROUP BY deal_stage",
+        "applies_when": lambda sql, intent: _is_cohort_query(sql, intent),
+        "check": lambda sql, intent: (
+            sql.strip().upper().startswith("WITH")
+            and bool(re.search(r'GROUP\s+BY\s+deal_stage', sql, re.I))
+        ),
+        "message": (
+            "Cohort funnel should be a single WITH-cohort CTE with GROUP BY deal_stage, "
+            "not separate per-stage SELECT statements."
+        ),
     },
     {
         "id": "cohort_count_distinct",
-        "section": "§8b Deduplication — countDistinct(deal_id)",
-        "applies_when": lambda sql, intent: intent.get("cohort_stage") is not None,
-        "check": lambda sql, intent: bool(re.search(r"countDistinct\s*\(\s*deal_id\s*\)", sql, re.I)),
-        "message": "Cohort funnel query not using countDistinct(deal_id).",
+        "section": "§8b Deduplication — countDistinct(deal_id) in cohort",
+        "applies_when": lambda sql, intent: _is_cohort_query(sql, intent),
+        "check": lambda sql, intent: bool(re.search(r'countDistinct\s*\(\s*deal_id\s*\)', sql, re.I)),
+        "message": "Cohort funnel is not using countDistinct(deal_id).",
     },
 
-    # ---- §6 MQL calculation --------------------------------------------------
+    # -------------------------------------------------------------------------
+    # §11 MQL filters
+    # -------------------------------------------------------------------------
     {
-        "id": "mql_filters_present",
-        "section": "§6 MQL — 3 mandatory filters",
+        "id": "mql_lifecycle_stage_filter",
+        "section": "§11 MQL filter 1 — lifecycle_stage = 'marketingqualifiedlead'",
         "applies_when": lambda sql, intent: intent.get("metric") == "mql",
-        "check": lambda sql, intent: "lifecycle_stage" in sql
-        and "date_entered_marketing_qualified_lead_lifecycle_stage_pipeline" in sql,
-        "message": "MQL query missing required lifecycle_stage / MQL date-entered filter.",
+        "check": lambda sql, intent: bool(re.search(r"lifecycle_stage\s*=\s*'marketingqualifiedlead'", sql, re.I)),
+        "message": "MQL query missing `lifecycle_stage = 'marketingqualifiedlead'` filter.",
+    },
+    {
+        "id": "mql_date_entered_filter",
+        "section": "§11 MQL filter 1b — date_entered_... IS NOT NULL",
+        "applies_when": lambda sql, intent: intent.get("metric") == "mql",
+        "check": lambda sql, intent: "date_entered_marketing_qualified_lead_lifecycle_stage_pipeline" in sql,
+        "message": "MQL query missing `date_entered_marketing_qualified_lead_lifecycle_stage_pipeline` filter.",
+    },
+    {
+        "id": "mql_company_priority_filter",
+        "section": "§11 MQL filter 2 — company_priority IN ('P1'...'P7')",
+        "applies_when": lambda sql, intent: intent.get("metric") == "mql",
+        "check": lambda sql, intent: bool(re.search(r"company_priority\s+IN", sql, re.I)),
+        "message": "MQL query missing `company_priority IN ('P1',...,'P7')` filter.",
+    },
+    {
+        "id": "mql_bad_data_filter",
+        "section": "§11 MQL filter 3 — lead_status != 'Bad Data'",
+        "applies_when": lambda sql, intent: intent.get("metric") == "mql",
+        "check": lambda sql, intent: bool(re.search(r"lead_status\s*!=\s*'Bad Data'", sql, re.I)),
+        "message": "MQL query missing `lead_status != 'Bad Data'` filter.",
     },
     {
         "id": "mql_no_quarter_divide",
-        "section": "§6 MQL — never derive quarterly target by /4",
+        "section": "§11 MQL — never derive quarterly target by /4",
         "applies_when": lambda sql, intent: intent.get("metric") == "mql",
-        "check": lambda sql, intent: "/4" not in sql.replace(" ", "") and "/ 4" not in sql,
-        "message": "MQL target appears to be derived by dividing annual target by 4 — not allowed.",
-    },
-
-    # ---- §5 Target / attainment queries --------------------------------------
-    {
-        "id": "attainment_uses_cte_pattern",
-        "section": "§5 Rule 4 — actual/target CTE pattern",
-        "applies_when": lambda sql, intent: intent.get("metric") == "attainment",
-        "check": lambda sql, intent: sql.strip().upper().startswith("WITH"),
-        "message": "Attainment/target query should use the actual-CTE + target-CTE pattern from §5.",
-    },
-
-    # ---- §8 Active pipeline definition ----------------------------------------
-    {
-        "id": "active_pipeline_stage_filter",
-        "section": "§8 Active pipeline definition",
-        "applies_when": lambda sql, intent: intent.get("metric") == "active_pipeline",
-        "check": lambda sql, intent: all(
-            s in sql
-            for s in ["20% - Solution", "30% - Proof", "40% - Proposal", "60% - Price Negotiation", "75% - Contract Review"]
-        ),
-        "message": "Active pipeline query missing one or more of the 5 required active deal_stage values.",
-    },
-    # ---- §8b SQL-structure-triggered cohort checks (bypass intent detection) ---
-    {
-        "id": "cohort_sql_triggered_exclusion",
-        "section": "§8b — SQL-triggered cohort exclusion check",
-        "applies_when": lambda sql: bool(re.search(r'became_\d+_deal_date', sql, re.I)),
-        "check": lambda sql: bool(re.search(r'\bNOT\s+IN\b', sql, re.I)),
-        "message": (
-            "SQL references became_<N>_deal_date (cohort anchor) but is missing "
-            "the NOT IN exclusion of prior stages. Every cohort query MUST exclude "
-            "deals currently in all stages prior to the cohort starting stage (§8b)."
-        ),
-    },
-    {
-        "id": "cohort_sql_triggered_cte",
-        "section": "§8b — Cohort must use CTE pattern",
-        "applies_when": lambda sql: bool(re.search(r'became_\d+_deal_date', sql, re.I)),
-        "check": lambda sql: sql.strip().upper().startswith("WITH"),
-        "message": (
-            "SQL references became_<N>_deal_date but is not structured as a CTE. "
-            "All cohort funnel queries MUST use the WITH-cohort CTE pattern from §8b."
-        ),
-    },
-    {
-        "id": "cohort_sql_triggered_count_distinct",
-        "section": "§8b — Cohort must use countDistinct(deal_id)",
-        "applies_when": lambda sql: bool(re.search(r'became_\d+_deal_date', sql, re.I)),
-        "check": lambda sql: bool(re.search(r'countDistinct\s*\(\s*deal_id\s*\)', sql, re.I)),
-        "message": (
-            "Cohort funnel SQL is not using countDistinct(deal_id). "
-            "Never use count() in cohort queries — each deal must be counted exactly once."
-        ),
+        "check": lambda sql, intent: not bool(re.search(r"/\s*4\b", sql)),
+        "message": "MQL target appears to be derived by dividing an annual target by 4 — filter the target table to the exact quarter instead.",
     },
 ]
 
 
 # =============================================================================
-# RESULT-LEVEL RULES — checkable only against the returned rows, since some
-# violations look fine as SQL text but produce impossible numbers.
+# RESULT-LEVEL RULES
 # =============================================================================
 RESULT_RULES: List[Dict[str, Any]] = [
     {
         "id": "funnel_sum_within_cohort",
-        "section": "§8b Deduplication — each deal appears once across stages",
-        "applies_when": lambda rows, intent: intent.get("cohort_stage") is not None and bool(rows),
+        "section": "§8b Deduplication — stage counts must not exceed cohort total",
+        "applies_when": lambda rows, intent: _is_cohort_query("", intent) and bool(rows),
         "check": lambda rows, intent: _funnel_sum_ok(rows),
-        "message": "Funnel stage counts (active stages + Closed Won/Lost) exceed the cohort total — "
-                    "rows were not derived from a single deduplicated cohort.",
+        "message": (
+            "Funnel stage counts (active stages + Closed Won/Lost) exceed the cohort total — "
+            "rows were not derived from a single deduplicated cohort CTE."
+        ),
     },
 ]
 
 
 def _funnel_sum_ok(rows: List[dict]) -> bool:
     try:
-        cohort_total = None
-        active_sum = 0
-        terminal_sum = 0
+        cohort_total: Optional[float] = None
+        active_sum = 0.0
+        terminal_sum = 0.0
         for r in rows:
             stage = str(r.get("deal_stage", ""))
-            cnt = r.get("deal_count", 0) or 0
+            cnt = float(r.get("deal_count", 0) or 0)
             if cohort_total is None:
-                # First row's stage is assumed to be the cohort's starting stage and is
-                # the baseline (100%) -- treat it as the cohort total.
                 cohort_total = cnt
+                continue
             if "Closed Won" in stage or "Closed Lost" in stage:
                 terminal_sum += cnt
-            elif cnt != cohort_total:  # skip the baseline row itself
+            else:
                 active_sum += cnt
         if cohort_total is None:
             return True
         return (active_sum + terminal_sum) <= cohort_total
     except Exception:
-        # If we can't evaluate it, don't block the response on a checker bug —
-        # log and pass. Visibility is handled via the audit log in main.py.
-        return True
+        return True  # don't block on checker bugs
 
 
 # =============================================================================
@@ -499,19 +676,17 @@ def validate_result_against_rules(rows: List[dict], user_message: str, sql: str 
 
 
 def get_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
-    """Exposed for logging/debugging in main.py."""
+    """Exposed for logging / debugging in main.py."""
     return detect_intent(user_message, sql)
-    
-    
+
+
 # =============================================================================
-# FACT-BINDING VERIFIER — checks Claude's prose summary against the numbers
-# that actually appeared in the query results, to catch invented figures.
+# FACT-BINDING VERIFIER
 # =============================================================================
 _NUM_PATTERN = re.compile(r'-?\$?\d[\d,]*\.?\d*%?')
 
 
 def extract_numbers(text: str) -> Set[float]:
-    """Pull every numeric token out of a string, normalized to a float."""
     raw = _NUM_PATTERN.findall(text)
     out: Set[float] = set()
     for tok in raw:
@@ -524,7 +699,6 @@ def extract_numbers(text: str) -> Set[float]:
 
 
 def extract_numbers_from_rows(rows: List[dict]) -> Set[float]:
-    """Pull every numeric value that actually appeared in the SQL result rows."""
     out: Set[float] = set()
     for row in rows:
         for v in row.values():
@@ -542,18 +716,18 @@ def validate_summary_against_facts(
 ) -> List[str]:
     """
     Returns violation strings if the summary contains numbers that cannot be
-    traced back to the actual query result rows (within a rounding tolerance,
-    since the LLM may legitimately compute %s/sums/$M conversions from raw rows).
+    traced back to actual query result rows (within rounding tolerance — the
+    model legitimately computes %s / $M conversions from raw values).
     """
     claimed = extract_numbers(summary_text)
     actual = extract_numbers_from_rows(allowed_rows)
 
     if not actual:
-        return []  # no data to check against — don't false-positive on greetings etc.
+        return []  # no data — don't false-positive on greetings / narrative
 
     violations = []
     for c in claimed:
-        if c in (0, 100):  # common safe derived values (0%, 100%)
+        if c in (0.0, 100.0, 1.0):   # common safe derived values
             continue
         matches_raw   = any(abs(c - a) <= tolerance for a in actual)
         matches_m     = any(abs(c - a / 1_000_000) <= tolerance for a in actual)
