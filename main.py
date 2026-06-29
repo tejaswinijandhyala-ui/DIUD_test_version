@@ -1676,6 +1676,64 @@ def _build_csv(stored: QueryResult) -> bytes:
 # Export content generation
 # FIX 1: EXPORT_MAX_TOKENS used here for long document generation
 # =============================================================================
+
+def _render_html_to_png(html_content: str, width: int = 800) -> Optional[bytes]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("⚠️  Playwright not installed.")
+        return None
+
+    full_html = f"""<!DOCTYPE html><html><head>
+<meta charset="UTF-8">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #ffffff; font-family: 'Inter', Arial, sans-serif; }}
+</style>
+</head><body>{html_content}
+</body></html>"""
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--single-process",          # ← critical for Render
+                    "--no-zygote",               # ← critical for Render
+                ]
+            )
+            page = browser.new_page(viewport={"width": width, "height": 800})
+            page.set_content(full_html, wait_until="networkidle", timeout=20000)
+            page.wait_for_timeout(2000)
+            height = page.evaluate("document.body.scrollHeight")
+            page.set_viewport_size({"width": width, "height": max(height, 100)})
+            png_bytes = page.screenshot(full_page=True)
+            browser.close()
+            return png_bytes
+    except Exception as e:
+        print(f"⚠️  Playwright screenshot failed: {e}")
+        return None
+
+
+def _extract_html_blocks(text: str):
+    """
+    Split a message into alternating text/html segments.
+    Returns list of ("text"|"html", content) tuples.
+    """
+    segments = []
+    last_end = 0
+    for m in re.finditer(r'```html\s*\n(.*?)```', text, flags=re.DOTALL | re.IGNORECASE):
+        segments.append(("text", text[last_end:m.start()]))
+        segments.append(("html", m.group(1).strip()))
+        last_end = m.end()
+    segments.append(("text", text[last_end:]))
+    return segments
+
+
 def _generate_export_content(
     conversation:    List[ChatMessage],
     title:           str,
@@ -1684,43 +1742,58 @@ def _generate_export_content(
     stored_dataset:  Optional[QueryResult] = None,
 ) -> str:
 
-    # ── VERBATIM MODE: no AI, just raw chat history ──────────────────────
-    if detail_level == "detailed":
-        lines = [f"# {title}", f"*Exported: {date.today().strftime('%B %d, %Y')}*", ""]
+    def _clean_text_segment(text: str) -> str:
+        text = re.sub(r'```[\w]*\n.*?```', '', text, flags=re.DOTALL)
+        text = re.sub(r'^\s*--\s*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*`+\s*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = text.replace('■', '').replace('🟦', '')
+        return text.strip()
 
+    # ── VERBATIM MODE ────────────────────────────────────────────────────
+    if detail_level == "detailed":
         if export_type == "pptx":
-            # Structure as slides by turn
+            lines = [f"# {title}", f"*Exported: {date.today().strftime('%B %d, %Y')}*", ""]
             for i, m in enumerate(conversation):
                 role = "User" if m.role == "user" else "DIUD Agent"
+                segments = _extract_html_blocks(m.content)
                 lines.append(f"SLIDE: {role} — Turn {i + 1}")
-                # Each line of the message becomes a bullet
-                for part in m.content.strip().split("\n"):
-                    part = part.strip()
-                    if part:
-                        lines.append(f"- {part}")
+                for seg_type, seg_content in segments:
+                    if seg_type == "html":
+                        lines.append("- [Interactive chart — see live DIUD interface]")
+                    else:
+                        cleaned = _clean_text_segment(seg_content)
+                        for part in cleaned.split("\n"):
+                            part = part.strip()
+                            if part:
+                                lines.append(f"- {part}")
+            return "\n".join(lines)
         else:
-            # PDF: plain transcript
+            # PDF: encode segments as JSON with sentinel so _build_pdf can embed chart images
+            pdf_segments = []
             for i, m in enumerate(conversation):
-                role = "**User**" if m.role == "user" else "**DIUD Agent**"
-                lines.append(f"### Turn {i + 1} — {role}")
-                lines.append(m.content.strip())
-                lines.append("")
+                role = "User" if m.role == "user" else "DIUD Agent"
+                pdf_segments.append({"type": "turn_header", "turn": i + 1, "role": role})
+                for seg_type, seg_content in _extract_html_blocks(m.content):
+                    if seg_type == "html":
+                        pdf_segments.append({"type": "html_chart", "html": seg_content})
+                    else:
+                        cleaned = _clean_text_segment(seg_content)
+                        if cleaned:
+                            pdf_segments.append({"type": "text", "content": cleaned})
+            return "__VERBATIM_SEGMENTS__" + json.dumps(pdf_segments)
 
-        return "\n".join(lines)
-
-    # ── SUMMARY MODE: AI-generated analytical report ─────────────────────
+    # ── SUMMARY MODE ─────────────────────────────────────────────────────
     selected_model = ALLOWED_MODELS["sonnet"]
     conv_text = "\n\n".join(
         f"{'USER' if m.role == 'user' else 'DIUD AGENT'}: {m.content}"
         for m in conversation
     )
-
     format_hint = (
         "Format as a PowerPoint: use SLIDE: <title> for each slide, then bullet points."
         if export_type == "pptx"
         else "Format as a professional PDF report: ## section headers, narrative prose, tables."
     )
-
     dataset_hint = ""
     if stored_dataset:
         dataset_hint = (
@@ -1728,7 +1801,6 @@ def _generate_export_content(
             f"with columns: {', '.join(stored_dataset.columns[:12])}. "
             f"Filters: {stored_dataset.filters_applied}."
         )
-
     prompt = f"""You are preparing a professional {export_type.upper()} summary report.
 
 CONVERSATION:
@@ -1742,7 +1814,6 @@ TASK: Create a concise executive summary titled "{title}"
 REQUIREMENTS:
 - Executive summary at the start with key numbers only
 - Logical sections: summary, key metrics, insights, recommendations
-- Keep it concise — highlight only the most important findings
 - Bold key numbers; clean professional tone
 - Today: {date.today().strftime('%B %d, %Y')}
 - Generate the COMPLETE document — do not truncate
@@ -1750,11 +1821,11 @@ REQUIREMENTS:
 Generate the summary report now:"""
 
     response = _ai_client.messages.create(
-        model      = selected_model,
-        system     = "You are a professional document formatter. Follow the instructions exactly. Never add content not requested.",
-        messages   = [{"role": "user", "content": prompt}],
-        temperature= 0,
-        max_tokens = EXPORT_MAX_TOKENS,
+        model=selected_model,
+        system="You are a professional document formatter. Follow the instructions exactly. Never add content not requested.",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=EXPORT_MAX_TOKENS,
     )
     ai_text = _extract_text(response.content)
 
@@ -1766,7 +1837,6 @@ Generate the summary report now:"""
             f"**Exported:** {date.today().strftime('%B %d, %Y')}"
         )
         full_section = f"\n\n## Data Export ({stored_dataset.total_rows:,} records)\n\n{meta_line}\n\n{table_md}"
-
         if "[DEAL_TABLE_PLACEHOLDER]" in ai_text:
             ai_text = ai_text.replace("[DEAL_TABLE_PLACEHOLDER]", full_section)
         else:
@@ -1857,9 +1927,9 @@ def _parse_sections(text: str):
 
 
 def _build_pdf(title: str, report_text: str) -> bytes:
-    buf     = io.BytesIO()
-    styles  = _pdf_styles()
-    sections = _parse_sections(report_text)
+    from reportlab.platypus import Image as RLImage
+    buf    = io.BytesIO()
+    styles = _pdf_styles()
 
     def _on_page(canvas, doc):
         canvas.saveState()
@@ -1885,15 +1955,86 @@ def _build_pdf(title: str, report_text: str) -> bytes:
                           topMargin=_MT + _HDR_H, bottomMargin=_MB + _FTR_H)
     doc.addPageTemplates([template])
 
-    story = [
+    cover_story = [
         Spacer(1, 1.0 * inch),
         Paragraph(title, styles["Cover_Title"]),
         Paragraph(f"Generated {date.today().strftime('%B %d, %Y')}", styles["Cover_Sub"]),
         PageBreak(),
     ]
 
+    # ── VERBATIM SEGMENTS PATH ────────────────────────────────────────────
+    if report_text.startswith("__VERBATIM_SEGMENTS__"):
+        segments = json.loads(report_text[len("__VERBATIM_SEGMENTS__"):])
+        story = cover_story[:]
+
+        for seg in segments:
+            if seg["type"] == "turn_header":
+                role_label = "User" if seg["role"] == "User" else "DIUD Agent"
+                bar_color  = _C_BLUE if seg["role"] == "User" else _C_NAVY
+                story.append(Spacer(1, 8))
+                story.append(Table(
+                    [[Paragraph(f"Turn {seg['turn']} — {role_label}", styles["Section_H"])]],
+                    colWidths=[_CW],
+                    style=TableStyle([
+                        ("BACKGROUND",    (0,0),(-1,-1), bar_color),
+                        ("TOPPADDING",    (0,0),(-1,-1), 6),
+                        ("BOTTOMPADDING", (0,0),(-1,-1), 6),
+                        ("LEFTPADDING",   (0,0),(-1,-1), 10),
+                    ])
+                ))
+                story.append(Spacer(1, 6))
+
+            elif seg["type"] == "html_chart":
+                png_bytes = _render_html_to_png(seg["html"], width=760)
+                if png_bytes:
+                    img = RLImage(io.BytesIO(png_bytes), width=_CW, height=_CW * 0.55)
+                    img.hAlign = "CENTER"
+                    story.append(img)
+                    story.append(Spacer(1, 10))
+                else:
+                    story.append(Paragraph(
+                        "[Chart could not be rendered — view in live DIUD interface]",
+                        styles["Body"]
+                    ))
+
+            elif seg["type"] == "text":
+                lines = seg["content"].split("\n")
+                i = 0
+                while i < len(lines):
+                    line = lines[i].strip()
+                    if line.startswith("|") and i + 1 < len(lines) and "---" in lines[i + 1]:
+                        table_lines = []
+                        while i < len(lines) and lines[i].strip().startswith("|"):
+                            table_lines.append(lines[i].strip())
+                            i += 1
+                        story.append(_md_table_to_rl(table_lines, styles))
+                        story.append(Spacer(1, 6))
+                        continue
+                    if not line:
+                        story.append(Spacer(1, 3))
+                    elif line.startswith("### "):
+                        story.append(Paragraph(_strip_md(line), styles["H3"]))
+                    elif line.startswith("## "):
+                        story.append(Paragraph(_strip_md(line), styles["H2"]))
+                    elif line.startswith(("- ", "* ", "• ")):
+                        story.append(Paragraph("• " + _strip_md(line[2:]), styles["Bullet"]))
+                    else:
+                        story.append(Paragraph(_strip_md(line), styles["Body"]))
+                    i += 1
+
+        doc.build(story)
+        return buf.getvalue()
+
+    # ── SUMMARY PATH (existing logic, unchanged) ──────────────────────────
+    sections = _parse_sections(report_text)
+    story = cover_story[:]
+
     if not sections:
-        for line in report_text.split("\n"):
+        # strip residual HTML before fallback rendering
+        clean_text = re.sub(r'```html.*?```', '[Chart omitted]', report_text, flags=re.DOTALL | re.IGNORECASE)
+        clean_text = re.sub(r'```.*?```', '', clean_text, flags=re.DOTALL)
+        clean_text = re.sub(r'^\s*--\s*$', '', clean_text, flags=re.MULTILINE)
+        for line in clean_text.split("\n"):
             line = line.strip()
             if line:
                 story.append(Paragraph(_strip_md(line), styles["Body"]))
@@ -1917,7 +2058,6 @@ def _build_pdf(title: str, report_text: str) -> bytes:
             i = 0
             while i < len(lines):
                 line = lines[i].strip()
-
                 if line.startswith("|") and i + 1 < len(lines) and "---" in lines[i + 1]:
                     table_lines = []
                     while i < len(lines) and lines[i].strip().startswith("|"):
@@ -1926,7 +2066,6 @@ def _build_pdf(title: str, report_text: str) -> bytes:
                     story.append(_md_table_to_rl(table_lines, styles))
                     story.append(Spacer(1, 6))
                     continue
-
                 if not line:
                     story.append(Spacer(1, 3))
                 elif line.startswith("### "):
