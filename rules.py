@@ -489,19 +489,17 @@ RULES: List[Dict[str, Any]] = [
         ),
     },
     {
-        {
-        "id": "pattern_a_stage_anchor",
-        "section": "§6 Pattern A — stage-specific FY anchor",
-        "applies_when": lambda sql, intent: _is_pattern_a(sql),
-        "check": lambda sql, intent: (
-            _expected_became_column(intent) in sql
-        ),
-        "message": (
-            "Pattern A must use the became_<stage>_deal_date "
-            "corresponding to the stage requested by the user."
-        ),
-        },
-    },
+    "id": "pattern_a_stage_anchor",
+    "section": "§6 Pattern A — stage-specific FY anchor",
+    "applies_when": lambda sql, intent: _is_pattern_a(sql),
+    "check": lambda sql, intent: (
+        _expected_became_column(intent) in sql
+    ),
+    "message": (
+        "Pattern A must use the became_<stage>_deal_date "
+        "corresponding to the stage requested by the user."
+    ),
+},
 
 
     # -------------------------------------------------------------------------
@@ -510,7 +508,7 @@ RULES: List[Dict[str, Any]] = [
     # -------------------------------------------------------------------------
     {
         "id": "pattern_b_close_date_filter",
-        "section": "§7 Pattern B — primary filter is close_date, (not any became_<stage>_deal_date)",
+        "section": "§7 Pattern B — primary filter is close_date (not any became_<stage>_deal_date)",
         "applies_when": lambda sql, intent: (
             intent.get("metric") == "active_pipeline"
             and not _is_pattern_a(sql)
