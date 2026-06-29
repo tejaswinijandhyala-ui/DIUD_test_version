@@ -509,7 +509,7 @@ RULES: List[Dict[str, Any]] = [
     # -------------------------------------------------------------------------
     {
         "id": "pattern_b_close_date_filter",
-        "section": "§7 Pattern B — primary filter is close_date, (not any became_<stage>_deal_date),
+        "section": "§7 Pattern B — primary filter is close_date, (not any became_<stage>_deal_date)",
         "applies_when": lambda sql, intent: (
             intent.get("metric") == "active_pipeline"
             and not _is_pattern_a(sql)
