@@ -69,7 +69,7 @@ ALLOWED_MODELS = {
 # FIX 1: Increased max_tokens across all call sites
 # Chat responses: 4096 → handles long analytical responses without mid-sentence cut
 # Export generation: 6144 → handles full reports with large deal tables
-CHAT_MAX_TOKENS   = 8192
+CHAT_MAX_TOKENS   = 4096
 EXPORT_MAX_TOKENS = 6144
 
 # =============================================================================
@@ -1386,6 +1386,20 @@ Please verify these filters match your expectation.
 ═══════════════════════════════════════════════════════════════
 §15  VISUAL / CHART GENERATION RULES
 ═══════════════════════════════════════════════════════════════
+Generate Chart.js charts as self-contained HTML in fenced ```html blocks.
+
+MANDATORY: Every response that returns numeric/aggregate data from a
+successful query MUST include a Chart.js visualization in a fenced
+```html block AFTER the text analysis and Filters Applied block.
+EXCEPTIONS (no chart needed):
+  - Greeting responses (§1)
+  - Error / connection failure responses
+  - Export intent responses (__EXPORT_INTENT__)
+  - Pure deal-list responses (Pattern B returning individual deal rows
+    without aggregation — e.g. "show me the deals")
+If the response would exceed token limits with a full chart, generate a
+simpler chart (basic bar chart with fewer options) rather than omitting
+the chart entirely. A simple chart is always better than no chart.
 Generate Chart.js charts as self-contained HTML in fenced ```html blocks.
 
 ── CHART TYPE SELECTION ──────────────────────────────────────
