@@ -1491,9 +1491,21 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
 
         if session_id:
             existing = _SESSION_STORE.get(session_id)
-            # Only overwrite if this result is larger than what's already stored.
-            # This prevents a trivial follow-up query (e.g. export intent confirmation)
-            # from replacing a large deal-list result with 1 row.
+            # Always store the most recent query result for chart/export purposes.
+            # Use a SEPARATE key (chat_session_id + ":latest") for the most recent
+            # result specifically, while preserving the old "largest result wins"
+            # behavior under the original session_id for export/CSV purposes.
+            _store_result(f"{session_id}:latest", QueryResult(
+                sql             = sql,
+                columns         = columns,
+                rows            = norm_rows,
+                total_rows      = total_rows,
+                captured_at     = datetime.utcnow().isoformat() + "Z",
+                filters_applied = _extract_filters_from_sql(sql),
+            ))
+            # Only overwrite the EXPORT-facing session result if this is larger.
+            # This prevents a trivial follow-up query from replacing a large
+            # deal-list result meant for CSV/PDF export with a tiny one.
             if not existing or total_rows > existing.total_rows:
                 _store_result(session_id, QueryResult(
                     sql             = sql,
@@ -1504,7 +1516,7 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
                     filters_applied = _extract_filters_from_sql(sql),
                 ))
             else:
-                print(f"   ⏭️  Skipping session store update — {total_rows} row(s) won't overwrite existing {existing.total_rows} rows.")
+                print(f"   ⏭️  Skipping EXPORT session store update — {total_rows} row(s) won't overwrite existing {existing.total_rows} rows.")
 
         CHAT_DISPLAY_LIMIT = 100
         header = " | ".join(columns)
@@ -1539,7 +1551,7 @@ def _extract_filters_from_sql(sql: str) -> str:
         filters.append("Pipeline: default")
     
     # Dynamically detect any cohort stage (5, 10, 20, 30, 40, 60, 75)
-    cohort_stages = re.findall(r'BECAME_(\d+)_DEAL_DATE', sql_upper)
+    cohort_stages = sorted(set(re.findall(r'BECAME_(\d+)_DEAL_DATE', sql_upper)), key=int)
     for stage in cohort_stages:
         filters.append(f"Cohort: {stage}% qualified deals")
     
@@ -1965,7 +1977,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
 
     # ── FACT-BINDING VERIFIER ───────────────────────────────────────
     if reply and session_id:
-        stored = _get_result(session_id)
+        stored = _get_result(f"{session_id}:latest") or _get_result(session_id)
         if stored and stored.rows:
             violations = validate_summary_against_facts(reply, stored.rows)
             if violations:
@@ -2000,7 +2012,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                     # keep original reply rather than losing the response entirely
 # ── DETERMINISTIC CHART INJECTION ────────────────────────────────
     if reply and session_id and not reply_already_has_chart(reply):
-        stored = _get_result(session_id)
+        stored = _get_result(f"{session_id}:latest") or _get_result(session_id)
         if stored and stored.rows:
             chart_html = build_chart_html(
                 stored.columns, stored.rows, stored.filters_applied
