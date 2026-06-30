@@ -70,7 +70,7 @@ ALLOWED_MODELS = {
 # FIX 1: Increased max_tokens across all call sites
 # Chat responses: 4096 → handles long analytical responses without mid-sentence cut
 # Export generation: 6144 → handles full reports with large deal tables
-CHAT_MAX_TOKENS   = 4096
+CHAT_MAX_TOKENS   = 6144
 EXPORT_MAX_TOKENS = 6144
 
 # =============================================================================
@@ -512,6 +512,14 @@ COLUMNS (all Nullable(String) except id):
 3. ALWAYS filter targets to the exact quarter: WHERE fy='FY27' AND quarter='Q1'
 4. Period grain must match: if actuals are Q1 FY27, filter target table to same.
 5. For partner tables: filter partner_team_type IN ('Hyperscaler','GSI/SI','Reseller/BPO/TSD').
+6. IF A TARGET QUERY RETURNS 0 ROWS: do not explain your plan in prose first.
+   In the SAME tool-use round, immediately run a diagnostic query
+     SELECT DISTINCT fy, quarter FROM <target_table>
+   against the relevant target table, identify the correct fy string format
+   (e.g. 'FY27' vs '27' vs '2027'), then re-run the original attainment
+   query with the corrected filter — all before writing any response to
+   the user. Never tell the user "let me check X" without having already
+   called the tool to check X in that same turn.
 
 ═══════════════════════════════════════════════════════════════
 §5  THREE QUERY PATTERNS — DECISION GUIDE
@@ -1975,6 +1983,87 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
 
     reply = _extract_text(response.content)
 
+    # ── INCOMPLETE-TURN GUARD ────────────────────────────────────────
+    # If the final round was cut off by max_tokens (not a natural
+    # tool_use/end_turn stop), "reply" may just be Claude narrating its
+    # NEXT planned step ("let me check...") without executing it. Force
+    # one continuation so the investigation actually finishes instead of
+    # serving unfinished reasoning as the answer.
+    if response.stop_reason == "max_tokens":
+        continue_messages = safe_messages + [
+            {"role": "assistant", "content": reply},
+            {"role": "user", "content": (
+                "Continue. You were cut off mid-response. If you said you "
+                "were going to check or fetch something, actually call the "
+                "appropriate tool now and complete the investigation. Do "
+                "not repeat or re-explain your plan — execute it, then give "
+                "the final answer."
+            )},
+        ]
+        try:
+            continue_response = _ai_client.messages.create(
+                model=selected_model,
+                system=_SYSTEM_PROMPT,
+                messages=continue_messages,
+                tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL],
+                temperature=0,
+                max_tokens=max_tokens,
+            )
+            for _ in range(3):
+                if continue_response.stop_reason != "tool_use":
+                    break
+                tool_blocks = [b for b in continue_response.content if b.type == "tool_use"]
+                if not tool_blocks:
+                    break
+                tool_result_blocks = []
+                for tb in tool_blocks:
+                    if tb.name == "lookup_business_rule":
+                        tool_result_blocks.append({
+                            "type": "tool_result", "tool_use_id": tb.id,
+                            "content": get_rulebook_entry(tb.input.get("topic", "")),
+                            "is_error": False,
+                        })
+                        continue
+                    if tb.name == "compute_verified_metric":
+                        tool_result_blocks.append({
+                            "type": "tool_result", "tool_use_id": tb.id,
+                            "content": compute_verified_metric(tb.input.get("metric_name", ""), session_id),
+                            "is_error": False,
+                        })
+                        continue
+                    sql = tb.input.get("sql", "")
+                    violations = validate_sql_against_rules(sql, original_user_message)
+                    _log_rule_audit(session_id, sql, violations, "pre_execute", original_user_message)
+                    if violations:
+                        result = "RULE VIOLATION — not executed:\n" + "\n".join(violations)
+                        is_err = True
+                    else:
+                        result = run_clickhouse_query(sql, session_id=session_id)
+                        is_err = any(result.startswith(p) for p in
+                            ["DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"])
+                    tool_result_blocks.append({
+                        "type": "tool_result", "tool_use_id": tb.id,
+                        "content": result, "is_error": is_err,
+                    })
+                continue_messages = continue_messages + [
+                    {"role": "assistant", "content": continue_response.content},
+                    {"role": "user", "content": tool_result_blocks},
+                ]
+                continue_response = _ai_client.messages.create(
+                    model=selected_model, system=_SYSTEM_PROMPT,
+                    messages=continue_messages,
+                    tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL],
+                    temperature=0, max_tokens=max_tokens,
+                )
+            completed = _extract_text(continue_response.content)
+            if completed:
+                reply = completed
+                safe_messages = continue_messages  # keep fact-binding verifier in sync
+        except Exception as e:
+            print(f"⚠️ Continuation after max_tokens cutoff failed: {e}")
+            # fall through with the original (incomplete) reply rather than erroring out
+
+
     # ── FACT-BINDING VERIFIER ───────────────────────────────────────
     if reply and session_id:
         stored = _get_result(f"{session_id}:latest") or _get_result(session_id)
@@ -2011,9 +2100,17 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                     print(f"⚠️ Fact-binding regeneration failed: {e}")
                     # keep original reply rather than losing the response entirely
 # ── DETERMINISTIC CHART INJECTION ────────────────────────────────
-    if reply and session_id and not reply_already_has_chart(reply):
+    _INVESTIGATION_MARKERS = ("let me check", "let me look", "let me verify",
+                               "i'll check", "i'll look", "checking what",
+                               "let me fetch", "let me re-run", "let me query")
+    reply_looks_unfinished = (
+        any(m in reply.lower() for m in _INVESTIGATION_MARKERS)
+        and "filters applied" not in reply.lower()
+    )
+    if reply and session_id and not reply_already_has_chart(reply) and not reply_looks_unfinished:
         stored = _get_result(f"{session_id}:latest") or _get_result(session_id)
         if stored and stored.rows:
+            chart_html = build_chart_html(
             chart_html = build_chart_html(
                 stored.columns, stored.rows, stored.filters_applied
             )
