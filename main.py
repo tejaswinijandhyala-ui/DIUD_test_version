@@ -557,6 +557,23 @@ PATTERN C — ACTUALS vs TARGET / ATTAINMENT
        Source mapping MERGES Executive Outreach + Investor (to match quota table).
   See §8 for full SQL pattern.
 
+PATTERN D — GENERAL / AD-HOC QUERIES
+  Use when the question does NOT match Pattern A, B, or C.
+  Examples:
+  • Win rate by source/region, average deal size, sales cycle length
+  • BANT qualification rate, competitor mentions, AE rankings
+  • Cross-table joins (contacts → deals via association table)
+  • MQL-to-deal funnels, any analytical question answerable with SQL
+  
+  KEY RULES:
+  - Apply MANDATORY_BASE_FILTERS (§3) when querying deals.
+  - Apply MQL filters (§11) when querying contacts.
+  - Use FINAL on all hs_analytics.* tables.
+  - Use countDistinct() for all aggregations.
+  - Start SQL with WITH or SELECT (no leading comments needed).
+  - Use appropriate JOINs between tables as needed.
+  - For association table joins, always use DISTINCT in subqueries.
+
 PATTERN SELECTION QUICK REFERENCE:
 
 "how many deals reached/passed through [stage]"   → A
@@ -572,6 +589,11 @@ PATTERN SELECTION QUICK REFERENCE:
 AMBIGUOUS: "pipegen attainment by region"          → C (needs target table)
 AMBIGUOUS: "how many 20% deals vs target"          → C
 AMBIGUOUS: "active pipeline vs EOP"                → C
+
+"win rate", "avg deal size", "sales cycle"             → D
+"BANT rate", "competitor analysis", "AE ranking"       → D
+"MQL to deal", "contact to deal funnel"                → D
+Any question not matching A, B, or C                   → D
 
 ═══════════════════════════════════════════════════════════════
 §6  PATTERN A — CUMULATIVE PIPEGEN / FUNNEL STAGE COUNTS
@@ -1467,8 +1489,9 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
         return "DATABASE CONNECTION FAILED: CLICKHOUSE_API_URL is not set."
     if not token:
         return "DATABASE CONNECTION FAILED: CLICKHOUSE_API_TOKEN is not set."
-
-    stripped = sql.strip().upper()
+        
+    cleaned = re.sub(r'^\s*--[^\n]*\n', '', sql.strip(), flags=re.MULTILINE).strip()
+    stripped = cleaned.upper()
     if not (stripped.startswith("SELECT") or stripped.startswith("WITH")):
         return "ERROR: Only SELECT/WITH queries are permitted."
     for kw in FORBIDDEN_KEYWORDS:
