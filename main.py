@@ -69,7 +69,7 @@ ALLOWED_MODELS = {
 # FIX 1: Increased max_tokens across all call sites
 # Chat responses: 4096 → handles long analytical responses without mid-sentence cut
 # Export generation: 6144 → handles full reports with large deal tables
-CHAT_MAX_TOKENS   = 4096
+CHAT_MAX_TOKENS   = 8192
 EXPORT_MAX_TOKENS = 6144
 
 # =============================================================================
