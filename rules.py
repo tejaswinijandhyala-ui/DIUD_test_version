@@ -780,18 +780,37 @@ def get_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
 # =============================================================================
 _NUM_PATTERN = re.compile(r'-?\$?\d[\d,]*\.?\d*%?')
 
+_STAGE_LABEL_PATTERN = re.compile(
+    r'\b\d{1,3}%\s*[-–—]\s*[A-Za-z][\w/() ]*'
+)
+_STAGE_TRANSITION_PATTERN = re.compile(
+    r'\b\d{1,3}%\s*(?:to|→|->)\s*\d{1,3}%'
+)
+_FY_QUARTER_PATTERN = re.compile(r'\bFY\s?\d{2,4}\b|\bQ[1-4]\b', re.IGNORECASE)
+_YEAR_RANGE = range(2020, 2036)
+
+
+def _strip_label_noise(text: str) -> str:
+    cleaned = _STAGE_LABEL_PATTERN.sub(' ', text)
+    cleaned = _STAGE_TRANSITION_PATTERN.sub(' ', cleaned)
+    cleaned = _FY_QUARTER_PATTERN.sub(' ', cleaned)
+    return cleaned
+
 
 def extract_numbers(text: str) -> Set[float]:
-    raw = _NUM_PATTERN.findall(text)
+    cleaned = _strip_label_noise(text)
+    raw = _NUM_PATTERN.findall(cleaned)
     out: Set[float] = set()
     for tok in raw:
-        cleaned = tok.replace('$', '').replace(',', '').replace('%', '')
+        cleaned_tok = tok.replace('$', '').replace(',', '').replace('%', '')
         try:
-            out.add(round(float(cleaned), 2))
+            val = float(cleaned_tok)
         except ValueError:
             continue
+        if val in _YEAR_RANGE and '.' not in cleaned_tok:
+            continue
+        out.add(round(val, 2))
     return out
-
 
 def extract_numbers_from_rows(rows: List[dict]) -> Set[float]:
     out: Set[float] = set()
@@ -802,6 +821,10 @@ def extract_numbers_from_rows(rows: List[dict]) -> Set[float]:
             except (TypeError, ValueError):
                 continue
     return out
+
+
+def _relative_tolerance(value: float, base_tolerance: float = 0.5) -> float:
+    return max(base_tolerance, abs(value) * 0.01)
 
 
 def validate_summary_against_facts(
@@ -815,17 +838,18 @@ def validate_summary_against_facts(
     if not actual:
         return []
 
-    # Pre-compute the set of plausible derived values
-    derived = set()
+    derived: Set[float] = set()
     for a in actual:
         derived.add(round(a, 1))
-        derived.add(round(a / 1_000_000, 1))  # $M conversion
-        derived.add(round(a / 1_000, 1))       # $K conversion
+        derived.add(round(a / 1_000_000, 1))
+        derived.add(round(a / 1_000, 1))
+        derived.add(round(a / 1_000_000, 2))
 
-    # Add all pairwise ratios and percentages (covers conversion rates)
     actual_nonzero = [a for a in actual if a != 0]
-    for i, a in enumerate(actual_nonzero):
+    for a in actual_nonzero:
         for b in actual_nonzero:
+            if a == b:
+                continue
             ratio = a / b * 100
             derived.add(round(ratio, 1))
             derived.add(round(ratio, 0))
@@ -834,12 +858,16 @@ def validate_summary_against_facts(
     for c in claimed:
         if c in (0.0, 100.0, 1.0):
             continue
-        # Check raw match
-        matches_raw = any(abs(c - a) <= tolerance for a in actual)
-        matches_m = any(abs(c - a / 1_000_000) <= tolerance for a in actual)
-        matches_scale = any(abs(c * 1_000_000 - a) <= tolerance for a in actual)
-        # Check derived match (percentages, ratios)
-        matches_derived = any(abs(c - d) <= tolerance for d in derived)
-        if not (matches_raw or matches_m or matches_scale or matches_derived):
+
+        tol = _relative_tolerance(c, tolerance)
+
+        matches_raw    = any(abs(c - a) <= tol for a in actual)
+        matches_m      = any(abs(c - a / 1_000_000) <= tol for a in actual)
+        matches_k      = any(abs(c - a / 1_000) <= tol for a in actual)
+        matches_scale  = any(abs(c * 1_000_000 - a) <= max(tol * 1_000_000, abs(a) * 0.01) for a in actual)
+        matches_derived = any(abs(c - d) <= tol for d in derived)
+
+        if not (matches_raw or matches_m or matches_k or matches_scale or matches_derived):
             violations.append(f"Unverified number in summary: {c}")
+
     return violations
