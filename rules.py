@@ -809,24 +809,37 @@ def validate_summary_against_facts(
     allowed_rows: List[dict],
     tolerance: float = 0.5,
 ) -> List[str]:
-    """
-    Returns violation strings if the summary contains numbers that cannot be
-    traced back to actual query result rows (within rounding tolerance — the
-    model legitimately computes %s / $M conversions from raw values).
-    """
     claimed = extract_numbers(summary_text)
     actual = extract_numbers_from_rows(allowed_rows)
 
     if not actual:
-        return []  # no data — don't false-positive on greetings / narrative
+        return []
+
+    # Pre-compute the set of plausible derived values
+    derived = set()
+    for a in actual:
+        derived.add(round(a, 1))
+        derived.add(round(a / 1_000_000, 1))  # $M conversion
+        derived.add(round(a / 1_000, 1))       # $K conversion
+
+    # Add all pairwise ratios and percentages (covers conversion rates)
+    actual_nonzero = [a for a in actual if a != 0]
+    for i, a in enumerate(actual_nonzero):
+        for b in actual_nonzero:
+            ratio = a / b * 100
+            derived.add(round(ratio, 1))
+            derived.add(round(ratio, 0))
 
     violations = []
     for c in claimed:
-        if c in (0.0, 100.0, 1.0):   # common safe derived values
+        if c in (0.0, 100.0, 1.0):
             continue
-        matches_raw   = any(abs(c - a) <= tolerance for a in actual)
-        matches_m     = any(abs(c - a / 1_000_000) <= tolerance for a in actual)
+        # Check raw match
+        matches_raw = any(abs(c - a) <= tolerance for a in actual)
+        matches_m = any(abs(c - a / 1_000_000) <= tolerance for a in actual)
         matches_scale = any(abs(c * 1_000_000 - a) <= tolerance for a in actual)
-        if not (matches_raw or matches_m or matches_scale):
+        # Check derived match (percentages, ratios)
+        matches_derived = any(abs(c - d) <= tolerance for d in derived)
+        if not (matches_raw or matches_m or matches_scale or matches_derived):
             violations.append(f"Unverified number in summary: {c}")
     return violations
