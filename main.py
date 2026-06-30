@@ -15,6 +15,7 @@ from rules import (
 )
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Literal, Optional, Callable
+from charts import build_chart_html, reply_already_has_chart
 
 import httpx
 import anthropic
@@ -1406,69 +1407,10 @@ Please verify these filters match your expectation.
 ---
 
 ═══════════════════════════════════════════════════════════════
-§15  VISUAL / CHART GENERATION RULES
+§15  VISUAL / CHART GENERATION
 ═══════════════════════════════════════════════════════════════
-Generate Chart.js charts as self-contained HTML in fenced ```html blocks.
-
-MANDATORY: Every response that returns numeric/aggregate data from a
-successful query MUST include a Chart.js visualization in a fenced
-```html block AFTER the text analysis and Filters Applied block.
-EXCEPTIONS (no chart needed):
-  - Greeting responses (§1)
-  - Error / connection failure responses
-  - Export intent responses (__EXPORT_INTENT__)
-  - Pure deal-list responses (Pattern B returning individual deal rows
-    without aggregation — e.g. "show me the deals")
-If the response would exceed token limits with a full chart, generate a
-simpler chart (basic bar chart with fewer options) rather than omitting
-the chart entirely. A simple chart is always better than no chart.
-Generate Chart.js charts as self-contained HTML in fenced ```html blocks.
-
-── CHART TYPE SELECTION ──────────────────────────────────────
-Scenario                                    | Chart type
---------------------------------------------|---------------------------
-Pattern A results (stage funnel)            | Trapezoid SVG funnel
-Pattern C results (actual vs target)        | Grouped bar chart
-≤6 categories with part-of-whole meaning    | Donut chart
->6 categories or comparisons                | Horizontal bar chart
-Time series with ≥4 data points             | Line chart with filled area
-Region/source mix                           | Horizontal bar or donut
-AE performance comparison                   | Horizontal bar chart
-
-── MANDATORY COLOR RULE ──────────────────────────────────────
-Every bar/slice/segment MUST use its OWN distinct color. Never use one color for all.
-Palette (cycle when > 10 items):
-  ["#4E79A7","#F28E2B","#E15759","#76B7B2","#59A14F",
-   "#EDC948","#B07AA1","#FF9DA7","#9C755F","#BAB0AC"]
-
-── CHART QUALITY CHECKLIST (all 12 rules required) ───────────
-1.  Use Chart.js 4.4.1 from cdnjs.cloudflare.com only.
-2.  Background MUST be white (#fff) with a light border — never dark navy.
-3.  Include a chart title and subtitle (filter context) above the canvas.
-4.  Build a custom HTML legend — disable Chart.js default legend.
-    Each legend item: color swatch + label + value.
-5.  Every canvas needs role="img" and a descriptive aria-label.
-6.  Wrap canvas in a div with position:relative and explicit pixel height.
-7.  Load Chart.js UMD script first, then plain <script> after.
-8.  Never use type="module" in script tags.
-9.  Horizontal bar charts: set indexAxis:'y', height = (bars × 44 + 80) px.
-10. Y-axis tick format: values ≥1M → "$X.XM", values ≥1K → "$XK".
-11. Show value labels on bars/slices where space allows.
-12. Generate ALL chart HTML in one complete pass — never truncate.
-
-── FUNNEL SVG SPECIFIC RULES ─────────────────────────────────
-- Centered trapezoid per stage using inline SVG.
-- Minimum bar width: Math.max((deals/maxDeals)*88, 18) + '%'
-  Never scale to zero even if count is 1.
-- Top edge of each trapezoid = bottom width of previous stage.
-- Show: deal count + $amount + conversion% per stage.
-- Each stage a different palette color.
-
-── DATA LABELING ─────────────────────────────────────────────
-- Bar charts: value above/inside each bar.
-- Pie/donut: percentage in legend, not inside slices.
-- Funnel: count + conversion % next to each stage.
-- Rounding: counts → integers | amounts → 1 decimal $M | % → 1 decimal.
+Charts are generated automatically by the system after your response.
+Do NOT write Chart.js, SVG, or any ```html chart code yourself.
 
 ═══════════════════════════════════════════════════════════════
 LIVE DATABASE SCHEMA (auto-injected below)
@@ -2032,12 +1974,15 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                 retry_messages = safe_messages + [
                     {"role": "assistant", "content": reply},
                     {"role": "user", "content": (
-                        "Your previous summary contained numeric values that do not "
-                        "appear in the query results or verified totals above. "
-                        "Rewrite the summary using ONLY numbers that literally appear "
-                        "in the returned rows, the [VERIFIED TOTALS] block, or a "
-                        "compute_verified_metric result. Do not invent or estimate "
-                        "any value."
+                        "Rewrite your last response as a clean, standalone answer "
+                        "using ONLY numbers that literally appear in the returned "
+                        "rows, the [VERIFIED TOTALS] block, or a "
+                        "compute_verified_metric result. IMPORTANT: This rewrite is "
+                        "the ONLY version the user will ever see — they have not "
+                        "seen your previous draft. Do NOT reference 'your previous "
+                        "response', do NOT apologize, do NOT say 'you're right' — "
+                        "just give the answer directly, as if this is the first "
+                        "and only time you're answering."
                     )},
                 ]
                 try:
@@ -2053,6 +1998,15 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                 except Exception as e:
                     print(f"⚠️ Fact-binding regeneration failed: {e}")
                     # keep original reply rather than losing the response entirely
+# ── DETERMINISTIC CHART INJECTION ────────────────────────────────
+    if reply and session_id and not reply_already_has_chart(reply):
+        stored = _get_result(session_id)
+        if stored and stored.rows:
+            chart_html = build_chart_html(
+                stored.columns, stored.rows, stored.filters_applied
+            )
+            if chart_html:
+                reply = reply.rstrip() + "\n\n" + chart_html
 
     if not reply:
         if last_error:
