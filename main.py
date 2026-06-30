@@ -2111,7 +2111,6 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
         stored = _get_result(f"{session_id}:latest") or _get_result(session_id)
         if stored and stored.rows:
             chart_html = build_chart_html(
-            chart_html = build_chart_html(
                 stored.columns, stored.rows, stored.filters_applied
             )
             if chart_html:
