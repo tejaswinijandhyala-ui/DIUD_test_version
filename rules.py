@@ -272,7 +272,13 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
             re.I,
         )
 
-        if m and "NOT IN" in sql.upper():
+        # Must specifically be a deal_stage exclusion (the real §8b cohort
+        # signature), NOT just any "NOT IN" clause in the SQL — mandatory
+        # base filters like `deal_type NOT IN ('Partner-Led SMB')` and the
+        # `gs_deal_ids_hs` allowlist subquery both contain "NOT IN" and were
+        # false-triggering this on every Pattern C/attainment query that
+        # happened to reference a became_<N>_deal_date FY anchor.
+        if m and re.search(r'deal_stage\s*NOT\s+IN\s*\(', sql, re.I):
             intent["cohort_stage"] = m.group(1)
 
     # ------------------------------------------------------------------
@@ -301,7 +307,9 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
         intent["metric"] = "mql"
 
     if re.search(
-        r'\b(attainment|quota|coverage|vs\.?\s*target|gap\s*to\s*target)\b',
+        r'\b(attainment|quota|coverage|'
+        r'(?:vs\.?|against|versus|compared?\s+to)\s*targets?|'
+        r'gap\s*to\s*target)\b',
         msg,
         re.I,
     ):
@@ -316,6 +324,53 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
 
     if sql and "MANDATORY_BASE_FILTERS" in sql:
         intent["placeholder_leak"] = True
+
+    # ------------------------------------------------------------------
+    # Dashboard reference (§ dashboard_definitions)
+    # ------------------------------------------------------------------
+
+    if re.search(
+        r'\b(dashboard|EOP|pipegen\s+dashboard|pipe\s*gen\s+dashboard|'
+        r'exec(?:utive)?\s*kpi|partnership\s+(?:dashboard|pipeline)|'
+        r'BDR\s*focus|AE\s*focus|CS\s+dashboard)\b',
+        msg,
+        re.I,
+    ):
+        intent["needs_dashboards"] = True
+
+    # ------------------------------------------------------------------
+    # needs_mql — mirrors the "mql" metric signal
+    # ------------------------------------------------------------------
+
+    intent["needs_mql"] = intent.get("metric") == "mql"
+
+    # ------------------------------------------------------------------
+    # Pattern classification (A / B / C) — drives which prompt module
+    # main.py._build_system_prompt() loads. Priority order matters:
+    # attainment/target language wins over active-pipeline language,
+    # which wins over funnel/cohort/stage-count language.
+    # ------------------------------------------------------------------
+
+    if intent.get("metric") == "attainment":
+        intent["pattern"] = "C"
+    elif intent.get("metric") == "active_pipeline":
+        intent["pattern"] = "B"
+    elif intent.get("cohort_stage") is not None or intent.get("stage") is not None:
+        # Funnel / cumulative stage-count / cohort questions — Pattern A
+        # covers the became_<N>_deal_date OR-chain and FY-anchoring logic
+        # these queries need. True cohort exclusion SQL (§8b) is still
+        # fetched on demand via lookup_business_rule when the model needs
+        # the exact template.
+        intent["pattern"] = "A"
+    elif re.search(r'\b(funnel|pipe\s*gen|pipegen|conversion)\b', msg, re.I):
+        intent["pattern"] = "A"
+    elif re.search(r'\bclosed\s*won\b', msg, re.I):
+        intent["pattern"] = "B"
+    else:
+        # Genuinely ambiguous — leave unset so _build_system_prompt()
+        # falls back to loading all three pattern modules rather than
+        # guessing wrong.
+        intent["pattern"] = None
 
     return intent
 
