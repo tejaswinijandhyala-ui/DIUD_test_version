@@ -1,5 +1,3 @@
-
-
 import re
 import json
 from typing import Dict, List, Optional, Tuple
@@ -66,8 +64,13 @@ def detect_chart_type(columns: List[str], rows: List[dict]) -> Optional[str]:
     if "deal_id" in cols_lower and "deal_name" in cols_lower:
         return None
 
-    # Pattern A — funnel: has a 'stage' column + a count column (deals)
-    if "stage" in cols_lower and any(c.lower() in ("deals", "deal_count") for c in columns):
+    # Pattern A — funnel: has a stage column + a count column (deals).
+    # NOTE: this app's own SQL templates (§6, §8b) alias the stage column
+    # as "deal_stage", not bare "stage" — match on substring, not exact
+    # membership, or every real Pattern A result silently misses this
+    # branch and falls through to a generic donut/bar chart instead.
+    stage_col = next((c for c in columns if "stage" in c.lower()), None)
+    if stage_col and any(c.lower() in ("deals", "deal_count") for c in columns):
         return "funnel"
 
     # Pattern C — attainment: actual vs target columns present
@@ -96,9 +99,15 @@ def detect_chart_type(columns: List[str], rows: List[dict]) -> Optional[str]:
 def _aggregate_funnel_rows(rows: List[dict]) -> List[Tuple[str, int, float]]:
     """Collapse possibly-multiple rows per stage (different region/source
     breakdowns) into one (stage, total_deals, total_amount) tuple per stage."""
+    if not rows:
+        return []
+    # Real SQL templates alias this column "deal_stage", not bare "stage" —
+    # detect the actual key present instead of assuming "stage" literally.
+    stage_key = next((k for k in rows[0].keys() if "stage" in k.lower()), "stage")
+
     agg: Dict[str, List[float]] = {}
     for r in rows:
-        stage = str(r.get("stage", "")).strip()
+        stage = str(r.get(stage_key, "")).strip()
         if not stage:
             continue
         deals = _to_float(r.get("deals") or r.get("deal_count") or 0)
@@ -358,5 +367,3 @@ def reply_already_has_chart(reply: str) -> bool:
     """Detect if Claude already included an ```html chart block, so we don't
     double-inject."""
     return bool(re.search(r'```html', reply, re.IGNORECASE))
-
-
