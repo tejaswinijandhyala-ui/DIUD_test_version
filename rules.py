@@ -383,6 +383,23 @@ def _call(fn: Callable, sql: str, intent: dict):
     return fn(sql, intent) if _arity(fn) == 2 else fn(sql)
 
 
+def _column_used_in_date_comparison(col: str, sql: str) -> bool:
+    """
+    True if `col` is used as the operand of a date comparison — either raw
+    (col >= '...') or wrapped in the §9-mandated
+    CAST(LEFT(coalesce(col,'1900-01-01'),10) AS DATE) pattern. Checking
+    only the raw form breaks the moment a query correctly applies the
+    mandatory §9 cast, since the column name is no longer adjacent to the
+    comparison operator.
+    """
+    raw = re.search(rf"\b{col}\b\s*(>=|<=|>|<|=)", sql, re.I)
+    wrapped = re.search(
+        rf"CAST\s*\(\s*LEFT\s*\(\s*coalesce\s*\(\s*{col}\b[^)]*\)[^)]*\)\s*AS\s*DATE\s*\)\s*(>=|<=|>|<|=)",
+        sql, re.I | re.S,
+    )
+    return bool(raw or wrapped)
+
+
 # =============================================================================
 # SQL-TEXT RULES
 # =============================================================================
@@ -569,7 +586,7 @@ RULES: List[Dict[str, Any]] = [
             and not _is_pattern_a(sql)
             and not _is_pattern_c(sql, intent)
         ),
-        "check": lambda sql, intent: bool(re.search(r"close_date\s*>=", sql, re.I)),
+        "check": lambda sql, intent: _column_used_in_date_comparison("close_date", sql),
         "message": (
             "Pattern B (active pipeline / deal-level) must filter on close_date >= <date>, "
             "not became_10_deal_date. See §7."
@@ -989,4 +1006,3 @@ def validate_summary_against_facts(
             violations.append(f"Unverified number in summary: {c}")
 
     return violations
-  
