@@ -989,3 +989,4 @@ def validate_summary_against_facts(
             violations.append(f"Unverified number in summary: {c}")
 
     return violations
+  
