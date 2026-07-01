@@ -154,13 +154,25 @@ PATTERN A — CUMULATIVE PIPEGEN / FUNNEL STAGE COUNTS
   • "how many deals reached [stage]" / "pipegen at 10%, 20%, 30%..."
   • "funnel breakdown", "stage counts", "pipeline funnel"
   • "deals created in Q1", "10% created", "20% created"
-  • "conversion from X% to Y%", "funnel conversion rate"
+  • "conversion from X% to Y%", "funnel conversion rate" — where BOTH
+    X and Y are stage percentages (e.g. "10% to 20%", "20% to 60%")
   • "deals by region/source/industry at each stage"
   KEY: A deal is counted at stage N if it has EVER reached N or beyond.
        FY/quarter is ALWAYS anchored to became_10_deal_date (pipeline entry point),
        regardless of which stage is being counted. This is the cohort definition
        used in Looker. Stage counting uses cumulative OR chains, NOT cohort exclusions.
   See §6 for full SQL pattern.
+
+  ⚠️  NOT PATTERN A — TRUE COHORT FUNNEL (see §8b instead):
+  If the destination is "Closed Won" / "CW" rather than another stage
+  percentage — e.g. "10% to closed won", "conversion funnel from 20% to CW",
+  "cohort starting at 30%" — this is a DIFFERENT pattern with a DIFFERENT
+  SQL shape (single WITH-cohort CTE, stage exclusions, sentinel anchor,
+  countDistinct(deal_id), GROUP BY deal_stage — NOT an OR-chain, NOT
+  IS NOT NULL). Call lookup_business_rule('cohort_funnel') to get the
+  exact template BEFORE writing SQL for these. Do not reuse the Pattern A
+  approach here — rules.py validates true cohort queries against the §8b
+  shape specifically, and Pattern A's OR-chain SQL will be rejected.
 
 PATTERN B — DEAL-LEVEL DETAIL / ACTIVE PIPELINE VIEW
   Use when the user asks:
