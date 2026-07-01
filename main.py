@@ -860,11 +860,26 @@ def _run_sql_generation_stage(
 
             if sql_violations:
                 cohort_violations = [v for v in sql_violations if "cohort" in v.lower() or "8b" in v.lower()]
+                cast_violations = [v for v in sql_violations if "target_table_float_cast" in v.lower() or "toFloat64OrZero" in v]
                 if cohort_violations:
                     query_result_text = (
                         "RULE VIOLATION — cohort funnel SQL rejected (§8b). NOT executed.\n\n"
                         "Violations:\n" + "\n".join(f"- {v}" for v in sql_violations)
-                        + "\n\n⚠️ Rewrite using the required single-CTE cohort skeleton and resubmit."
+                        + "\n\n⚠️ Before rewriting, call lookup_business_rule('cohort_funnel') to get "
+                        "the exact §8b template (sentinel anchor, single WITH-cohort CTE, "
+                        "countDistinct(deal_id), GROUP BY deal_stage). Do NOT reuse the Pattern A "
+                        "OR-chain approach or IS NOT NULL checks for this query — this is a true "
+                        "cohort exclusion query, not cumulative stage counting. Then resubmit."
+                    )
+                elif cast_violations:
+                    query_result_text = (
+                        "RULE VIOLATION — query rejected, NOT executed against the database:\n"
+                        + "\n".join(f"- {v}" for v in sql_violations)
+                        + "\n\n⚠️ Check EVERY target-table column referenced in this query, not just "
+                        "the one named above — a query often sums multiple target columns "
+                        "(e.g. amount_target_20 AND deals_target_20), and each one independently "
+                        "needs its own SUM(toFloat64OrZero(col)) wrapper. Rewrite the SQL to satisfy "
+                        "these rules, then call the tool again."
                     )
                 else:
                     query_result_text = (
