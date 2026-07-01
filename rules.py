@@ -601,7 +601,12 @@ RULES: List[Dict[str, Any]] = [
         "applies_when": lambda sql, intent: _is_pattern_c(sql, intent),
         "check": lambda sql, intent: (
             sql.strip().upper().startswith("WITH")
-            and sql.upper().count("CTE") + sql.upper().count("AS (") >= 2
+            # Count actual CTE definitions ("<name> AS (") tolerant of any
+            # whitespace/newlines between AS and the opening paren — the
+            # previous literal "AS (" substring count broke on the equally
+            # valid "AS\n(" formatting style, false-rejecting correctly
+            # structured two-CTE attainment queries.
+            and len(re.findall(r'\bAS\s*\(', sql, re.I)) >= 2
         ),
         "message": (
             "Attainment/target query must use independent CTEs for actuals and targets, "
@@ -852,6 +857,9 @@ def _strip_label_noise(text: str) -> str:
     return cleaned
 
 
+_CANONICAL_STAGES = {5.0, 10.0, 20.0, 30.0, 40.0, 60.0, 75.0}
+
+
 def extract_numbers(text: str) -> Set[float]:
     cleaned = _strip_label_noise(text)
     raw = _NUM_PATTERN.findall(cleaned)
@@ -863,6 +871,17 @@ def extract_numbers(text: str) -> Set[float]:
         except ValueError:
             continue
         if val in _YEAR_RANGE and '.' not in cleaned_tok:
+            continue
+        # Bare integer stage percentages ("20%", not "20.0%") are almost
+        # always a stage-name reference ("the 20% stage"), not a computed
+        # figure — every computed percentage in this app is emitted with
+        # 1 decimal place (round(...,1) per the rulebook), so an integer
+        # token reliably signals a label rather than a fact to verify.
+        if (
+            val in _CANONICAL_STAGES
+            and '.' not in cleaned_tok
+            and tok.rstrip().endswith('%')
+        ):
             continue
         out.add(round(val, 2))
     return out
@@ -880,6 +899,24 @@ def extract_numbers_from_rows(rows: List[dict]) -> Set[float]:
 
 def _relative_tolerance(value: float, base_tolerance: float = 0.5) -> float:
     return max(base_tolerance, abs(value) * 0.01)
+
+
+def _column_sums(rows: List[dict]) -> Dict[str, float]:
+    """
+    Per-column numeric sums. Lets the verifier recognize legitimate
+    aggregate totals ("combined pipeline across all regions is $X")
+    that are computed by the narrator by summing a visible column —
+    not looked up verbatim from any single cell.
+    """
+    sums: Dict[str, float] = {}
+    for row in rows:
+        for k, v in row.items():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            sums[k] = sums.get(k, 0.0) + fv
+    return sums
 
 
 def validate_summary_against_facts(
@@ -907,7 +944,33 @@ def validate_summary_against_facts(
                 continue
             ratio = a / b * 100
             derived.add(round(ratio, 1))
-            derived.add(round(ratio, 0))
+            # Growth / period-over-period change ("grew 23% QoQ"),
+            # ("down 12%") — (a - b) / b * 100, not just a straight ratio.
+            growth = (a - b) / b * 100
+            derived.add(round(growth, 1))
+
+    # Column-level aggregates: sums across the whole table (e.g. combined
+    # actual/target across all regions), plus $M/$K scaled versions, plus
+    # ratios and gaps BETWEEN different column sums (e.g. an overall
+    # attainment % computed from sum(actual)/sum(target), or an overall
+    # gap-to-target computed from sum(target) - sum(actual)).
+    col_sums = _column_sums(allowed_rows)
+    sum_values = list(col_sums.values())
+    for s in sum_values:
+        derived.add(round(s, 1))
+        derived.add(round(s / 1_000_000, 1))
+        derived.add(round(s / 1_000, 1))
+        derived.add(round(s / 1_000_000, 2))
+
+    sum_nonzero = [s for s in sum_values if s != 0]
+    for a in sum_nonzero:
+        for b in sum_nonzero:
+            if a == b:
+                continue
+            derived.add(round(a / b * 100, 1))
+            derived.add(round(abs(a - b), 1))
+            derived.add(round(abs(a - b) / 1_000_000, 1))
+            derived.add(round(abs(a - b) / 1_000, 1))
 
     violations = []
     for c in claimed:
