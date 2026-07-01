@@ -158,7 +158,7 @@ PATTERN A — CUMULATIVE PIPEGEN / FUNNEL STAGE COUNTS
     X and Y are stage percentages (e.g. "10% to 20%", "20% to 60%")
   • "deals by region/source/industry at each stage"
   KEY: A deal is counted at stage N if it has EVER reached N or beyond.
-       FY/quarter is ALWAYS anchored to became_10_deal_date (pipeline entry point),
+       FY/quarter is anchored to became_stage_deal_date based on user asked stage,
        regardless of which stage is being counted. This is the cohort definition
        used in Looker. Stage counting uses cumulative OR chains, NOT cohort exclusions.
   See §6 for full SQL pattern.
