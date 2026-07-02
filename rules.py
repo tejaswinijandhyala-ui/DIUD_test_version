@@ -81,12 +81,18 @@ RULEBOOK: Dict[str, str] = {
     "mql": """
 §11 MQL CALCULATION RULES — MANDATORY
 When computing MQL actuals from hs_analytics.contacts FINAL, ALL THREE filters
-below are mandatory. Missing any one produces inflated counts.
+below are mandatory. Missing any one produces inflated or deflated counts.
 
-1. lifecycle_stage = 'marketingqualifiedlead'
-   AND date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
+1. date_entered_marketing_qualified_lead_lifecycle_stage_pipeline >= <fy_start>
+   This is the anchor — "this contact became an MQL on this date". Do NOT
+   also require lifecycle_stage = 'marketingqualifiedlead': that would
+   silently exclude every MQL who has since progressed further down the
+   funnel (became an opportunity, became a customer), since their CURRENT
+   lifecycle_stage would no longer literally say 'marketingqualifiedlead'
+   even though they genuinely were an MQL.
 2. company_priority IN ('P1','P2','P3','P4','P5','P6','P7')
-3. lead_status != 'Bad Data'
+3. lead_status != 'Bad Data' (or lead_status NOT IN ('Bad Data') — either
+   syntax is acceptable)
 
 MQL TARGET PATTERN — always filter by exact quarter, never divide annual by 4:
   SELECT region, original_source, SUM(toFloat64OrZero(mql_target)) AS mql_tgt
@@ -473,8 +479,15 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
     # Metrics
     # ------------------------------------------------------------------
 
-    if re.search(r'\bMQL\b', msg, re.I):
+    if re.search(r'\bMQLs?\b', msg, re.I):
         intent["metric"] = "mql"
+        # Distinguish "how many MQLs" (no deal join needed) from "which
+        # deals/pipeline came FROM MQLs" (requires the gs_DealContactAssociation
+        # join pattern — see mql_deal_association_table / mql_deal_left_join
+        # rules below). A plain MQL-count question shouldn't be required to
+        # join to deals at all.
+        if re.search(r'\b(deal|deals|pipeline|opportunit\w*|convert\w*|funnel)\b', msg, re.I):
+            intent["mql_needs_deal_join"] = True
 
     if re.search(
         r'\b(attainment|quota|coverage|vs\.?\s*target|gap\s*to\s*target)\b',
@@ -841,16 +854,18 @@ RULES: List[Dict[str, Any]] = [
     # -------------------------------------------------------------------------
     # §11 MQL filters
     # -------------------------------------------------------------------------
-    {
-        "id": "mql_lifecycle_stage_filter",
-        "section": "§11 MQL filter 1 — lifecycle_stage = 'marketingqualifiedlead'",
-        "applies_when": lambda sql, intent: intent.get("metric") == "mql",
-        "check": lambda sql, intent: bool(re.search(r"lifecycle_stage\s*=\s*'marketingqualifiedlead'", sql, re.I)),
-        "message": "MQL query missing `lifecycle_stage = 'marketingqualifiedlead'` filter.",
-    },
+    # NOTE: There is deliberately NO rule requiring
+    # `lifecycle_stage = 'marketingqualifiedlead'`. Real MQL queries anchor
+    # solely on date_entered_marketing_qualified_lead_lifecycle_stage_pipeline
+    # (i.e. "this contact became an MQL on this date"), not on their CURRENT
+    # lifecycle_stage. Requiring lifecycle_stage = 'marketingqualifiedlead'
+    # would silently exclude every MQL who has since progressed further down
+    # the funnel (became an opportunity, became a customer) — since their
+    # current lifecycle_stage would no longer literally say
+    # 'marketingqualifiedlead' even though they genuinely were one.
     {
         "id": "mql_date_entered_filter",
-        "section": "§11 MQL filter 1b — date_entered_... IS NOT NULL",
+        "section": "§11 MQL filter 1 — date_entered_... anchor",
         "applies_when": lambda sql, intent: intent.get("metric") == "mql",
         "check": lambda sql, intent: "date_entered_marketing_qualified_lead_lifecycle_stage_pipeline" in sql,
         "message": "MQL query missing `date_entered_marketing_qualified_lead_lifecycle_stage_pipeline` filter.",
@@ -864,10 +879,13 @@ RULES: List[Dict[str, Any]] = [
     },
     {
         "id": "mql_bad_data_filter",
-        "section": "§11 MQL filter 3 — lead_status != 'Bad Data'",
+        "section": "§11 MQL filter 3 — excludes 'Bad Data' lead status",
         "applies_when": lambda sql, intent: intent.get("metric") == "mql",
-        "check": lambda sql, intent: bool(re.search(r"lead_status\s*!=\s*'Bad Data'", sql, re.I)),
-        "message": "MQL query missing `lead_status != 'Bad Data'` filter.",
+        "check": lambda sql, intent: bool(
+            re.search(r"lead_status\s*!=\s*'Bad Data'", sql, re.I)
+            or re.search(r"lead_status\s+NOT\s+IN\s*\(\s*'Bad Data'", sql, re.I)
+        ),
+        "message": "MQL query missing a `lead_status != 'Bad Data'` or `lead_status NOT IN ('Bad Data')` filter.",
     },
     {
         "id": "mql_no_quarter_divide",
@@ -875,6 +893,57 @@ RULES: List[Dict[str, Any]] = [
         "applies_when": lambda sql, intent: intent.get("metric") == "mql",
         "check": lambda sql, intent: not bool(re.search(r"/\s*4\b", sql)),
         "message": "MQL target appears to be derived by dividing an annual target by 4 — filter the target table to the exact quarter instead.",
+    },
+
+    # -------------------------------------------------------------------------
+    # §11 MQL-to-deal linkage — only applies when the question asks about
+    # deals/pipeline coming FROM MQLs, not plain MQL counting. Enforces the
+    # gs_DealContactAssociation join pattern documented in §11 of the live
+    # prompt: real association table (not name/owner matching), a fiscal-
+    # window filter on the association itself, and LEFT JOIN (so MQLs with
+    # no matched deal aren't silently dropped from the count).
+    # -------------------------------------------------------------------------
+    {
+        "id": "mql_deal_association_table",
+        "section": "§11 MQL-to-deal linkage — must use gs_DealContactAssociation",
+        "applies_when": lambda sql, intent: intent.get("mql_needs_deal_join"),
+        "check": lambda sql, intent: "gs_DealContactAssociation" in sql,
+        "message": (
+            "Query links MQLs to deals but doesn't reference "
+            "kore_ai_hubspot.gs_DealContactAssociation — deals from MQLs must be "
+            "joined through this table, not inferred from company_name, owner, "
+            "or any other matching field."
+        ),
+    },
+    {
+        "id": "mql_deal_association_date_window",
+        "section": "§11 MQL-to-deal linkage — association must be date-windowed",
+        "applies_when": lambda sql, intent: (
+            intent.get("mql_needs_deal_join") and "gs_DealContactAssociation" in sql
+        ),
+        "check": lambda sql, intent: bool(re.search(r"createdate\s*>=", sql, re.I)),
+        "message": (
+            "gs_DealContactAssociation is referenced but not filtered by "
+            "createdate — without a fiscal-window filter on the association "
+            "itself, stale associations from outside the requested period can "
+            "be included."
+        ),
+    },
+    {
+        "id": "mql_deal_left_join",
+        "section": "§11 MQL-to-deal linkage — must LEFT JOIN, not INNER JOIN",
+        "applies_when": lambda sql, intent: (
+            intent.get("mql_needs_deal_join") and "gs_DealContactAssociation" in sql
+        ),
+        "check": lambda sql, intent: bool(re.search(
+            r'\bLEFT\s+JOIN\b(?:(?!\bJOIN\b).){0,300}?gs_DealContactAssociation', sql, re.I | re.S
+        )),
+        "message": (
+            "MQL-to-deal query must use LEFT JOIN against the deal association — "
+            "an INNER JOIN (or bare JOIN, which defaults to INNER) silently drops "
+            "MQLs with no matched deal instead of counting them as "
+            "'MQL without Deals'."
+        ),
     },
 ]
 
