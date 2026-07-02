@@ -14,7 +14,7 @@ from rules import (
     validate_summary_against_facts,
 )
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Literal, Optional, Callable
+from typing import Dict, List, Literal, Optional, Callable, Tuple
 from charts import build_chart_html, reply_already_has_chart
 
 import httpx
@@ -109,6 +109,65 @@ def _cleanup_sessions():
     if expired:
         print(f"🧹 Cleaned {len(expired)} expired sessions.")
     threading.Timer(3600, _cleanup_sessions).start()
+
+
+_ALLOWED_CHART_TYPES = {"funnel", "attainment", "donut", "bar_h"}
+_MAX_INSIGHT_NOTE_LEN = 160
+_MAX_TITLE_LEN = 80
+
+
+def _validate_chart_spec(spec: dict, columns: List[str]) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Validates a chart spec Claude proposed via choose_chart_spec against the
+    ACTUAL columns of the result it's describing. Returns (clean_spec, error).
+    clean_spec is None if invalid — callers must fall back to auto-detected
+    charting rather than trust anything unvalidated. This is the only gate
+    between "Claude describes a chart" and "a chart gets rendered" — nothing
+    here is allowed to affect actual chart NUMBERS, only which columns/type
+    are used, so there is no path for Claude to inject a wrong figure.
+    """
+    if not isinstance(spec, dict):
+        return None, "spec is not an object"
+
+    chart_type = spec.get("chart_type")
+    if chart_type not in _ALLOWED_CHART_TYPES:
+        return None, f"chart_type '{chart_type}' is not one of {sorted(_ALLOWED_CHART_TYPES)}"
+
+    label_col = spec.get("label_column")
+    if label_col is not None and label_col not in columns:
+        return None, f"label_column '{label_col}' is not a real column in this result: {columns}"
+
+    value_col = spec.get("value_column")
+    if value_col is not None and value_col not in columns:
+        return None, f"value_column '{value_col}' is not a real column in this result: {columns}"
+
+    exclude_values = spec.get("exclude_values")
+    if exclude_values is not None:
+        if not isinstance(exclude_values, list) or not all(isinstance(v, str) for v in exclude_values):
+            return None, "exclude_values must be a list of strings"
+        exclude_values = exclude_values[:20]
+
+    title = spec.get("title")
+    if title is not None:
+        if not isinstance(title, str):
+            return None, "title must be a string"
+        title = title[:_MAX_TITLE_LEN]
+
+    insight_note = spec.get("insight_note")
+    if insight_note is not None:
+        if not isinstance(insight_note, str):
+            return None, "insight_note must be a string"
+        insight_note = insight_note[:_MAX_INSIGHT_NOTE_LEN]
+
+    clean = {
+        "chart_type": chart_type,
+        "label_column": label_col,
+        "value_column": value_col,
+        "exclude_values": exclude_values,
+        "title": title,
+        "insight_note": insight_note,
+    }
+    return clean, None
 
 _RULE_AUDIT_LOG: List[dict] = []   # most-recent-first, capped
 
@@ -1796,6 +1855,58 @@ _COMPUTE_METRIC_TOOL = {
     },
 }
 
+_CHART_SPEC_TOOL = {
+    "name": "choose_chart_spec",
+    "description": (
+        "Call this AFTER query_clickhouse returns a result you're about to summarize, "
+        "if a chart would help the user (funnel/stage breakdowns, actual-vs-target, "
+        "top-N comparisons, breakdowns by region/source/competitor/etc). Do NOT call "
+        "this for raw deal lists or single-number answers. "
+        "You choose WHAT to chart — the chart type and which real columns to use. "
+        "You do NOT choose any numbers, percentages, or pixel widths — those are always "
+        "computed independently from the actual query result, never from what you write here. "
+        "label_column and value_column MUST be exact column names from the query result you "
+        "just got back — do not invent or rename columns."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "chart_type": {
+                "type": "string",
+                "enum": ["funnel", "attainment", "donut", "bar_h"],
+                "description": (
+                    "funnel: cumulative stage counts (Pattern A). "
+                    "attainment: actual vs target columns present (Pattern C). "
+                    "donut: a breakdown into 6 or fewer categories. "
+                    "bar_h: a ranked breakdown into 7+ categories, or a top-N comparison."
+                ),
+            },
+            "label_column": {
+                "type": "string",
+                "description": "Exact column name to use as category labels (ignored for funnel/attainment, which use fixed columns).",
+            },
+            "value_column": {
+                "type": "string",
+                "description": "Exact column name to use as the chart values (ignored for funnel/attainment).",
+            },
+            "exclude_values": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Category values to exclude from the chart scale (e.g. 'N/A', 'Unknown') so real categories stay readable. Excluded rows are footnoted, not dropped from the underlying data.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Short chart title, e.g. 'Lost Deals by Competitor'.",
+            },
+            "insight_note": {
+                "type": "string",
+                "description": "Optional one-line callout under the chart, e.g. 'Microsoft is our top competitive loss this quarter'. Must be a fact already visible in the query result — do not introduce new numbers here.",
+            },
+        },
+        "required": ["chart_type"],
+    },
+}
+
 # =============================================================================
 # Pydantic models
 # =============================================================================
@@ -1836,13 +1947,17 @@ def _extract_text(content_blocks) -> str:
 def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                  session_id: Optional[str] = None, model: str = "sonnet") -> str:
 
-    # Carries the chart HTML forward from the exact moment a query result is
-    # validated, so chart generation is tied to that specific validated
-    # result rather than re-fetched later from the shared session store
-    # (which can hold a different turn's data). Set only where the result
-    # is actually validated below; used verbatim by DETERMINISTIC CHART
-    # INJECTION at the end — no re-fetch, no staleness heuristic needed.
-    current_turn_chart_html: Optional[str] = None
+    # Carries the validated query result, and Claude's optional chart spec
+    # (from choose_chart_spec), forward from wherever they're produced in
+    # the tool loop to the single point where the chart actually gets built
+    # (DETERMINISTIC CHART INJECTION at the end of this function). Tied to
+    # this turn only — never re-fetched from the shared session store, so
+    # there's no possibility of a stale, cross-turn chart. Claude's spec
+    # only ever selects chart type/columns/title — every number rendered is
+    # still computed from latest_validated_result.rows in charts.py, never
+    # from anything Claude wrote.
+    latest_validated_result: Optional["QueryResult"] = None
+    pending_chart_spec: Optional[dict] = None
 
     selected_model = ALLOWED_MODELS.get(model, ALLOWED_MODELS["sonnet"])
 
@@ -1874,7 +1989,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
         model=selected_model,
         system=_SYSTEM_PROMPT,
         messages=safe_messages,
-        tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL],
+        tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL, _CHART_SPEC_TOOL],
         temperature=0,
         max_tokens=max_tokens,
     )
@@ -1912,6 +2027,40 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                     "type":        "tool_result",
                     "tool_use_id": tool_block.id,
                     "content":     compute_verified_metric(metric_name, session_id),
+                    "is_error":    False,
+                })
+                continue
+
+            # --- chart spec branch -----------------------------------
+            # Claude picks WHAT to chart (type + real column names); every
+            # number in the rendered chart still comes from Python, from
+            # latest_validated_result.rows — see _validate_chart_spec and
+            # charts.build_chart_html.
+            if tool_block.name == "choose_chart_spec":
+                if latest_validated_result is None:
+                    tool_result_blocks.append({
+                        "type":        "tool_result",
+                        "tool_use_id": tool_block.id,
+                        "content":     "No validated query result yet this turn — call query_clickhouse first.",
+                        "is_error":    True,
+                    })
+                    continue
+                clean_spec, spec_error = _validate_chart_spec(
+                    tool_block.input, latest_validated_result.columns
+                )
+                if spec_error:
+                    tool_result_blocks.append({
+                        "type":        "tool_result",
+                        "tool_use_id": tool_block.id,
+                        "content":     f"Chart spec rejected: {spec_error}. Real columns available: {latest_validated_result.columns}",
+                        "is_error":    True,
+                    })
+                    continue
+                pending_chart_spec = clean_spec
+                tool_result_blocks.append({
+                    "type":        "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "content":     "Chart spec accepted.",
                     "is_error":    False,
                 })
                 continue
@@ -2000,18 +2149,16 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                                 f"do not recompute]: {headline}"
                             )
 
-                        # --- chart generation, tied to this exact validated
-                        # result — happens right alongside the headline/
-                        # summary prep above, not as a later disconnected
-                        # step. Overwrites on each validated query within
-                        # this turn, so it ends up holding the chart for the
-                        # LAST validated result of this turn.
+                        # --- track this as the turn's latest validated
+                        # result. The actual chart HTML is built once,
+                        # later, at DETERMINISTIC CHART INJECTION — by then
+                        # Claude may also have called choose_chart_spec
+                        # (possibly in this same round, possibly next
+                        # round) to pick chart type/columns/title. If it
+                        # never does, the fallback there uses the same
+                        # auto-detection this used to do inline.
                         if this_result and this_result.rows:
-                            candidate_chart = build_chart_html(
-                                this_result.columns, this_result.rows, this_result.filters_applied
-                            )
-                            if candidate_chart:
-                                current_turn_chart_html = candidate_chart
+                            latest_validated_result = this_result
 
             if is_error:
                 last_error = query_result
@@ -2062,7 +2209,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                 model=selected_model,
                 system=_SYSTEM_PROMPT,
                 messages=continue_messages,
-                tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL],
+                tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL, _CHART_SPEC_TOOL],
                 temperature=0,
                 max_tokens=max_tokens,
             )
@@ -2088,6 +2235,28 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                             "is_error": False,
                         })
                         continue
+                    if tb.name == "choose_chart_spec":
+                        if latest_validated_result is None:
+                            tool_result_blocks.append({
+                                "type": "tool_result", "tool_use_id": tb.id,
+                                "content": "No validated query result yet this turn — call query_clickhouse first.",
+                                "is_error": True,
+                            })
+                            continue
+                        clean_spec, spec_error = _validate_chart_spec(tb.input, latest_validated_result.columns)
+                        if spec_error:
+                            tool_result_blocks.append({
+                                "type": "tool_result", "tool_use_id": tb.id,
+                                "content": f"Chart spec rejected: {spec_error}. Real columns available: {latest_validated_result.columns}",
+                                "is_error": True,
+                            })
+                            continue
+                        pending_chart_spec = clean_spec
+                        tool_result_blocks.append({
+                            "type": "tool_result", "tool_use_id": tb.id,
+                            "content": "Chart spec accepted.", "is_error": False,
+                        })
+                        continue
                     sql = tb.input.get("sql", "")
                     violations = validate_sql_against_rules(sql, original_user_message)
                     _log_rule_audit(session_id, sql, violations, "pre_execute", original_user_message)
@@ -2099,15 +2268,12 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                         is_err = any(result.startswith(p) for p in
                             ["DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"])
                         if not is_err and session_id:
-                            # Same rule as the main loop: tie the chart to
-                            # this exact query's result, not a later re-fetch.
+                            # Same rule as the main loop: track this exact
+                            # query's result — chart HTML is built once,
+                            # later, at DETERMINISTIC CHART INJECTION.
                             this_result = _get_result(f"{session_id}:latest")
                             if this_result and this_result.rows:
-                                candidate_chart = build_chart_html(
-                                    this_result.columns, this_result.rows, this_result.filters_applied
-                                )
-                                if candidate_chart:
-                                    current_turn_chart_html = candidate_chart
+                                latest_validated_result = this_result
                     tool_result_blocks.append({
                         "type": "tool_result", "tool_use_id": tb.id,
                         "content": result, "is_error": is_err,
@@ -2119,7 +2285,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                 continue_response = _ai_client.messages.create(
                     model=selected_model, system=_SYSTEM_PROMPT,
                     messages=continue_messages,
-                    tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL],
+                    tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL, _CHART_SPEC_TOOL],
                     temperature=0, max_tokens=max_tokens,
                 )
             completed = _extract_text(continue_response.content)
@@ -2182,14 +2348,26 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                          "could you rephrase")
     reply_looks_failed = any(m in reply.lower() for m in _FAILURE_MARKERS)
 
-    # current_turn_chart_html was built earlier, at the exact moment this
-    # turn's query result was validated (see the tool loop above) — no
-    # re-fetch from the session store here, so there's nothing to get out
-    # of sync with. If no query in this turn produced a chart-worthy,
-    # validated result, there is simply nothing to attach.
-    if (reply and current_turn_chart_html and not reply_already_has_chart(reply)
+    # Chart is built HERE, once, from latest_validated_result (this turn's
+    # own data — never re-fetched from the shared session store) and
+    # pending_chart_spec (Claude's optional choose_chart_spec call, already
+    # validated against this exact result's real columns when it was
+    # accepted). If Claude never called choose_chart_spec, spec is None and
+    # build_chart_html falls back to the original auto-detection — same
+    # behavior as before this feature existed. Either way, every number in
+    # the output comes from latest_validated_result.rows, computed in
+    # charts.py — Claude's spec can only ever pick type/columns/title.
+    if (reply and latest_validated_result and latest_validated_result.rows
+            and not reply_already_has_chart(reply)
             and not reply_looks_unfinished and not reply_looks_failed):
-        reply = reply.rstrip() + "\n\n" + current_turn_chart_html
+        chart_html = build_chart_html(
+            latest_validated_result.columns,
+            latest_validated_result.rows,
+            latest_validated_result.filters_applied,
+            spec=pending_chart_spec,
+        )
+        if chart_html:
+            reply = chart_html + "\n\n" + reply.lstrip()
 
     if not reply:
         if last_error and last_error_is_rule_violation:
