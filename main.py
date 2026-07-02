@@ -377,6 +377,20 @@ This applies to ALL of these phrasings (and similar ones):
 The export panel is fully functional — always emit __EXPORT_INTENT__ for any export request.
 Do NOT re-run the query. The export panel handles format selection and download.
 
+CHART SPEC RULE:
+After query_clickhouse returns a result you're about to summarize, if a
+chart would genuinely help (funnel/stage breakdowns, actual-vs-target,
+top-N comparisons, breakdowns by region/source/competitor/etc — NOT raw
+deal lists or single-number answers), call choose_chart_spec once, using
+the EXACT column names from the result you just got back. You are only
+choosing chart type, which columns, a title, and an optional one-line
+insight already visible in the data — you are NOT computing any numbers,
+percentages, or chart proportions yourself; those are always calculated
+independently from the real query result. If a category is unlogged/blank
+(e.g. "N/A") and would dominate the scale, list it in exclude_values
+rather than silently ignoring the issue. Do not call this tool for deal
+lists or single-value answers — there's nothing to chart.
+
 ═══════════════════════════════════════════════════════════════
 §3  SCHEMA, DUPLICATE EXCLUSION, AND MANDATORY BASE FILTERS
 ═══════════════════════════════════════════════════════════════
@@ -1520,6 +1534,81 @@ LIVE DATABASE SCHEMA (auto-injected below)
 
 _SYSTEM_PROMPT = _build_system_prompt()
 
+
+def _cached_system_prompt() -> list:
+    """
+    Wraps the (unchanged) system prompt text in Anthropic's prompt-caching
+    format. Nothing about the prompt content changes — same rules, same
+    text, same behavior — this only tells the API "this block is reused
+    identically across calls, cache it" instead of re-processing the full
+    ~15k-token prompt at full cost/latency on every single API call.
+
+    Reads the CURRENT value of the _SYSTEM_PROMPT global each time it's
+    called (not a stale copy), so it stays correct after refresh_schema()
+    or on_startup() reassign it following a schema change.
+
+    Every call site that previously used `system=_SYSTEM_PROMPT` should use
+    `system=_cached_system_prompt()` instead — same content, cached.
+    """
+    return [
+        {
+            "type": "text",
+            "text": _SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+# =============================================================================
+# Data Normalizer — Stage 2 of the target architecture.
+#
+# Takes the raw JSON payload from the ClickHouse proxy and turns it into the
+# one normalized shape every downstream consumer relies on: (columns, rows),
+# where rows is always List[dict]. This used to be inline logic buried
+# inside run_clickhouse_query() (steps: figure out if the proxy returned a
+# list or a dict, find the actual row array under whatever key it used,
+# reconcile column names from a separate columns/meta field if rows came
+# back as bare arrays instead of dicts). Extracted here so it's independently
+# testable and so the shape guarantee it provides — dicts, real column
+# names, matching every row — is explicit rather than implicit.
+#
+# Both Chart Builder (charts.py:build_chart_html) and everything downstream
+# of Fact Binder consume the QueryResult this produces — there is no
+# separate normalization path for either.
+# =============================================================================
+def normalize_query_response(payload) -> Tuple[Optional[List[str]], Optional[List[dict]], Optional[str]]:
+    """
+    Returns (columns, rows, error). Exactly one of (columns, rows) or
+    error will be set. `error` is a human-readable string suitable for
+    returning directly as the tool_result when normalization isn't
+    possible (e.g. the proxy returned something with no row data).
+    """
+    if isinstance(payload, list):
+        rows = payload
+        api_columns = None
+    elif isinstance(payload, dict):
+        rows = payload.get("data") or payload.get("rows") or payload.get("result") or payload.get("results")
+        api_columns = payload.get("columns") or payload.get("meta") or payload.get("column_names")
+        if rows is None:
+            return None, None, json.dumps(payload, indent=2, default=str)[:3000]
+    else:
+        return None, None, f"Unexpected response type: {type(payload)}"
+
+    if not rows:
+        return None, None, "Query returned 0 rows."
+
+    if isinstance(rows[0], dict):
+        columns = list(rows[0].keys())
+        norm_rows = rows
+    else:
+        if api_columns and len(api_columns) == len(rows[0]):
+            columns = [c["name"] if isinstance(c, dict) else c for c in api_columns]
+        else:
+            columns = [f"col_{i}" for i in range(len(rows[0]))]
+        norm_rows = [dict(zip(columns, r)) for r in rows]
+
+    return columns, norm_rows, None
+
+
 # =============================================================================
 # ClickHouse query runner
 # =============================================================================
@@ -1564,28 +1653,9 @@ def run_clickhouse_query(sql: str, session_id: Optional[str] = None) -> str:
 
         payload = resp.json()
 
-        if isinstance(payload, list):
-            rows = payload
-        elif isinstance(payload, dict):
-            rows = payload.get("data") or payload.get("rows") or payload.get("result") or payload.get("results")
-            api_columns = payload.get("columns") or payload.get("meta") or payload.get("column_names")
-            if rows is None:
-                return json.dumps(payload, indent=2, default=str)[:3000]
-        else:
-            return f"Unexpected response type: {type(payload)}"
-
-        if not rows:
-            return "Query returned 0 rows."
-
-        if isinstance(rows[0], dict):
-            columns = list(rows[0].keys())
-            norm_rows = rows
-        else:
-            if api_columns and len(api_columns) == len(rows[0]):
-                columns = [c["name"] if isinstance(c, dict) else c for c in api_columns]
-            else:
-                columns = [f"col_{i}" for i in range(len(rows[0]))]
-            norm_rows = [dict(zip(columns, r)) for r in rows]
+        columns, norm_rows, norm_error = normalize_query_response(payload)
+        if norm_error:
+            return norm_error
 
         total_rows = len(norm_rows)
 
@@ -1650,10 +1720,26 @@ def _extract_filters_from_sql(sql: str) -> str:
     if "PIPELINE = 'DEFAULT'" in sql_upper:
         filters.append("Pipeline: default")
     
-    # Dynamically detect any cohort stage (5, 10, 20, 30, 40, 60, 75)
-    cohort_stages = sorted(set(re.findall(r'BECAME_(\d+)_DEAL_DATE', sql_upper)), key=int)
-    for stage in cohort_stages:
-        filters.append(f"Cohort: {stage}% qualified deals")
+    # A genuine cohort query anchors on exactly ONE became_X_deal_date
+    # stage plus a deal_stage NOT IN (...) exclusion of earlier stages.
+    # A normal Pattern A funnel query legitimately references ALL 7
+    # became_X_deal_date columns as part of ordinary cumulative OR-chain
+    # stage counting — that is NOT cohort filtering, and labeling every
+    # one of those 7 columns "Cohort: N% qualified deals" (as the old
+    # code did) produced a garbled, factually wrong subtitle like
+    # "Cohort: 5% qualified deals; Cohort: 10% qualified deals; ..." on
+    # every ordinary funnel chart.
+    referenced_stages = sorted(set(re.findall(r'BECAME_(\d+)_DEAL_DATE', sql_upper)), key=int)
+    if len(referenced_stages) == 1 and re.search(r'DEAL_STAGE\s+NOT\s+IN', sql_upper):
+        filters.append(f"Cohort: {referenced_stages[0]}% starting stage")
+    elif referenced_stages:
+        # Report the TRUE FY anchor (the column actually used inside
+        # toYear(...)), not just "however many stage columns happen to be
+        # referenced" — matches the same anchor-detection logic used by
+        # rules.py's pattern_a_stage_anchor / pattern_c_stage_anchor checks.
+        anchor_match = re.search(r'TOYEAR\(\s*BECAME_(\d+)_DEAL_DATE\s*\)', sql_upper)
+        anchor_stage = anchor_match.group(1) if anchor_match else referenced_stages[0]
+        filters.append(f"FY anchor stage: {anchor_stage}%")
     
     if "CLOSE_DATE" in sql_upper and "2026-04-01" in sql:
         filters.append("FY27 active pipeline")
@@ -1739,7 +1825,13 @@ _METRIC_FNS: Dict[str, Callable[[List[dict]], float]] = {
 
 
 def compute_verified_metric(metric_name: str, session_id: Optional[str]) -> str:
-    stored = _get_result(session_id) if session_id else None
+    # This metric must be computed from the query Claude just ran THIS
+    # turn, not whichever past query in the session happened to return
+    # the most rows (the old largest-wins cache).
+    stored = (
+        (_get_result(f"{session_id}:latest") or _get_result(session_id))
+        if session_id else None
+    )
     if not stored or not stored.rows:
         return "ERROR: No stored query result for this session — run a query first."
     fn = _METRIC_FNS.get(metric_name)
@@ -1944,6 +2036,97 @@ def _extract_text(content_blocks) -> str:
     ).strip()
 
 
+# =============================================================================
+# Response Builder — Stage 3 of the target architecture.
+#
+# Takes Claude's already fact-checked reply text, this turn's validated
+# query result (if any), and Claude's optional chart spec, and produces the
+# final string sent to the browser. Two jobs, kept explicit and separate
+# from the tool-loop orchestration in _call_claude():
+#   1. Attach a chart above the reply — but only when there's real,
+#      validated data behind it, and only when the reply isn't itself a
+#      failure/unfinished message (a chart glued under an apology is worse
+#      than no chart).
+#   2. If Claude never produced any text at all (tool loop exhausted its
+#      round budget without a final answer), synthesize a clean,
+#      user-facing fallback message — distinguishing a pre-execution rule
+#      rejection (not a database error) from an actual DB/timeout failure,
+#      so internal validator text never leaks to the end user verbatim.
+# =============================================================================
+def build_final_response(
+    reply: str,
+    latest_validated_result: Optional["QueryResult"],
+    pending_chart_spec: Optional[dict],
+    last_error: Optional[str],
+    last_error_is_rule_violation: bool,
+    session_id: Optional[str] = None,
+) -> str:
+    _INVESTIGATION_MARKERS = ("let me check", "let me look", "let me verify",
+                               "i'll check", "i'll look", "checking what",
+                               "let me fetch", "let me re-run", "let me query")
+    reply_looks_unfinished = (
+        any(m in reply.lower() for m in _INVESTIGATION_MARKERS)
+        and "filters applied" not in reply.lower()
+    )
+    # Don't attach a chart to a reply that's actually reporting a failure —
+    # e.g. the rule-violation / DB-error fallback text, or an apology that
+    # slipped through with no real data behind it.
+    _FAILURE_MARKERS = ("couldn't complete this", "wasn't able to", "rule violation",
+                         "database error", "i wasn't able to build a query",
+                         "could you rephrase")
+    reply_looks_failed = any(m in reply.lower() for m in _FAILURE_MARKERS)
+
+    # Chart is built HERE, once, from latest_validated_result (this turn's
+    # own data — never re-fetched from the shared session store) and
+    # pending_chart_spec (Claude's optional choose_chart_spec call, already
+    # validated against this exact result's real columns when it was
+    # accepted). If Claude never called choose_chart_spec, spec is None and
+    # build_chart_html falls back to the original auto-detection — same
+    # behavior as before this feature existed. Either way, every number in
+    # the output comes from latest_validated_result.rows, computed in
+    # charts.py — Claude's spec can only ever pick type/columns/title.
+    if (reply and latest_validated_result and latest_validated_result.rows
+            and not reply_already_has_chart(reply)
+            and not reply_looks_unfinished and not reply_looks_failed):
+        chart_html = build_chart_html(
+            latest_validated_result.columns,
+            latest_validated_result.rows,
+            latest_validated_result.filters_applied,
+            spec=pending_chart_spec,
+        )
+        if chart_html:
+            reply = chart_html + "\n\n" + reply.lstrip()
+
+    if not reply:
+        if last_error and last_error_is_rule_violation:
+            # This was rejected by our own SQL guardrails before ever
+            # reaching the database — it is NOT a database error, and the
+            # internal violation text (fed to the model to self-correct)
+            # is not meant for the end user. Log the full detail
+            # server-side and show a clean, honest message instead.
+            print(f"[RULE-VIOLATION-EXHAUSTED] session={session_id} last_error={last_error}")
+            reply = (
+                "⚠️ I wasn't able to build a query that satisfies all of our data-quality "
+                "rules for this question after several attempts. This is usually a sign the "
+                "question needs to be broken down or phrased more specifically (e.g. naming "
+                "a single stage or metric). Could you try rephrasing, or check **/debug/db** "
+                "if this keeps happening?"
+            )
+        elif last_error:
+            reply = (
+                "⚠️ I couldn't complete this query. The last database error was:\n\n"
+                f"`{last_error[:400]}`\n\n"
+                "Could you rephrase the question, or check **/debug/db** if this persists?"
+            )
+        else:
+            reply = (
+                "⚠️ I wasn't able to finish answering this in time — it may need "
+                "a more specific or simpler question. Could you try rephrasing it "
+                "(e.g. break it into smaller asks)?"
+            )
+    return reply
+
+
 def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                  session_id: Optional[str] = None, model: str = "sonnet") -> str:
 
@@ -1987,7 +2170,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
 
     response = _ai_client.messages.create(
         model=selected_model,
-        system=_SYSTEM_PROMPT,
+        system=_cached_system_prompt(),
         messages=safe_messages,
         tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL, _CHART_SPEC_TOOL],
         temperature=0,
@@ -2178,7 +2361,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
         is_last_round = (round_num == MAX_ROUNDS - 1)
         response = _ai_client.messages.create(
             model=selected_model,
-            system=_SYSTEM_PROMPT,
+            system=_cached_system_prompt(),
             messages=safe_messages,
             tools=[] if is_last_round else [_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL],
             temperature=0,
@@ -2207,7 +2390,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
         try:
             continue_response = _ai_client.messages.create(
                 model=selected_model,
-                system=_SYSTEM_PROMPT,
+                system=_cached_system_prompt(),
                 messages=continue_messages,
                 tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL, _CHART_SPEC_TOOL],
                 temperature=0,
@@ -2283,7 +2466,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                     {"role": "user", "content": tool_result_blocks},
                 ]
                 continue_response = _ai_client.messages.create(
-                    model=selected_model, system=_SYSTEM_PROMPT,
+                    model=selected_model, system=_cached_system_prompt(),
                     messages=continue_messages,
                     tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL, _CHART_SPEC_TOOL],
                     temperature=0, max_tokens=max_tokens,
@@ -2322,7 +2505,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                 try:
                     retry_response = _ai_client.messages.create(
                         model=selected_model,
-                        system=_SYSTEM_PROMPT,
+                        system=_cached_system_prompt(),
                         messages=retry_messages,
                         tools=[],
                         temperature=0,
@@ -2332,71 +2515,11 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                 except Exception as e:
                     print(f"⚠️ Fact-binding regeneration failed: {e}")
                     # keep original reply rather than losing the response entirely
-# ── DETERMINISTIC CHART INJECTION ────────────────────────────────
-    _INVESTIGATION_MARKERS = ("let me check", "let me look", "let me verify",
-                               "i'll check", "i'll look", "checking what",
-                               "let me fetch", "let me re-run", "let me query")
-    reply_looks_unfinished = (
-        any(m in reply.lower() for m in _INVESTIGATION_MARKERS)
-        and "filters applied" not in reply.lower()
+# ── RESPONSE BUILDER ──────────────────────────────────────────────
+    return build_final_response(
+        reply, latest_validated_result, pending_chart_spec,
+        last_error, last_error_is_rule_violation, session_id,
     )
-    # Don't attach a chart to a reply that's actually reporting a failure —
-    # e.g. the rule-violation / DB-error fallback text, or an apology that
-    # slipped through with no real data behind it.
-    _FAILURE_MARKERS = ("couldn't complete this", "wasn't able to", "rule violation",
-                         "database error", "i wasn't able to build a query",
-                         "could you rephrase")
-    reply_looks_failed = any(m in reply.lower() for m in _FAILURE_MARKERS)
-
-    # Chart is built HERE, once, from latest_validated_result (this turn's
-    # own data — never re-fetched from the shared session store) and
-    # pending_chart_spec (Claude's optional choose_chart_spec call, already
-    # validated against this exact result's real columns when it was
-    # accepted). If Claude never called choose_chart_spec, spec is None and
-    # build_chart_html falls back to the original auto-detection — same
-    # behavior as before this feature existed. Either way, every number in
-    # the output comes from latest_validated_result.rows, computed in
-    # charts.py — Claude's spec can only ever pick type/columns/title.
-    if (reply and latest_validated_result and latest_validated_result.rows
-            and not reply_already_has_chart(reply)
-            and not reply_looks_unfinished and not reply_looks_failed):
-        chart_html = build_chart_html(
-            latest_validated_result.columns,
-            latest_validated_result.rows,
-            latest_validated_result.filters_applied,
-            spec=pending_chart_spec,
-        )
-        if chart_html:
-            reply = chart_html + "\n\n" + reply.lstrip()
-
-    if not reply:
-        if last_error and last_error_is_rule_violation:
-            # This was rejected by our own SQL guardrails before ever
-            # reaching the database — it is NOT a database error, and the
-            # internal violation text (fed to the model to self-correct)
-            # is not meant for the end user. Log the full detail
-            # server-side and show a clean, honest message instead.
-            print(f"[RULE-VIOLATION-EXHAUSTED] session={session_id} last_error={last_error}")
-            reply = (
-                "⚠️ I wasn't able to build a query that satisfies all of our data-quality "
-                "rules for this question after several attempts. This is usually a sign the "
-                "question needs to be broken down or phrased more specifically (e.g. naming "
-                "a single stage or metric). Could you try rephrasing, or check **/debug/db** "
-                "if this keeps happening?"
-            )
-        elif last_error:
-            reply = (
-                "⚠️ I couldn't complete this query. The last database error was:\n\n"
-                f"`{last_error[:400]}`\n\n"
-                "Could you rephrase the question, or check **/debug/db** if this persists?"
-            )
-        else:
-            reply = (
-                "⚠️ I wasn't able to finish answering this in time — it may need "
-                "a more specific or simpler question. Could you try rephrasing it "
-                "(e.g. break it into smaller asks)?"
-            )
-    return reply
 
 # =============================================================================
 # Routes — chat
@@ -2530,7 +2653,9 @@ def chat_retry(payload: RetryRequest):
 # =============================================================================
 @app.get("/session/{session_id}/dataset-info")
 def session_dataset_info(session_id: str):
-    result = _get_result(session_id)
+    # Prefer the most recent result over the largest-wins export cache —
+    # "what can I export" should reflect what the user just saw.
+    result = _get_result(f"{session_id}:latest") or _get_result(session_id)
     if not result:
         return {"has_dataset": False}
     return {
@@ -2554,7 +2679,12 @@ async def export_preview(req: ExportPreviewRequest):
 
     print(f"📄 [export/preview] session={req.session_id} type={req.export_type}")
 
-    stored = _get_result(req.session_id) if req.session_id else None
+    # "Export this" should reflect the most recent result, not whichever
+    # past query in this session happened to return the most rows.
+    stored = (
+        (_get_result(f"{req.session_id}:latest") or _get_result(req.session_id))
+        if req.session_id else None
+    )
 
     try:
         ai_content = _generate_export_content(
@@ -2587,7 +2717,11 @@ async def export_download(req: ExportDownloadRequest):
     print(f"⬇️  [export/download] format={req.format} session={req.session_id}")
 
     if req.format == "csv":
-        stored = _get_result(req.session_id) if req.session_id else None
+        # Same fix as export_preview / session_dataset_info.
+        stored = (
+            (_get_result(f"{req.session_id}:latest") or _get_result(req.session_id))
+            if req.session_id else None
+        )
         if not stored:
             raise HTTPException(
                 status_code=404,
