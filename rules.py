@@ -172,7 +172,7 @@ Examples:
 
     "closed_won": """
 CLOSED WON RULES
-  deal_stage = 'Closed Won' AND close_date BETWEEN '<fy_start>' AND '<fy_end>'
+  deal_stage IN ('Closed Won', '90% - Deal Desk Review')  AND close_date BETWEEN '<fy_start>' AND '<fy_end>'
   GROUP BY deal_owner + MANDATORY_BASE_FILTERS
   Quota source: kore_ai_hubspot.gs_closed_won_quotas, cast with toFloat64OrZero().
   No L1/L2/Committed split in this table — single quota tier only.
