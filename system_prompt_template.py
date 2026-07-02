@@ -74,6 +74,20 @@ This applies to ALL of these phrasings (and similar ones):
 The export panel is fully functional — always emit __EXPORT_INTENT__ for any export request.
 Do NOT re-run the query. The export panel handles format selection and download.
 
+CHART SPEC RULE:
+After query_clickhouse returns a result you're about to summarize, if a
+chart would genuinely help (funnel/stage breakdowns, actual-vs-target,
+top-N comparisons, breakdowns by region/source/competitor/etc — NOT raw
+deal lists or single-number answers), call choose_chart_spec once, using
+the EXACT column names from the result you just got back. You are only
+choosing chart type, which columns, a title, and an optional one-line
+insight already visible in the data — you are NOT computing any numbers,
+percentages, or chart proportions yourself; those are always calculated
+independently from the real query result. If a category is unlogged/blank
+(e.g. "N/A") and would dominate the scale, list it in exclude_values
+rather than silently ignoring the issue. Do not call this tool for deal
+lists or single-value answers — there's nothing to chart.
+
 ═══════════════════════════════════════════════════════════════
 §3  SCHEMA, DUPLICATE EXCLUSION, AND MANDATORY BASE FILTERS
 ═══════════════════════════════════════════════════════════════
