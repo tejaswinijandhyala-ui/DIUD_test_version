@@ -1836,10 +1836,13 @@ def _extract_text(content_blocks) -> str:
 def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                  session_id: Optional[str] = None, model: str = "sonnet") -> str:
 
-    # Used later to make sure any chart we auto-attach was actually produced
-    # by a query THIS turn ran, not a stale result left over from an earlier
-    # turn in the same session (see DETERMINISTIC CHART INJECTION below).
-    _turn_started_at = datetime.utcnow()
+    # Carries the chart HTML forward from the exact moment a query result is
+    # validated, so chart generation is tied to that specific validated
+    # result rather than re-fetched later from the shared session store
+    # (which can hold a different turn's data). Set only where the result
+    # is actually validated below; used verbatim by DETERMINISTIC CHART
+    # INJECTION at the end — no re-fetch, no staleness heuristic needed.
+    current_turn_chart_html: Optional[str] = None
 
     selected_model = ALLOWED_MODELS.get(model, ALLOWED_MODELS["sonnet"])
 
@@ -1989,12 +1992,26 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                         is_error = True
                     else:
                         # --- deterministic headline injection ------
-                        headline = _compute_deterministic_headline(_get_result(session_id))
+                        this_result = _get_result(f"{session_id}:latest") if session_id else None
+                        headline = _compute_deterministic_headline(this_result)
                         if headline:
                             query_result += (
                                 f"\n\n[VERIFIED TOTALS — use these exact figures, "
                                 f"do not recompute]: {headline}"
                             )
+
+                        # --- chart generation, tied to this exact validated
+                        # result — happens right alongside the headline/
+                        # summary prep above, not as a later disconnected
+                        # step. Overwrites on each validated query within
+                        # this turn, so it ends up holding the chart for the
+                        # LAST validated result of this turn.
+                        if this_result and this_result.rows:
+                            candidate_chart = build_chart_html(
+                                this_result.columns, this_result.rows, this_result.filters_applied
+                            )
+                            if candidate_chart:
+                                current_turn_chart_html = candidate_chart
 
             if is_error:
                 last_error = query_result
@@ -2081,6 +2098,16 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                         result = run_clickhouse_query(sql, session_id=session_id)
                         is_err = any(result.startswith(p) for p in
                             ["DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"])
+                        if not is_err and session_id:
+                            # Same rule as the main loop: tie the chart to
+                            # this exact query's result, not a later re-fetch.
+                            this_result = _get_result(f"{session_id}:latest")
+                            if this_result and this_result.rows:
+                                candidate_chart = build_chart_html(
+                                    this_result.columns, this_result.rows, this_result.filters_applied
+                                )
+                                if candidate_chart:
+                                    current_turn_chart_html = candidate_chart
                     tool_result_blocks.append({
                         "type": "tool_result", "tool_use_id": tb.id,
                         "content": result, "is_error": is_err,
@@ -2149,28 +2176,20 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
     )
     # Don't attach a chart to a reply that's actually reporting a failure —
     # e.g. the rule-violation / DB-error fallback text, or an apology that
-    # slipped through with no real data behind it. A stale chart glued onto
-    # an "I couldn't complete this" message is worse than no chart.
+    # slipped through with no real data behind it.
     _FAILURE_MARKERS = ("couldn't complete this", "wasn't able to", "rule violation",
                          "database error", "i wasn't able to build a query",
                          "could you rephrase")
     reply_looks_failed = any(m in reply.lower() for m in _FAILURE_MARKERS)
 
-    if (reply and session_id and not reply_already_has_chart(reply)
+    # current_turn_chart_html was built earlier, at the exact moment this
+    # turn's query result was validated (see the tool loop above) — no
+    # re-fetch from the session store here, so there's nothing to get out
+    # of sync with. If no query in this turn produced a chart-worthy,
+    # validated result, there is simply nothing to attach.
+    if (reply and current_turn_chart_html and not reply_already_has_chart(reply)
             and not reply_looks_unfinished and not reply_looks_failed):
-        stored = _get_result(f"{session_id}:latest") or _get_result(session_id)
-        # Guard against attaching a chart from a stale, earlier turn: only
-        # use it if it was actually captured during THIS turn's tool loop.
-        stored_is_from_this_turn = bool(
-            stored and stored.captured_at
-            and stored.captured_at.rstrip("Z") >= _turn_started_at.isoformat()
-        )
-        if stored and stored.rows and stored_is_from_this_turn:
-            chart_html = build_chart_html(
-                stored.columns, stored.rows, stored.filters_applied
-            )
-            if chart_html:
-                reply = reply.rstrip() + "\n\n" + chart_html
+        reply = reply.rstrip() + "\n\n" + current_turn_chart_html
 
     if not reply:
         if last_error and last_error_is_rule_violation:
