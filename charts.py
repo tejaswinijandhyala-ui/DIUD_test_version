@@ -16,9 +16,27 @@ _STAGE_ORDER = [
 
 
 def _stage_rank(stage: str) -> int:
+    # Compare the ACTUAL leading percentage on this row (e.g. "75%" from
+    # "75% - Contract Review") against each canonical stage's percentage,
+    # exactly — not a raw substring check. A substring check here is a real
+    # bug: "5%" IS a substring of "75%" (and would be of "45%"/"65%"/
+    # "85%"/"95%" too), so "75% - Contract Review" was silently matching
+    # the "5% - IQM Held" entry and sorting FIRST in the funnel — which
+    # also scrambled every conversion-% calculation downstream, since
+    # those all divide by whichever row ends up first after this sort.
+    stage_match = re.match(r'\s*(\d+)\s*%', str(stage))
+    stage_pct = stage_match.group(1) if stage_match else None
+
     for i, s in enumerate(_STAGE_ORDER):
-        if s.split(" - ")[0].strip() in str(stage):
-            return i
+        canon_match = re.match(r'\s*(\d+)\s*%', s)
+        if canon_match:
+            if stage_pct is not None and stage_pct == canon_match.group(1):
+                return i
+        else:
+            # Non-percentage entries (e.g. "Closed Won") — substring match
+            # is safe here since there's no numeric-prefix collision risk.
+            if s.strip() in str(stage):
+                return i
     return 99
 
 
