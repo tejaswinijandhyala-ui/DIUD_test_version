@@ -169,6 +169,99 @@ def _validate_chart_spec(spec: dict, columns: List[str]) -> Tuple[Optional[dict]
     return clean, None
 
 _RULE_AUDIT_LOG: List[dict] = []   # most-recent-first, capped
+_FEEDBACK_LOG: List[dict] = []     # most-recent-first, capped — thumbs up/down from users
+
+def _log_feedback(session_id: Optional[str], user_question: str,
+                   assistant_reply: str, rating: str,
+                   issue_type: Optional[str], comment: Optional[str]):
+    """
+    Records a user's thumbs up/down. Tagged with the same get_intent
+    classification used for rule violations, so negative feedback can be
+    grouped by question type right alongside rule-violation failures —
+    two different signals (did our own rules catch a problem vs. did a
+    human actually think the answer was wrong) feeding the same review
+    surface, not two disconnected systems.
+
+    This ONLY records the signal. Nothing here changes DIUD's behavior
+    automatically — see get_feedback_metrics() / /debug/feedback, which
+    surface this for a person to review, deliberately not an auto-tuning
+    loop. An agent that quietly rewrites its own guardrails based on
+    unverified user reactions (which can be wrong, sarcastic, or testing
+    edge cases on purpose) is not something to build silently as a
+    side effect of "make it adaptive."
+    """
+    try:
+        intent = get_intent(user_question, sql="")
+        pattern_tag = (
+            intent.get("pattern_hint")
+            or intent.get("pattern")
+            or intent.get("metric")
+            or (f"stage_{intent['stage']}" if intent.get("stage") else None)
+            or (f"cohort_{intent['cohort_stage']}" if intent.get("cohort_stage") else None)
+            or "unclassified"
+        )
+    except Exception:
+        pattern_tag = "unclassified"
+
+    entry = {
+        "ts": datetime.utcnow().isoformat(),
+        "session_id": session_id,
+        "pattern": pattern_tag,
+        "rating": rating,                      # "up" | "down"
+        "issue_type": issue_type or "",         # only meaningful when rating == "down"
+        "comment": (comment or "")[:500],
+        "user_question": user_question[:200],
+        "assistant_reply_preview": assistant_reply[:300],
+    }
+    _FEEDBACK_LOG.insert(0, entry)
+    del _FEEDBACK_LOG[500:]
+    print(f"[FEEDBACK][{rating}][{pattern_tag}]"
+          + (f"[{issue_type}]" if issue_type else "")
+          + f" session={session_id}"
+          + (f" comment={comment[:100]!r}" if comment else ""))
+
+
+def get_feedback_metrics() -> dict:
+    """
+    Aggregates _FEEDBACK_LOG the same way get_audit_metrics() aggregates
+    the rule-violation log: overall up/down rate, broken down by question
+    pattern AND by reported issue type, so both "which type of QUESTION do
+    users dislike" and "which KIND of mistake keeps happening" are
+    answerable without reading raw log entries by eye.
+    """
+    total = len(_FEEDBACK_LOG)
+    if total == 0:
+        return {"total_feedback": 0, "thumbs_up": 0, "thumbs_down": 0,
+                "positive_rate_pct": None, "by_pattern": {}, "by_issue_type": {},
+                "recent_comments": []}
+
+    up = sum(1 for e in _FEEDBACK_LOG if e["rating"] == "up")
+    down = total - up
+
+    by_pattern: Dict[str, Dict[str, int]] = {}
+    by_issue_type: Dict[str, int] = {}
+    for e in _FEEDBACK_LOG:
+        p = by_pattern.setdefault(e["pattern"], {"up": 0, "down": 0})
+        p[e["rating"]] = p.get(e["rating"], 0) + 1
+        if e["rating"] == "down" and e["issue_type"]:
+            by_issue_type[e["issue_type"]] = by_issue_type.get(e["issue_type"], 0) + 1
+
+    return {
+        "total_feedback": total,
+        "thumbs_up": up,
+        "thumbs_down": down,
+        "positive_rate_pct": round(up / total * 100, 1),
+        "by_pattern": dict(sorted(
+            by_pattern.items(), key=lambda kv: kv[1].get("down", 0), reverse=True
+        )),
+        "by_issue_type": dict(sorted(by_issue_type.items(), key=lambda x: -x[1])),
+        "recent_comments": [
+            {"pattern": e["pattern"], "rating": e["rating"],
+             "issue_type": e["issue_type"], "comment": e["comment"]}
+            for e in _FEEDBACK_LOG if e["comment"] or e["issue_type"]
+        ][:20],
+    }
+
 
 def _log_rule_audit(session_id: Optional[str], sql: str, violations: List[str],
                      stage: str, user_message: str):
@@ -217,7 +310,7 @@ def get_audit_metrics() -> dict:
         return {
             "total_events": 0, "clean": 0, "with_violations": 0,
             "success_rate_pct": None, "by_rule_id": {}, "by_pattern": {},
-            "by_stage": {},
+            "by_stage": {}, "pattern_rates": {},
         }
 
     clean = sum(1 for e in _RULE_AUDIT_LOG if not e["violations"])
@@ -226,10 +319,18 @@ def get_audit_metrics() -> dict:
     by_rule_id: Dict[str, int] = {}
     by_pattern: Dict[str, int] = {}
     by_stage: Dict[str, int] = {}
+    # Per-pattern TOTALS (attempts + violations), not just violation counts —
+    # a pattern with 8 violations out of 10 attempts is a real problem; a
+    # pattern with 8 violations out of 200 attempts mostly just gets asked
+    # a lot. by_pattern above can't distinguish these; pattern_rates can.
+    pattern_totals: Dict[str, Dict[str, int]] = {}
 
     for e in _RULE_AUDIT_LOG:
         by_stage[e["stage"]] = by_stage.get(e["stage"], 0) + 1
+        pt = pattern_totals.setdefault(e["pattern"], {"total": 0, "violations": 0})
+        pt["total"] += 1
         if e["violations"]:
+            pt["violations"] += 1
             by_pattern[e["pattern"]] = by_pattern.get(e["pattern"], 0) + 1
             for v in e["violations"]:
                 # violation strings are formatted "[rule_id] §n ... : message"
@@ -241,9 +342,121 @@ def get_audit_metrics() -> dict:
         "clean": clean,
         "with_violations": with_violations,
         "success_rate_pct": round(clean / total * 100, 1),
+        "pattern_rates": pattern_totals,
         "by_rule_id": dict(sorted(by_rule_id.items(), key=lambda x: -x[1])),
         "by_pattern": dict(sorted(by_pattern.items(), key=lambda x: -x[1])),
         "by_stage": by_stage,
+    }
+
+
+def get_flagged_issues(
+    rule_violation_threshold: int = 3,
+    pattern_failure_rate_threshold: float = 30.0,
+    pattern_min_sample: int = 5,
+    feedback_negative_rate_threshold: float = 40.0,
+    feedback_min_sample: int = 3,
+    issue_type_threshold: int = 3,
+) -> dict:
+    """
+    THE CONNECTING PIECE between "we log everything" and "a human notices
+    a repeated pattern" — cross-references the rule-violation audit log
+    and the user-feedback log, and surfaces anything crossing a repeat
+    threshold as a flagged item for review.
+
+    This function NEVER changes DIUD's behavior. It does not touch
+    rules.py, does not touch either agent's prompt, does not retry
+    anything. It only produces a sorted list of "this looks worth a
+    look" — matching the human-supervised design we agreed on: an agent
+    that quietly rewrites its own guardrails based on failure counts is
+    a real risk for a system whose numbers drive business decisions, so
+    the decision of what to actually change stays with a person, every
+    time. See /debug/alerts.
+
+    Flags come from five checks, escalating in what they mean:
+      1. A specific rule firing repeatedly (raw count) — the rule itself
+         may be too strict, or the model keeps making the same mistake.
+      2. A question pattern with a high RULE FAILURE RATE (not just a
+         raw count — a pattern that's simply asked often will naturally
+         accumulate more violations without this being unusual).
+      3. A question pattern with a high NEGATIVE FEEDBACK RATE.
+      4. A specific reported issue type recurring.
+      5. CROSS-SIGNAL: a pattern flagged by BOTH the rule engine AND user
+         feedback independently — two different signals agreeing is much
+         stronger evidence than either alone, so this is always "critical".
+    """
+    audit = get_audit_metrics()
+    feedback = get_feedback_metrics()
+    flags: List[dict] = []
+
+    for rule_id, count in audit["by_rule_id"].items():
+        if count >= rule_violation_threshold:
+            flags.append({
+                "severity": "high" if count >= rule_violation_threshold * 2 else "medium",
+                "source": "rule_engine",
+                "subject": rule_id,
+                "detail": f"Rule '{rule_id}' has fired {count} times in the current audit window.",
+                "suggested_action": "Check whether this rule is too strict, or the model keeps making the same mistake.",
+            })
+
+    rule_flagged_patterns = set()
+    for pattern, stats in audit.get("pattern_rates", {}).items():
+        total = stats["total"]
+        violations = stats["violations"]
+        if total >= pattern_min_sample:
+            rate = violations / total * 100
+            if rate >= pattern_failure_rate_threshold:
+                rule_flagged_patterns.add(pattern)
+                flags.append({
+                    "severity": "high" if rate >= 50 else "medium",
+                    "source": "rule_engine",
+                    "subject": pattern,
+                    "detail": f"Question pattern '{pattern}' fails our own rules {rate:.0f}% of the time ({violations}/{total} attempts).",
+                    "suggested_action": "This question type may need clearer prompt guidance or a rule review.",
+                })
+
+    feedback_flagged_patterns = set()
+    for pattern, counts in feedback.get("by_pattern", {}).items():
+        total = counts.get("up", 0) + counts.get("down", 0)
+        if total >= feedback_min_sample:
+            neg_rate = counts.get("down", 0) / total * 100
+            if neg_rate >= feedback_negative_rate_threshold:
+                feedback_flagged_patterns.add(pattern)
+                flags.append({
+                    "severity": "high" if neg_rate >= 60 else "medium",
+                    "source": "user_feedback",
+                    "subject": pattern,
+                    "detail": f"Users rated '{pattern}' answers negatively {neg_rate:.0f}% of the time ({counts.get('down', 0)}/{total} ratings).",
+                    "suggested_action": "Check recent comments for this pattern in /debug/feedback.",
+                })
+
+    for issue_type, count in feedback.get("by_issue_type", {}).items():
+        if count >= issue_type_threshold:
+            flags.append({
+                "severity": "medium",
+                "source": "user_feedback",
+                "subject": issue_type,
+                "detail": f"Users have reported '{issue_type}' {count} times.",
+                "suggested_action": "Review recent comments tagged with this issue type.",
+            })
+
+    for pattern in (rule_flagged_patterns & feedback_flagged_patterns):
+        flags.append({
+            "severity": "critical",
+            "source": "cross_signal",
+            "subject": pattern,
+            "detail": f"'{pattern}' is failing BOTH our own rules AND getting negative user "
+                      f"feedback — two independent signals agree.",
+            "suggested_action": "Prioritize this one — it's the strongest signal the system can produce.",
+        })
+
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    flags.sort(key=lambda f: severity_order.get(f["severity"], 4))
+
+    return {
+        "flag_count": len(flags),
+        "flags": flags,
+        "note": ("Review surface only — nothing here changes DIUD's behavior automatically. "
+                 "A person decides what, if anything, to act on."),
     }
 
 # =============================================================================
@@ -1592,28 +1805,163 @@ LIVE DATABASE SCHEMA (auto-injected below)
 {schema}
 """
 
-_SYSTEM_PROMPT = _build_system_prompt()
 
-
-def _cached_system_prompt() -> list:
+def _extract_section(text: str, n: int) -> str:
     """
-    Wraps the (unchanged) system prompt text in Anthropic's prompt-caching
-    format. Nothing about the prompt content changes — same rules, same
-    text, same behavior — this only tells the API "this block is reused
-    identically across calls, cache it" instead of re-processing the full
-    ~15k-token prompt at full cost/latency on every single API call.
+    Pulls §N (header through body) out of the full prompt text, up to but
+    not including the next §-header or the LIVE DATABASE SCHEMA block.
+    Extraction is driven by the section markers already in the text, not
+    hand-copied, so splitting the prompt can't silently drop or duplicate
+    rule content that exists in only one place today.
+    """
+    pattern = rf'═+\n§{n}\b.*?(?=\n═+\n§\d|\n═+\nLIVE DATABASE SCHEMA|\Z)'
+    m = re.search(pattern, text, re.S)
+    return m.group(0).strip() if m else ""
 
-    Reads the CURRENT value of the _SYSTEM_PROMPT global each time it's
-    called (not a stale copy), so it stays correct after refresh_schema()
-    or on_startup() reassign it following a schema change.
 
-    Every call site that previously used `system=_SYSTEM_PROMPT` should use
-    `system=_cached_system_prompt()` instead — same content, cached.
+def _split_section_2(sec2: str) -> Tuple[str, str, str]:
+    """
+    §2 (TOOL USAGE) bundles three logically separate things: which tool to
+    call and when (SQL Agent's job), the export-intent marker (a
+    conversational routing decision, not a SQL decision), and the
+    chart-spec instruction (now the Narrator Agent's job, since
+    choose_chart_spec moved to the Narrator's tool set). Splits it into
+    (tool_usage_only, export_intent_block, chart_spec_block).
+    """
+    export_m = re.search(r'EXPORT INTENT RULE:.*?(?=\nCHART SPEC RULE:|\Z)', sec2, re.S)
+    chart_m = re.search(r'CHART SPEC RULE:.*', sec2, re.S)
+    tool_only = sec2
+    if export_m:
+        tool_only = tool_only.replace(export_m.group(0), '')
+    if chart_m:
+        tool_only = tool_only.replace(chart_m.group(0), '')
+    return (
+        tool_only.strip(),
+        export_m.group(0).strip() if export_m else "",
+        chart_m.group(0).strip() if chart_m else "",
+    )
+
+
+def _build_sql_agent_prompt() -> str:
+    """
+    SQL Agent's prompt: everything needed to turn a question into
+    validated SQL and retrieve data, plus the greeting/export fast paths
+    (§1, export-intent) so a turn that needs no data at all — "hi", "export
+    that as PDF" — can be answered directly without ever reaching the
+    Narrator Agent. Includes the live schema; the Narrator Agent does not
+    need it (it only ever sees already-labeled result rows, never raw
+    columns it has to interpret against a schema).
+    """
+    full = _build_system_prompt()
+    sec1 = _extract_section(full, 1)
+    sec2 = _extract_section(full, 2)
+    tool_only, export_block, _chart_block = _split_section_2(sec2)
+    sections = "\n\n".join(
+        s for s in (
+            tool_only,
+            export_block,
+            *[_extract_section(full, n) for n in range(3, 14)],
+        ) if s
+    )
+    schema_start = full.find("LIVE DATABASE SCHEMA")
+    schema_block = full[schema_start - 66:] if schema_start != -1 else ""
+
+    return f"""
+You are DIUD's SQL Agent — responsible for understanding a business question,
+writing correct ClickHouse SQL, and retrieving validated data. You never
+fabricate numbers and never run destructive SQL. If the question needs no
+data at all (a greeting, an export request on already-fetched data, a
+question about your own capabilities), handle it directly per the rules
+below without calling query_clickhouse.
+
+Once you have a clean, rule-compliant result, STOP — do not write the final
+narrative answer yourself. A separate Narrator Agent turns your retrieved
+data into the response the user sees.
+
+RULE PRIORITY ORDER (highest → lowest):
+  1. Greeting Rule (§1)
+  2. Safety — SELECT/WITH only, no destructive SQL ever
+  3. MANDATORY_BASE_FILTERS (§3)
+  4. Tool Usage (§2)
+  5. Business & SQL Rules (§4–§13)
+
+{sec1}
+
+{sections}
+
+{schema_block}
+"""
+
+
+def _build_narrator_agent_prompt() -> str:
+    """
+    Narrator Agent's prompt: only what's needed to turn already-verified
+    data into a clear written answer and (optionally) pick a chart. No
+    schema, no SQL rules, no table names — by the time this agent runs,
+    all of that ambiguity has already been resolved by the SQL Agent and
+    the rule engine. This is deliberately the smaller of the two prompts.
+    """
+    full = _build_system_prompt()
+    sec1 = _extract_section(full, 1)
+    sec2 = _extract_section(full, 2)
+    _tool_only, _export_block, chart_block = _split_section_2(sec2)
+    sec14 = _extract_section(full, 14)
+    sec15 = _extract_section(full, 15)
+
+    return f"""
+You are DIUD's Narrator Agent — responsible for turning already-verified
+data into a clear, executive-grade written answer. You do not have database
+access and cannot write SQL; the data handed to you has already been
+retrieved and checked by a separate SQL Agent. Never invent, adjust, or
+recompute any number — use only what appears in the data block you're
+given, in a [VERIFIED TOTALS] block, or from a compute_verified_metric
+result already included in that data.
+
+RULE PRIORITY ORDER (highest → lowest):
+  1. Greeting Rule (§1) — only relevant if you're ever invoked with no data
+  2. Formatting & Chart Rules (§14–§15)
+  3. Chart spec selection (below)
+
+{sec1}
+
+{chart_block}
+
+{sec14}
+
+{sec15}
+"""
+
+
+_SQL_AGENT_PROMPT = _build_sql_agent_prompt()
+_NARRATOR_AGENT_PROMPT = _build_narrator_agent_prompt()
+
+
+def _cached_sql_agent_prompt() -> list:
+    """
+    Prompt-caching wrapper for the SQL Agent's prompt. Reads the CURRENT
+    _SQL_AGENT_PROMPT global each call (not a stale copy), so it stays
+    correct after refresh_schema() or on_startup() reassign it.
     """
     return [
         {
             "type": "text",
-            "text": _SYSTEM_PROMPT,
+            "text": _SQL_AGENT_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
+def _cached_narrator_agent_prompt() -> list:
+    """
+    Prompt-caching wrapper for the Narrator Agent's prompt. Much smaller
+    than the SQL Agent's — no schema, no SQL rules — so this was already
+    cheap before caching; caching still helps across the many narration
+    calls within a single busy session.
+    """
+    return [
+        {
+            "type": "text",
+            "text": _NARRATOR_AGENT_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }
     ]
@@ -1924,14 +2272,15 @@ def _parse_rows_for_validation(query_result: str, session_id: Optional[str]) -> 
 # =============================================================================
 @app.on_event("startup")
 async def on_startup():
-    global _SYSTEM_PROMPT
+    global _SQL_AGENT_PROMPT, _NARRATOR_AGENT_PROMPT
     try:
         discover_schema()
-        _SYSTEM_PROMPT = _build_system_prompt()
+        _SQL_AGENT_PROMPT = _build_sql_agent_prompt()
+        _NARRATOR_AGENT_PROMPT = _build_narrator_agent_prompt()
     except Exception as e:
         print(f"⚠️  Schema discovery failed: {e}")
     _cleanup_sessions()
-    print("🚀 DIUD v4 started — session-store export enabled.")
+    print("🚀 DIUD v5 started — SQL Agent / Narrator Agent split, session-store export enabled.")
 
 
 # =============================================================================
@@ -2059,12 +2408,27 @@ _CHART_SPEC_TOOL = {
     },
 }
 
+# Tool sets per agent — the SQL Agent never sees choose_chart_spec (it isn't
+# the one deciding what to chart), and the Narrator Agent never sees the
+# data-fetching tools (it has no database access and shouldn't be able to
+# query anything itself — it only narrates what it's handed).
+_SQL_AGENT_TOOLS = [_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL]
+_NARRATOR_AGENT_TOOLS = [_CHART_SPEC_TOOL]
+
 # =============================================================================
 # Pydantic models
 # =============================================================================
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str
+
+class FeedbackRequest(BaseModel):
+    session_id: Optional[str] = None
+    user_question: str
+    assistant_reply: str
+    rating: Literal["up", "down"]
+    issue_type: Optional[str] = None
+    comment: Optional[str] = None
 
 class ChatRequest(BaseModel):
     message: str
@@ -2187,26 +2551,355 @@ def build_final_response(
     return reply
 
 
-def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
-                 session_id: Optional[str] = None, model: str = "sonnet") -> str:
+def _format_data_envelope(result: "QueryResult") -> str:
+    """
+    Formats a validated QueryResult into the plain-text block handed to
+    the Narrator Agent — same pipe-table style already used for the SQL
+    Agent's own tool results (run_clickhouse_query), so both agents see
+    data in a consistent, familiar shape. Includes the deterministic
+    headline (if one was computed) so the Narrator never has to derive a
+    total/average itself from raw rows.
+    """
+    CHAT_DISPLAY_LIMIT = 100
+    header = " | ".join(result.columns)
+    lines = [header, "-" * min(len(header), 140)]
+    for row in result.rows[:CHAT_DISPLAY_LIMIT]:
+        lines.append(" | ".join(str(row.get(c, "")) for c in result.columns))
+    if result.total_rows > CHAT_DISPLAY_LIMIT:
+        lines.append(f"\n(Showing {CHAT_DISPLAY_LIMIT} of {result.total_rows} rows.)")
+    if result.filters_applied:
+        lines.append(f"\nFilters applied: {result.filters_applied}")
+    headline = _compute_deterministic_headline(result)
+    if headline:
+        lines.append(f"\n[VERIFIED TOTALS — use these exact figures, do not recompute]: {headline}")
+    return "\n".join(lines)
 
-    # Carries the validated query result, and Claude's optional chart spec
-    # (from choose_chart_spec), forward from wherever they're produced in
-    # the tool loop to the single point where the chart actually gets built
-    # (DETERMINISTIC CHART INJECTION at the end of this function). Tied to
-    # this turn only — never re-fetched from the shared session store, so
-    # there's no possibility of a stale, cross-turn chart. Claude's spec
-    # only ever selects chart type/columns/title — every number rendered is
-    # still computed from latest_validated_result.rows in charts.py, never
-    # from anything Claude wrote.
+
+def _dispatch_sql_tool(tool_block, session_id: Optional[str], original_user_message: str,
+                        latest_validated_result: Optional["QueryResult"]):
+    """
+    Handles one tool_use block for the SQL Agent (lookup_business_rule,
+    compute_verified_metric, or a query_clickhouse SQL execution — the
+    SQL Agent no longer has choose_chart_spec at all, so that branch is
+    gone entirely, not just unreachable).
+
+    Returns (content: str, is_error: bool, updated_latest_validated_result,
+    last_error: Optional[str], last_error_is_rule_violation: bool).
+    The last two are only ever non-None/True when this specific call was
+    the one that failed — the caller is responsible for tracking the most
+    recent one across the whole loop.
+    """
+    if tool_block.name == "lookup_business_rule":
+        topic = tool_block.input.get("topic", "")
+        return get_rulebook_entry(topic), False, latest_validated_result, None, False
+
+    if tool_block.name == "compute_verified_metric":
+        metric_name = tool_block.input.get("metric_name", "")
+        return compute_verified_metric(metric_name, session_id), False, latest_validated_result, None, False
+
+    sql = tool_block.input.get("sql", "")
+
+    # --- pre-execution rule gate -------------------------------
+    sql_violations = validate_sql_against_rules(sql, original_user_message)
+    _log_rule_audit(session_id, sql, sql_violations, "pre_execute", original_user_message)
+
+    if sql_violations:
+        cohort_violations = [v for v in sql_violations if "cohort" in v.lower() or "8b" in v.lower()]
+
+        if cohort_violations:
+            query_result = (
+                "RULE VIOLATION — cohort funnel SQL rejected (§8b). NOT executed.\n\n"
+                "Violations:\n"
+                + "\n".join(f"- {v}" for v in sql_violations)
+                + """
+
+⚠️ REQUIRED: Rewrite from scratch using this exact skeleton:
+
+WITH cohort AS (
+  SELECT deal_id, deal_stage, amount
+  FROM hs_analytics.deals FINAL
+  WHERE became_<N>_deal_date IS NOT NULL
+    AND deal_stage NOT IN (
+        '1% - Prospect', '<stages before N%>'
+    )
+    AND pipeline = 'default'
+    AND CASE WHEN deal_type IS NULL THEN 'Not Assigned' ELSE deal_type END
+        NOT IN ('Partner-Led SMB')
+    AND toInt64(deal_id) IN (
+        SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs
+    )
+    AND toDate(LEFT(coalesce(became_<N>_deal_date, '1900-01-01'), 10))
+        BETWEEN '<start_date>' AND '<end_date>'
+)
+SELECT
+    deal_stage,
+    countDistinct(deal_id)       AS deal_count,
+    round(SUM(amount) / 1e6, 1) AS pipeline_m
+FROM cohort
+GROUP BY deal_stage
+ORDER BY deal_count DESC
+
+Fill in <N> and the stage exclusion list from §8b, then resubmit.
+"""
+            )
+        else:
+            query_result = (
+                "RULE VIOLATION — query rejected, NOT executed against the database:\n"
+                + "\n".join(f"- {v}" for v in sql_violations)
+                + "\n\nRewrite the SQL to satisfy these rules, then call the tool again."
+            )
+        return query_result, True, latest_validated_result, query_result, True
+
+    query_result = run_clickhouse_query(sql, session_id=session_id)
+    is_error = any(query_result.startswith(p) for p in [
+        "DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"
+    ])
+
+    if is_error:
+        return query_result, True, latest_validated_result, query_result, False
+
+    # --- post-execution result-level rule check ------------
+    parsed_rows = _parse_rows_for_validation(query_result, session_id)
+    result_violations = validate_result_against_rules(parsed_rows, original_user_message, sql)
+    _log_rule_audit(session_id, sql, result_violations, "post_execute", original_user_message)
+    if result_violations:
+        query_result += (
+            "\n\n⚠️ RESULT RULE VIOLATION:\n"
+            + "\n".join(f"- {v}" for v in result_violations)
+            + "\nThis result is likely wrong — re-derive using the single-CTE "
+              "cohort pattern from §8b and call the tool again."
+        )
+        return query_result, True, latest_validated_result, query_result, False
+
+    # --- deterministic headline injection ------
+    this_result = _get_result(f"{session_id}:latest") if session_id else None
+    headline = _compute_deterministic_headline(this_result)
+    if headline:
+        query_result += (
+            f"\n\n[VERIFIED TOTALS — use these exact figures, "
+            f"do not recompute]: {headline}"
+        )
+    if this_result and this_result.rows:
+        latest_validated_result = this_result
+
+    return query_result, False, latest_validated_result, None, False
+
+
+def _run_sql_agent(safe_messages: list, original_user_message: str, session_id: Optional[str],
+                    selected_model: str, max_tokens: int):
+    """
+    Runs the SQL Agent's tool loop to completion: drafts SQL, gets it
+    checked by the deterministic rule engine (pre- and post-execution),
+    retries on violation, up to MAX_ROUNDS. Never writes the user-facing
+    answer — that's the Narrator Agent's job. If the loop ends with no
+    validated result and no tool call was ever needed at all (a greeting,
+    an export request, a capability question), sql_agent_text carries
+    that direct reply so the caller can use it as-is without invoking the
+    Narrator Agent for something that was never about data in the first
+    place.
+
+    Returns: (sql_agent_text, latest_validated_result, last_error,
+    last_error_is_rule_violation, updated_safe_messages)
+    """
+    response = _ai_client.messages.create(
+        model=selected_model,
+        system=_cached_sql_agent_prompt(),
+        messages=safe_messages,
+        tools=_SQL_AGENT_TOOLS,
+        temperature=0,
+        max_tokens=max_tokens,
+    )
+
     latest_validated_result: Optional["QueryResult"] = None
+    last_error = None
+    last_error_is_rule_violation = False
+    MAX_ROUNDS = 8
+
+    for round_num in range(MAX_ROUNDS):
+        if response.stop_reason != "tool_use":
+            break
+
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
+            break
+
+        tool_result_blocks = []
+        for tool_block in tool_blocks:
+            content, is_error, latest_validated_result, err, err_is_violation = _dispatch_sql_tool(
+                tool_block, session_id, original_user_message, latest_validated_result
+            )
+            if err is not None:
+                last_error = err
+                last_error_is_rule_violation = err_is_violation
+            tool_result_blocks.append({
+                "type": "tool_result", "tool_use_id": tool_block.id,
+                "content": content, "is_error": is_error,
+            })
+
+        safe_messages = safe_messages + [
+            {"role": "assistant", "content": response.content},
+            {"role": "user", "content": tool_result_blocks},
+        ]
+        is_last_round = (round_num == MAX_ROUNDS - 1)
+        response = _ai_client.messages.create(
+            model=selected_model,
+            system=_cached_sql_agent_prompt(),
+            messages=safe_messages,
+            tools=[] if is_last_round else _SQL_AGENT_TOOLS,
+            temperature=0,
+            max_tokens=max_tokens,
+        )
+
+    sql_agent_text = _extract_text(response.content)
+
+    # ── INCOMPLETE-TURN GUARD ────────────────────────────────────────
+    # If the final round was cut off by max_tokens, the SQL Agent may just
+    # be narrating its NEXT planned step without having executed it. Force
+    # one continuation so the investigation actually finishes.
+    if response.stop_reason == "max_tokens":
+        continue_messages = safe_messages + [
+            {"role": "assistant", "content": sql_agent_text},
+            {"role": "user", "content": (
+                "Continue. You were cut off mid-response. If you said you "
+                "were going to check or fetch something, actually call the "
+                "appropriate tool now and complete the investigation. Do "
+                "not repeat or re-explain your plan — execute it."
+            )},
+        ]
+        try:
+            continue_response = _ai_client.messages.create(
+                model=selected_model,
+                system=_cached_sql_agent_prompt(),
+                messages=continue_messages,
+                tools=_SQL_AGENT_TOOLS,
+                temperature=0,
+                max_tokens=max_tokens,
+            )
+            for _ in range(3):
+                if continue_response.stop_reason != "tool_use":
+                    break
+                tool_blocks = [b for b in continue_response.content if b.type == "tool_use"]
+                if not tool_blocks:
+                    break
+                tool_result_blocks = []
+                for tb in tool_blocks:
+                    content, is_error, latest_validated_result, err, err_is_violation = _dispatch_sql_tool(
+                        tb, session_id, original_user_message, latest_validated_result
+                    )
+                    if err is not None:
+                        last_error = err
+                        last_error_is_rule_violation = err_is_violation
+                    tool_result_blocks.append({
+                        "type": "tool_result", "tool_use_id": tb.id,
+                        "content": content, "is_error": is_error,
+                    })
+                continue_messages = continue_messages + [
+                    {"role": "assistant", "content": continue_response.content},
+                    {"role": "user", "content": tool_result_blocks},
+                ]
+                continue_response = _ai_client.messages.create(
+                    model=selected_model, system=_cached_sql_agent_prompt(),
+                    messages=continue_messages,
+                    tools=_SQL_AGENT_TOOLS,
+                    temperature=0, max_tokens=max_tokens,
+                )
+            completed = _extract_text(continue_response.content)
+            if completed:
+                sql_agent_text = completed
+                safe_messages = continue_messages
+        except Exception as e:
+            print(f"⚠️ SQL Agent continuation after max_tokens cutoff failed: {e}")
+
+    return sql_agent_text, latest_validated_result, last_error, last_error_is_rule_violation, safe_messages
+
+
+def _run_narrator_agent(original_user_message: str, latest_validated_result: "QueryResult",
+                         session_id: Optional[str], selected_model: str, max_tokens: int):
+    """
+    Runs the Narrator Agent on ALREADY-VERIFIED data only. Gets a fresh,
+    minimal message list — not the SQL Agent's tool-calling history — just
+    the question and the validated rows. No database access, no SQL
+    rulebook in its prompt; its only tool is choose_chart_spec. This is
+    the actual multi-agent boundary: everything upstream of this point is
+    the SQL Agent's concern, everything from here on is the Narrator's.
+
+    Returns: (reply, pending_chart_spec, narrator_messages) — the last is
+    needed so the fact-binding verifier's regeneration call, if triggered,
+    continues from the same context this agent actually used.
+    """
+    envelope = _format_data_envelope(latest_validated_result) if latest_validated_result else ""
+    narrator_messages = [{
+        "role": "user",
+        "content": (
+            f"Question: {original_user_message}\n\n"
+            f"Verified data (already checked against every business rule — "
+            f"use only these numbers):\n{envelope}"
+        ),
+    }]
+
+    response = _ai_client.messages.create(
+        model=selected_model,
+        system=_cached_narrator_agent_prompt(),
+        messages=narrator_messages,
+        tools=_NARRATOR_AGENT_TOOLS,
+        temperature=0,
+        max_tokens=max_tokens,
+    )
+
     pending_chart_spec: Optional[dict] = None
 
+    # The Narrator only ever has one tool available, so this loop is
+    # intentionally short — a couple of rounds is enough for "call
+    # choose_chart_spec, then write the answer".
+    for _ in range(3):
+        if response.stop_reason != "tool_use":
+            break
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
+            break
+        tool_result_blocks = []
+        for tb in tool_blocks:
+            clean_spec, spec_error = _validate_chart_spec(tb.input, latest_validated_result.columns)
+            if spec_error:
+                tool_result_blocks.append({
+                    "type": "tool_result", "tool_use_id": tb.id,
+                    "content": f"Chart spec rejected: {spec_error}. Real columns available: {latest_validated_result.columns}",
+                    "is_error": True,
+                })
+                continue
+            pending_chart_spec = clean_spec
+            tool_result_blocks.append({
+                "type": "tool_result", "tool_use_id": tb.id,
+                "content": "Chart spec accepted.", "is_error": False,
+            })
+        narrator_messages = narrator_messages + [
+            {"role": "assistant", "content": response.content},
+            {"role": "user", "content": tool_result_blocks},
+        ]
+        response = _ai_client.messages.create(
+            model=selected_model,
+            system=_cached_narrator_agent_prompt(),
+            messages=narrator_messages,
+            tools=[],  # chart spec is a one-shot choice, not re-offered
+            temperature=0,
+            max_tokens=max_tokens,
+        )
+
+    reply = _extract_text(response.content)
+    return reply, pending_chart_spec, narrator_messages
+
+
+def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
+                 session_id: Optional[str] = None, model: str = "sonnet") -> str:
+    """
+    Orchestrator: runs the SQL Agent, and — only if it actually produced
+    validated data — hands off to the Narrator Agent to write the answer.
+    If the turn never needed data (a greeting, an export request, a
+    capabilities question), the SQL Agent's own direct reply is used
+    as-is and the Narrator Agent is never invoked at all.
+    """
     selected_model = ALLOWED_MODELS.get(model, ALLOWED_MODELS["sonnet"])
 
-    # FIX: original_user_message was referenced below but never defined —
-    # this caused "NameError: name 'original_user_message' is not defined"
-    # on every request that triggered the tool loop.
     original_user_message = next(
         (m.get("content", "") for m in reversed(messages)
          if m.get("role") == "user" and isinstance(m.get("content", ""), str)),
@@ -2228,317 +2921,29 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
         else:
             safe_messages.append({"role": m["role"], "content": content})
 
-    response = _ai_client.messages.create(
-        model=selected_model,
-        system=_cached_system_prompt(),
-        messages=safe_messages,
-        tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL, _CHART_SPEC_TOOL],
-        temperature=0,
-        max_tokens=max_tokens,
-    )
+    sql_agent_text, latest_validated_result, last_error, last_error_is_rule_violation, safe_messages = \
+        _run_sql_agent(safe_messages, original_user_message, session_id, selected_model, max_tokens)
 
-    MAX_ROUNDS = 8
-    last_error = None
-    last_error_is_rule_violation = False
+    pending_chart_spec: Optional[dict] = None
 
-    for round_num in range(MAX_ROUNDS):
-        if response.stop_reason != "tool_use":
-            break
-
-        tool_blocks = [b for b in response.content if b.type == "tool_use"]
-        if not tool_blocks:
-            break
-
-        tool_result_blocks = []
-        for tool_block in tool_blocks:
-
-            # --- rulebook lookup branch ----------------------------
-            if tool_block.name == "lookup_business_rule":
-                topic = tool_block.input.get("topic", "")
-                tool_result_blocks.append({
-                    "type":        "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content":     get_rulebook_entry(topic),
-                    "is_error":    False,
-                })
-                continue
-
-            # --- deterministic metric branch ------------------------
-            if tool_block.name == "compute_verified_metric":
-                metric_name = tool_block.input.get("metric_name", "")
-                tool_result_blocks.append({
-                    "type":        "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content":     compute_verified_metric(metric_name, session_id),
-                    "is_error":    False,
-                })
-                continue
-
-            # --- chart spec branch -----------------------------------
-            # Claude picks WHAT to chart (type + real column names); every
-            # number in the rendered chart still comes from Python, from
-            # latest_validated_result.rows — see _validate_chart_spec and
-            # charts.build_chart_html.
-            if tool_block.name == "choose_chart_spec":
-                if latest_validated_result is None:
-                    tool_result_blocks.append({
-                        "type":        "tool_result",
-                        "tool_use_id": tool_block.id,
-                        "content":     "No validated query result yet this turn — call query_clickhouse first.",
-                        "is_error":    True,
-                    })
-                    continue
-                clean_spec, spec_error = _validate_chart_spec(
-                    tool_block.input, latest_validated_result.columns
-                )
-                if spec_error:
-                    tool_result_blocks.append({
-                        "type":        "tool_result",
-                        "tool_use_id": tool_block.id,
-                        "content":     f"Chart spec rejected: {spec_error}. Real columns available: {latest_validated_result.columns}",
-                        "is_error":    True,
-                    })
-                    continue
-                pending_chart_spec = clean_spec
-                tool_result_blocks.append({
-                    "type":        "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content":     "Chart spec accepted.",
-                    "is_error":    False,
-                })
-                continue
-
-            sql = tool_block.input.get("sql", "")
-
-            # --- pre-execution rule gate -------------------------------
-            sql_violations = validate_sql_against_rules(sql, original_user_message)
-            _log_rule_audit(session_id, sql, sql_violations, "pre_execute", original_user_message)
-
-            if sql_violations:
-                cohort_violations = [v for v in sql_violations if "cohort" in v.lower() or "8b" in v.lower()]
-
-                if cohort_violations:
-                    query_result = (
-                        "RULE VIOLATION — cohort funnel SQL rejected (§8b). NOT executed.\n\n"
-                        "Violations:\n"
-                        + "\n".join(f"- {v}" for v in sql_violations)
-                        + """
-
-            ⚠️ REQUIRED: Rewrite from scratch using this exact skeleton:
-
-            WITH cohort AS (
-              SELECT deal_id, deal_stage, amount
-              FROM hs_analytics.deals FINAL
-              WHERE became_<N>_deal_date IS NOT NULL
-                AND deal_stage NOT IN (
-                    '1% - Prospect', '<stages before N%>'
-                )
-                AND pipeline = 'default'
-                AND CASE WHEN deal_type IS NULL THEN 'Not Assigned' ELSE deal_type END
-                    NOT IN ('Partner-Led SMB')
-                AND toInt64(deal_id) IN (
-                    SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs
-                )
-                AND toDate(LEFT(coalesce(became_<N>_deal_date, '1900-01-01'), 10))
-                    BETWEEN '<start_date>' AND '<end_date>'
-            )
-            SELECT
-                deal_stage,
-                countDistinct(deal_id)       AS deal_count,
-                round(SUM(amount) / 1e6, 1) AS pipeline_m
-            FROM cohort
-            GROUP BY deal_stage
-            ORDER BY deal_count DESC
-
-            Fill in <N> and the stage exclusion list from §8b, then resubmit.
-            """
-                    )
-                else:
-                    query_result = (
-                        "RULE VIOLATION — query rejected, NOT executed against the database:\n"
-                        + "\n".join(f"- {v}" for v in sql_violations)
-                        + "\n\nRewrite the SQL to satisfy these rules, then call the tool again."
-                    )
-                is_error = True
-
-            else:
-                query_result = run_clickhouse_query(sql, session_id=session_id)
-                is_error = any(query_result.startswith(p) for p in [
-                    "DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"
-                ])
-
-                # --- post-execution result-level rule check ------------
-                if not is_error:
-                    parsed_rows = _parse_rows_for_validation(query_result, session_id)
-                    result_violations = validate_result_against_rules(
-                        parsed_rows, original_user_message, sql
-                    )
-                    _log_rule_audit(session_id, sql, result_violations, "post_execute", original_user_message)
-                    if result_violations:
-                        query_result += (
-                            "\n\n⚠️ RESULT RULE VIOLATION:\n"
-                            + "\n".join(f"- {v}" for v in result_violations)
-                            + "\nThis result is likely wrong — re-derive using the single-CTE "
-                              "cohort pattern from §8b and call the tool again."
-                        )
-                        is_error = True
-                    else:
-                        # --- deterministic headline injection ------
-                        this_result = _get_result(f"{session_id}:latest") if session_id else None
-                        headline = _compute_deterministic_headline(this_result)
-                        if headline:
-                            query_result += (
-                                f"\n\n[VERIFIED TOTALS — use these exact figures, "
-                                f"do not recompute]: {headline}"
-                            )
-
-                        # --- track this as the turn's latest validated
-                        # result. The actual chart HTML is built once,
-                        # later, at DETERMINISTIC CHART INJECTION — by then
-                        # Claude may also have called choose_chart_spec
-                        # (possibly in this same round, possibly next
-                        # round) to pick chart type/columns/title. If it
-                        # never does, the fallback there uses the same
-                        # auto-detection this used to do inline.
-                        if this_result and this_result.rows:
-                            latest_validated_result = this_result
-
-            if is_error:
-                last_error = query_result
-                last_error_is_rule_violation = bool(sql_violations)
-
-            tool_result_blocks.append({
-                "type":        "tool_result",
-                "tool_use_id": tool_block.id,
-                "content":     query_result,
-                "is_error":    is_error,
-            })
-
-        safe_messages = safe_messages + [
-            {"role": "assistant", "content": response.content},
-            {"role": "user",      "content": tool_result_blocks},
-        ]
-        is_last_round = (round_num == MAX_ROUNDS - 1)
-        response = _ai_client.messages.create(
-            model=selected_model,
-            system=_cached_system_prompt(),
-            messages=safe_messages,
-            tools=[] if is_last_round else [_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL],
-            temperature=0,
-            max_tokens=max_tokens,
+    if latest_validated_result and latest_validated_result.rows:
+        # There's real data — hand off to the Narrator Agent to write the
+        # actual answer. sql_agent_text (whatever the SQL Agent said while
+        # fetching data, e.g. "let me check that") is deliberately discarded.
+        reply, pending_chart_spec, narrator_messages = _run_narrator_agent(
+            original_user_message, latest_validated_result, session_id, selected_model, max_tokens
         )
-
-    reply = _extract_text(response.content)
-
-    # ── INCOMPLETE-TURN GUARD ────────────────────────────────────────
-    # If the final round was cut off by max_tokens (not a natural
-    # tool_use/end_turn stop), "reply" may just be Claude narrating its
-    # NEXT planned step ("let me check...") without executing it. Force
-    # one continuation so the investigation actually finishes instead of
-    # serving unfinished reasoning as the answer.
-    if response.stop_reason == "max_tokens":
-        continue_messages = safe_messages + [
-            {"role": "assistant", "content": reply},
-            {"role": "user", "content": (
-                "Continue. You were cut off mid-response. If you said you "
-                "were going to check or fetch something, actually call the "
-                "appropriate tool now and complete the investigation. Do "
-                "not repeat or re-explain your plan — execute it, then give "
-                "the final answer."
-            )},
-        ]
-        try:
-            continue_response = _ai_client.messages.create(
-                model=selected_model,
-                system=_cached_system_prompt(),
-                messages=continue_messages,
-                tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL, _CHART_SPEC_TOOL],
-                temperature=0,
-                max_tokens=max_tokens,
-            )
-            for _ in range(3):
-                if continue_response.stop_reason != "tool_use":
-                    break
-                tool_blocks = [b for b in continue_response.content if b.type == "tool_use"]
-                if not tool_blocks:
-                    break
-                tool_result_blocks = []
-                for tb in tool_blocks:
-                    if tb.name == "lookup_business_rule":
-                        tool_result_blocks.append({
-                            "type": "tool_result", "tool_use_id": tb.id,
-                            "content": get_rulebook_entry(tb.input.get("topic", "")),
-                            "is_error": False,
-                        })
-                        continue
-                    if tb.name == "compute_verified_metric":
-                        tool_result_blocks.append({
-                            "type": "tool_result", "tool_use_id": tb.id,
-                            "content": compute_verified_metric(tb.input.get("metric_name", ""), session_id),
-                            "is_error": False,
-                        })
-                        continue
-                    if tb.name == "choose_chart_spec":
-                        if latest_validated_result is None:
-                            tool_result_blocks.append({
-                                "type": "tool_result", "tool_use_id": tb.id,
-                                "content": "No validated query result yet this turn — call query_clickhouse first.",
-                                "is_error": True,
-                            })
-                            continue
-                        clean_spec, spec_error = _validate_chart_spec(tb.input, latest_validated_result.columns)
-                        if spec_error:
-                            tool_result_blocks.append({
-                                "type": "tool_result", "tool_use_id": tb.id,
-                                "content": f"Chart spec rejected: {spec_error}. Real columns available: {latest_validated_result.columns}",
-                                "is_error": True,
-                            })
-                            continue
-                        pending_chart_spec = clean_spec
-                        tool_result_blocks.append({
-                            "type": "tool_result", "tool_use_id": tb.id,
-                            "content": "Chart spec accepted.", "is_error": False,
-                        })
-                        continue
-                    sql = tb.input.get("sql", "")
-                    violations = validate_sql_against_rules(sql, original_user_message)
-                    _log_rule_audit(session_id, sql, violations, "pre_execute", original_user_message)
-                    if violations:
-                        result = "RULE VIOLATION — not executed:\n" + "\n".join(violations)
-                        is_err = True
-                    else:
-                        result = run_clickhouse_query(sql, session_id=session_id)
-                        is_err = any(result.startswith(p) for p in
-                            ["DATABASE CONNECTION FAILED", "ERROR:", "DATABASE ERROR:"])
-                        if not is_err and session_id:
-                            # Same rule as the main loop: track this exact
-                            # query's result — chart HTML is built once,
-                            # later, at DETERMINISTIC CHART INJECTION.
-                            this_result = _get_result(f"{session_id}:latest")
-                            if this_result and this_result.rows:
-                                latest_validated_result = this_result
-                    tool_result_blocks.append({
-                        "type": "tool_result", "tool_use_id": tb.id,
-                        "content": result, "is_error": is_err,
-                    })
-                continue_messages = continue_messages + [
-                    {"role": "assistant", "content": continue_response.content},
-                    {"role": "user", "content": tool_result_blocks},
-                ]
-                continue_response = _ai_client.messages.create(
-                    model=selected_model, system=_cached_system_prompt(),
-                    messages=continue_messages,
-                    tools=[_QUERY_TOOL, _RULEBOOK_TOOL, _COMPUTE_METRIC_TOOL, _CHART_SPEC_TOOL],
-                    temperature=0, max_tokens=max_tokens,
-                )
-            completed = _extract_text(continue_response.content)
-            if completed:
-                reply = completed
-                safe_messages = continue_messages  # keep fact-binding verifier in sync
-        except Exception as e:
-            print(f"⚠️ Continuation after max_tokens cutoff failed: {e}")
-            # fall through with the original (incomplete) reply rather than erroring out
-
+        fact_check_messages = narrator_messages
+        fact_check_system = _cached_narrator_agent_prompt()
+    else:
+        # No data was ever fetched — either this was a no-data turn
+        # (greeting, export marker, capability question) that the SQL
+        # Agent already answered directly, or SQL Agent exhausted its
+        # retries. Either way, there's nothing for the Narrator Agent to
+        # narrate.
+        reply = sql_agent_text
+        fact_check_messages = safe_messages
+        fact_check_system = _cached_sql_agent_prompt()
 
     # ── FACT-BINDING VERIFIER ───────────────────────────────────────
     if reply and session_id:
@@ -2548,7 +2953,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
             if violations:
                 _log_rule_audit(session_id, "summary_check", violations, "post_summary", original_user_message)
                 print(f"⚠️ Unverified numbers in summary: {violations}")
-                retry_messages = safe_messages + [
+                retry_messages = fact_check_messages + [
                     {"role": "assistant", "content": reply},
                     {"role": "user", "content": (
                         "Rewrite your last response as a clean, standalone answer "
@@ -2565,7 +2970,7 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                 try:
                     retry_response = _ai_client.messages.create(
                         model=selected_model,
-                        system=_cached_system_prompt(),
+                        system=fact_check_system,
                         messages=retry_messages,
                         tools=[],
                         temperature=0,
@@ -2575,7 +2980,8 @@ def _call_claude(messages: list, max_tokens: int = CHAT_MAX_TOKENS,
                 except Exception as e:
                     print(f"⚠️ Fact-binding regeneration failed: {e}")
                     # keep original reply rather than losing the response entirely
-# ── RESPONSE BUILDER ──────────────────────────────────────────────
+
+    # ── RESPONSE BUILDER ──────────────────────────────────────────────
     return build_final_response(
         reply, latest_validated_result, pending_chart_spec,
         last_error, last_error_is_rule_violation, session_id,
@@ -2639,11 +3045,52 @@ def debug_metrics():
     return get_audit_metrics()
 
 
+@app.post("/feedback")
+def submit_feedback(req: FeedbackRequest):
+    """
+    Records a thumbs up/down from the chat UI. This is Explicit Learning's
+    raw material (a human directly saying whether an answer was good) —
+    kept as a separate signal from the rule-violation audit log (which
+    only tells you whether DIUD's OWN rules were satisfied, not whether a
+    person actually found the answer useful or correct). Deliberately
+    does not change any behavior itself; see /debug/feedback.
+    """
+    _log_feedback(req.session_id, req.user_question, req.assistant_reply,
+                  req.rating, req.issue_type, req.comment)
+    return {"status": "recorded"}
+
+
+@app.get("/debug/feedback")
+def debug_feedback():
+    """
+    Thumbs up/down rate, broken down by question pattern, plus the most
+    recent free-text comments. Sorted worst-first (by pattern) so the
+    question type users are least happy with surfaces at the top rather
+    than needing to be found by eye.
+    """
+    return get_feedback_metrics()
+
+
+@app.get("/debug/alerts")
+def debug_alerts():
+    """
+    The actual answer to "does DIUD stop repeating its mistakes": not
+    automatically, but this is where a repeated mistake becomes
+    impossible to miss instead of requiring someone to notice it by eye
+    across two separate endpoints. Cross-references /debug/metrics and
+    /debug/feedback, flags anything crossing a repeat-failure threshold,
+    and — this is the important part — never acts on any of it itself.
+    Sorted worst-first (critical > high > medium).
+    """
+    return get_flagged_issues()
+
+
 @app.post("/refresh-schema")
 def refresh_schema():
-    global _SYSTEM_PROMPT
+    global _SQL_AGENT_PROMPT, _NARRATOR_AGENT_PROMPT
     schema = discover_schema()
-    _SYSTEM_PROMPT = _build_system_prompt()
+    _SQL_AGENT_PROMPT = _build_sql_agent_prompt()
+    _NARRATOR_AGENT_PROMPT = _build_narrator_agent_prompt()
     return {"status": "refreshed", "tables": list(_LIVE_SCHEMA.keys())}
 
 
