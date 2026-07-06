@@ -490,7 +490,7 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
             intent["mql_needs_deal_join"] = True
 
     if re.search(
-        r'\b(attainment|quota|coverage|vs\.?\s*target|gap\s*to\s*target)\b',
+        r'\b(attainment|quota|coverage|(?:vs\.?|against|versus|compared?\s+to)\s*targets?|gap\s*to\s*target)\b',
         msg,
         re.I,
     ) or re.search(r'\b\d{1,3}\s*%\s*(?:pipegen\s+)?target\b', msg, re.I):
