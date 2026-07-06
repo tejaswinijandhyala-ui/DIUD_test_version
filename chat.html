@@ -278,6 +278,53 @@
     .msg-copy-btn.copied { color: #16a34a; border-color: #bbf7d0; background: #f0fdf4; }
     .msg-copy-btn svg { width: 12px; height: 12px; flex-shrink: 0; }
 
+    /* ── Feedback buttons (thumbs up/down) ───────────────────────────────── */
+    .msg-feedback-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 26px; height: 26px; border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--card); color: var(--txt-dim);
+      cursor: pointer; transition: all .15s;
+    }
+    .msg-feedback-btn svg { width: 13px; height: 13px; pointer-events: none; }
+    .msg-feedback-btn:hover:not(:disabled) { background: var(--blue-lt); color: var(--accent); border-color: var(--accent); }
+    .msg-feedback-btn.selected.up { color: #16a34a; border-color: #bbf7d0; background: #f0fdf4; }
+    .msg-feedback-btn.selected.down { color: #dc2626; border-color: #fecaca; background: #fef2f2; }
+    .msg-feedback-btn:disabled { cursor: default; opacity: .55; }
+    .msg-feedback-thanks { font-size: 11px; color: var(--txt-dim); padding: 0 2px; }
+
+    /* ── Negative-feedback detail modal ──────────────────────────────────── */
+    #feedback-modal-overlay {
+      position: fixed; inset: 0; z-index: 10000;
+      background: rgba(15, 23, 42, .55);
+      display: none; align-items: center; justify-content: center;
+    }
+    #feedback-modal-overlay.open { display: flex; }
+    .feedback-modal-card {
+      background: white; border-radius: 16px; padding: 28px 28px 22px;
+      width: 420px; max-width: calc(100vw - 32px);
+      box-shadow: 0 24px 64px rgba(0,0,0,.35);
+      display: flex; flex-direction: column; gap: 14px;
+    }
+    .feedback-modal-card h3 { font-size: 17px; font-weight: 700; color: var(--txt-main); margin: 0; }
+    .feedback-modal-field { display: flex; flex-direction: column; gap: 6px; }
+    .feedback-modal-field label { font-size: 12.5px; font-weight: 600; color: var(--txt-main); }
+    .feedback-modal-textarea {
+      padding: 9px 11px; border-radius: 8px; border: 1.5px solid var(--border);
+      font-family: inherit; font-size: 12.5px; color: var(--txt-main);
+      background: var(--bg); outline: none; resize: vertical; min-height: 70px;
+    }
+    .feedback-modal-textarea:focus { border-color: var(--accent); background: white; }
+    .feedback-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+    .feedback-modal-cancel-btn, .feedback-modal-submit-btn {
+      padding: 8px 16px; border-radius: 8px; font-size: 12.5px; font-weight: 600;
+      cursor: pointer; font-family: inherit; border: 1.5px solid transparent;
+    }
+    .feedback-modal-cancel-btn { background: white; border-color: var(--border); color: var(--txt-main); }
+    .feedback-modal-cancel-btn:hover { background: var(--bg); }
+    .feedback-modal-submit-btn { background: var(--navy); color: white; }
+    .feedback-modal-submit-btn:hover { opacity: .9; }
+
     /* ── Markdown inside assistant bubbles ──────────────────────────────── */
     .chat-md { overflow-x: auto; }
     .chat-md p  { margin-bottom: 8px; }
@@ -607,6 +654,34 @@
       <button class="login-btn" onclick="doLogin()">Sign In</button>
     </div>
     <div class="login-footer">Decision Intelligence Using Data · Kore.ai</div>
+  </div>
+</div>
+
+<!-- ── Negative Feedback Detail Modal ────────────────────────────────────── -->
+<div id="feedback-modal-overlay">
+  <div class="feedback-modal-card">
+    <h3>What went wrong?</h3>
+    <div class="feedback-modal-field">
+      <label for="feedback-issue-type">Issue type (optional)</label>
+      <select class="ep-select" id="feedback-issue-type" style="width:100%;">
+        <option value="">Select…</option>
+        <option value="wrong_numbers">Wrong numbers or totals</option>
+        <option value="wrong_chart">Wrong or missing chart</option>
+        <option value="wrong_filters">Wrong region/stage/date filters</option>
+        <option value="misunderstood_question">Misunderstood the question</option>
+        <option value="incomplete">Incomplete or cut off</option>
+        <option value="sql_or_db_error">SQL or database error</option>
+        <option value="other">Other</option>
+      </select>
+    </div>
+    <div class="feedback-modal-field">
+      <label for="feedback-comment">Details (optional)</label>
+      <textarea class="feedback-modal-textarea" id="feedback-comment" placeholder="What was unsatisfying about this response?"></textarea>
+    </div>
+    <div class="feedback-modal-actions">
+      <button class="feedback-modal-cancel-btn" onclick="closeFeedbackModal()">Cancel</button>
+      <button class="feedback-modal-submit-btn" onclick="submitFeedbackModal()">Submit</button>
+    </div>
   </div>
 </div>
 
@@ -1064,11 +1139,11 @@
       if (data.dataset_rows > datasetRows) { datasetRows = data.dataset_rows; updateDatasetBadge(); }
       if (data.export_intent) {
         const visibleReply = data.reply.replace('__EXPORT_INTENT__', '').trim();
-        appendBubble('assistant', visibleReply);
+        appendBubble('assistant', visibleReply, text);
         history.push({ role: 'assistant', content: visibleReply });
         openExportPanel(detectExportFormat(text));
       } else {
-        appendBubble('assistant', data.reply);
+        appendBubble('assistant', data.reply, text);
         history.push({ role: 'assistant', content: data.reply });
       }
     } catch(err) {
@@ -1113,7 +1188,7 @@
       const reply = data.export_intent ? data.reply.replace('__EXPORT_INTENT__', '').trim() : data.reply;
       appendBubble('user', origMsg);
       history.push({ role: 'user', content: origMsg });
-      appendBubble('assistant', reply);
+      appendBubble('assistant', reply, origMsg);
       history.push({ role: 'assistant', content: reply });
       if (data.export_intent) openExportPanel(detectExportFormat(origMsg));
       showToast('✅ Retry succeeded', 'success');
@@ -1142,7 +1217,7 @@
   /* ======================================================================
      BUBBLE HELPERS
      ====================================================================== */
-  function appendBubble(role, content) {
+  function appendBubble(role, content, userQuestion) {
     const msgs = document.getElementById('messages');
     const now  = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const div  = document.createElement('div');
@@ -1160,6 +1235,17 @@
                   </svg>
                   Copy
                 </button>
+                <button class="msg-feedback-btn" data-rating="up" title="Good answer">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
+                  </svg>
+                </button>
+                <button class="msg-feedback-btn" data-rating="down" title="Not helpful">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h3a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-3"/>
+                  </svg>
+                </button>
+                <span class="msg-feedback-thanks" hidden>Thanks for the feedback</span>
               </div>
               <div class="msg-time">${now}</div>`;
     } else {
@@ -1189,14 +1275,80 @@
           }, 2000);
         });
       });
+
+      const feedbackBtns = div.querySelectorAll('.msg-feedback-btn');
+      const thanksEl = div.querySelector('.msg-feedback-thanks');
+      feedbackBtns.forEach(function(fbtn) {
+        fbtn.addEventListener('click', function() {
+          const rating = fbtn.dataset.rating;
+          if (rating === 'down') {
+            openFeedbackModal(userQuestion || '', content, feedbackBtns, fbtn, thanksEl);
+            return;
+          }
+          feedbackBtns.forEach(function(b) { b.disabled = true; });
+          fbtn.classList.add('selected', rating);
+          if (thanksEl) thanksEl.hidden = false;
+          sendFeedback({ userQuestion: userQuestion || '', content: content, rating: rating });
+        });
+      });
     }
 
     msgs.appendChild(div);
+
 
     // KEY FIX: hydrate iframes AFTER the element is in the DOM
     if (role === 'assistant') hydrateIframes(div);
 
     msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  /* ======================================================================
+     FEEDBACK
+     ====================================================================== */
+  function sendFeedback({ userQuestion, content, rating, issueType, comment }) {
+    fetch('/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: SESSION_ID,
+        user_question: userQuestion || '',
+        assistant_reply: content,
+        rating: rating,
+        issue_type: issueType || null,
+        comment: comment || null,
+      }),
+    }).catch(function(err) {
+      console.warn('Feedback submission failed (non-blocking):', err);
+    });
+  }
+
+  let _pendingFeedback = null; // { userQuestion, content, btns, downBtn, thanksEl }
+
+  function openFeedbackModal(userQuestion, content, feedbackBtns, downBtn, thanksEl) {
+    _pendingFeedback = { userQuestion, content, feedbackBtns, downBtn, thanksEl };
+    document.getElementById('feedback-issue-type').value = '';
+    document.getElementById('feedback-comment').value = '';
+    document.getElementById('feedback-modal-overlay').classList.add('open');
+  }
+
+  function closeFeedbackModal() {
+    document.getElementById('feedback-modal-overlay').classList.remove('open');
+    _pendingFeedback = null;
+  }
+
+  function submitFeedbackModal() {
+    if (!_pendingFeedback) { closeFeedbackModal(); return; }
+    const issueTypeSelect = document.getElementById('feedback-issue-type');
+    const issueType = issueTypeSelect.value; // e.g. "wrong_numbers", or "" if unselected
+    const comment = document.getElementById('feedback-comment').value.trim();
+    const { userQuestion, content, feedbackBtns, downBtn, thanksEl } = _pendingFeedback;
+
+    sendFeedback({ userQuestion, content, rating: 'down', issueType, comment });
+
+    feedbackBtns.forEach(function(b) { b.disabled = true; });
+    downBtn.classList.add('selected', 'down');
+    if (thanksEl) thanksEl.hidden = false;
+    closeFeedbackModal();
   }
 
   function appendErrorBubble(errorText, retryContext) {
