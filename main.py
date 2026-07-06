@@ -171,6 +171,19 @@ def _validate_chart_spec(spec: dict, columns: List[str]) -> Tuple[Optional[dict]
 _RULE_AUDIT_LOG: List[dict] = []   # most-recent-first, capped
 _FEEDBACK_LOG: List[dict] = []     # most-recent-first, capped — thumbs up/down from users
 
+# ── Human-approved-fix middle ground ─────────────────────────────────────
+# DIUD can DRAFT a proposed fix for a flagged issue (via _draft_fix_proposal,
+# a separate Claude call), but a proposal only ever takes effect after a
+# human calls /debug/proposals/{id}/approve. Scoped deliberately narrow:
+# a proposal can ONLY be an additive plain-English clarification appended
+# to an agent's prompt — never a change to rules.py's actual validation
+# logic. A bad sentence is easy to spot and remove; a bad autonomous edit
+# to executable guardrail code is a different category of risk.
+_PENDING_PROPOSALS: List[dict] = []
+_PROPOSAL_HISTORY: List[dict] = []   # approved + rejected, most-recent-first
+_SQL_AGENT_PATCHES: List[str] = []       # approved clarifications, SQL Agent prompt
+_NARRATOR_AGENT_PATCHES: List[str] = []  # approved clarifications, Narrator prompt
+
 def _log_feedback(session_id: Optional[str], user_question: str,
                    assistant_reply: str, rating: str,
                    issue_type: Optional[str], comment: Optional[str]):
@@ -457,6 +470,130 @@ def get_flagged_issues(
         "flags": flags,
         "note": ("Review surface only — nothing here changes DIUD's behavior automatically. "
                  "A person decides what, if anything, to act on."),
+    }
+
+
+def _gather_evidence_for_flag(flag: dict) -> str:
+    """
+    Pulls a few concrete recent real examples backing a flag, so the Rule
+    Reviewer drafts a fix grounded in actual cases rather than reasoning
+    from a bare count. Deliberately capped at 4 examples per source —
+    enough to see a pattern, not so much that it dominates the prompt.
+    """
+    subject = flag["subject"]
+    source = flag["source"]
+    lines: List[str] = []
+
+    if source in ("rule_engine", "cross_signal"):
+        rule_matches = [
+            e for e in _RULE_AUDIT_LOG
+            if any(v.startswith(f"[{subject}]") for v in e.get("violations", []))
+        ]
+        pattern_matches = [
+            e for e in _RULE_AUDIT_LOG
+            if e.get("pattern") == subject and e.get("violations")
+        ]
+        for e in (rule_matches or pattern_matches)[:4]:
+            lines.append(
+                f"- Question: {e['user_message']!r}\n"
+                f"  SQL: {e['sql_preview'][:200]!r}\n"
+                f"  Violations: {e['violations']}"
+            )
+
+    if source in ("user_feedback", "cross_signal"):
+        fb_matches = [
+            e for e in _FEEDBACK_LOG
+            if e.get("pattern") == subject or e.get("issue_type") == subject
+        ]
+        for e in fb_matches[:4]:
+            lines.append(
+                f"- Question: {e['user_question']!r}\n"
+                f"  Reply preview: {e['assistant_reply_preview'][:200]!r}\n"
+                f"  Rating: {e['rating']}"
+                + (f" ({e['issue_type']})" if e.get("issue_type") else "")
+                + (f"\n  Comment: {e['comment']}" if e.get("comment") else "")
+            )
+
+    return "\n".join(lines) if lines else "No detailed examples available — flag is based on aggregate counts only."
+
+
+_RULE_REVIEWER_SYSTEM_PROMPT = """
+You are DIUD's Rule Reviewer — an internal tool, never user-facing.
+
+You are given ONE flagged recurring problem from DIUD's own audit and
+feedback logs, plus a few real examples backing it. Your job:
+
+1. Diagnose the likely root cause in plain English (2-3 sentences).
+2. Decide which agent's prompt the fix belongs in: "sql_agent" (if this
+   is about how SQL gets written) or "narrator_agent" (if this is about
+   how the final written answer gets formatted/phrased).
+3. Draft ONE short, clear, ADDITIVE clarification (2-4 sentences) to
+   append to that agent's prompt to prevent this specific mistake going
+   forward — written in the same plain-English instructional style the
+   rest of that agent's prompt already uses.
+
+HARD RULES — do not violate these:
+- You may only ADD a clarifying instruction. NEVER propose removing,
+  weakening, loosening, or contradicting an existing rule — especially
+  anything about mandatory filters, casting, or data correctness.
+- If you cannot draft a safe, additive fix with real confidence from the
+  evidence given, say so honestly in the diagnosis and leave
+  PROPOSED_ADDITION empty rather than forcing a suggestion.
+- You are not writing code. Do not reference rules.py, Python, or write
+  SQL syntax rules directly — write a plain-English instruction the way
+  a person would explain it to a colleague.
+
+Respond in EXACTLY this format and nothing else:
+
+DIAGNOSIS: <your diagnosis>
+TARGET_PROMPT: sql_agent OR narrator_agent
+PROPOSED_ADDITION:
+<the clarification text, or leave this blank if you have no safe fix to propose>
+"""
+
+
+def _draft_fix_proposal(flag: dict) -> dict:
+    """
+    Calls a separate, tightly-scoped Claude call to draft a proposed fix
+    for one flagged issue. Returns a proposal dict with status "pending"
+    (has a real proposed addition) or "no_safe_fix" (the reviewer itself
+    declined to guess). Either way, NOTHING is applied here — see
+    /debug/proposals/{id}/approve, which is the only path that ever
+    changes a live prompt, and only after a human calls it.
+    """
+    evidence = _gather_evidence_for_flag(flag)
+    user_msg = (
+        f"FLAGGED ISSUE:\n"
+        f"Source: {flag['source']}\n"
+        f"Subject: {flag['subject']}\n"
+        f"Detail: {flag['detail']}\n\n"
+        f"EVIDENCE:\n{evidence}"
+    )
+    response = _ai_client.messages.create(
+        model=ALLOWED_MODELS["sonnet"],
+        system=_RULE_REVIEWER_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_msg}],
+        temperature=0,
+        max_tokens=800,
+    )
+    text = _extract_text(response.content)
+
+    diagnosis_m = re.search(r"DIAGNOSIS:\s*(.*?)(?=\nTARGET_PROMPT:)", text, re.S)
+    target_m = re.search(r"TARGET_PROMPT:\s*(sql_agent|narrator_agent)", text, re.I)
+    addition_m = re.search(r"PROPOSED_ADDITION:\s*(.*)", text, re.S)
+
+    diagnosis = diagnosis_m.group(1).strip() if diagnosis_m else text[:400]
+    target = target_m.group(1).lower() if target_m else "sql_agent"
+    addition = addition_m.group(1).strip() if addition_m else ""
+
+    return {
+        "id": str(uuid.uuid4())[:8],
+        "created_at": datetime.utcnow().isoformat(),
+        "flag": flag,
+        "diagnosis": diagnosis,
+        "target_prompt": target,
+        "proposed_addition": addition,
+        "status": "pending" if addition else "no_safe_fix",
     }
 
 # =============================================================================
@@ -1866,6 +2003,15 @@ def _build_sql_agent_prompt() -> str:
     schema_start = full.find("LIVE DATABASE SCHEMA")
     schema_block = full[schema_start - 66:] if schema_start != -1 else ""
 
+    patches_block = ""
+    if _SQL_AGENT_PATCHES:
+        patches_block = (
+            "\n\n═══════════════════════════════════════════════════════════════\n"
+            "§16  HUMAN-APPROVED CLARIFICATIONS (see /debug/proposals for origin)\n"
+            "═══════════════════════════════════════════════════════════════\n"
+            + "\n".join(f"- {p}" for p in _SQL_AGENT_PATCHES)
+        )
+
     return f"""
 You are DIUD's SQL Agent — responsible for understanding a business question,
 writing correct ClickHouse SQL, and retrieving validated data. You never
@@ -1884,12 +2030,15 @@ RULE PRIORITY ORDER (highest → lowest):
   3. MANDATORY_BASE_FILTERS (§3)
   4. Tool Usage (§2)
   5. Business & SQL Rules (§4–§13)
+  6. Human-approved clarifications (§16), if any — same authority as §4–§13,
+     added later after a real recurring mistake was reviewed and confirmed
 
 {sec1}
 
 {sections}
 
 {schema_block}
+{patches_block}
 """
 
 
@@ -1908,6 +2057,15 @@ def _build_narrator_agent_prompt() -> str:
     sec14 = _extract_section(full, 14)
     sec15 = _extract_section(full, 15)
 
+    patches_block = ""
+    if _NARRATOR_AGENT_PATCHES:
+        patches_block = (
+            "\n\n═══════════════════════════════════════════════════════════════\n"
+            "HUMAN-APPROVED CLARIFICATIONS (see /debug/proposals for origin)\n"
+            "═══════════════════════════════════════════════════════════════\n"
+            + "\n".join(f"- {p}" for p in _NARRATOR_AGENT_PATCHES)
+        )
+
     return f"""
 You are DIUD's Narrator Agent — responsible for turning already-verified
 data into a clear, executive-grade written answer. You do not have database
@@ -1921,6 +2079,8 @@ RULE PRIORITY ORDER (highest → lowest):
   1. Greeting Rule (§1) — only relevant if you're ever invoked with no data
   2. Formatting & Chart Rules (§14–§15)
   3. Chart spec selection (below)
+  4. Human-approved clarifications, if any — added later after a real
+     recurring mistake was reviewed and confirmed
 
 {sec1}
 
@@ -1929,6 +2089,7 @@ RULE PRIORITY ORDER (highest → lowest):
 {sec14}
 
 {sec15}
+{patches_block}
 """
 
 
@@ -3083,6 +3244,80 @@ def debug_alerts():
     Sorted worst-first (critical > high > medium).
     """
     return get_flagged_issues()
+
+
+@app.get("/debug/proposals")
+def list_proposals():
+    """All pending proposals, plus the last 50 resolved (approved/rejected)."""
+    return {"pending": _PENDING_PROPOSALS, "history": _PROPOSAL_HISTORY[:50]}
+
+
+@app.post("/debug/proposals/draft")
+def draft_proposals():
+    """
+    Drafts a fix proposal for each currently-flagged issue that doesn't
+    already have one pending or previously resolved. Each draft costs one
+    Claude call — this is an explicit action a person triggers, never run
+    automatically by /debug/alerts itself, so checking alerts never
+    silently spends API calls.
+    """
+    flags = get_flagged_issues()["flags"]
+    already_seen = {p["flag"]["subject"] for p in _PENDING_PROPOSALS + _PROPOSAL_HISTORY}
+    drafted = []
+    for flag in flags:
+        if flag["subject"] in already_seen:
+            continue
+        try:
+            proposal = _draft_fix_proposal(flag)
+            _PENDING_PROPOSALS.append(proposal)
+            drafted.append(proposal)
+        except Exception as e:
+            print(f"⚠️ Failed to draft proposal for {flag['subject']}: {e}")
+    return {"drafted": len(drafted), "proposals": drafted}
+
+
+@app.post("/debug/proposals/{proposal_id}/approve")
+def approve_proposal(proposal_id: str):
+    """
+    The ONLY endpoint in the entire system that changes a live agent
+    prompt as a result of the audit/feedback/flag pipeline — and it only
+    ever does so for the exact proposal a human just explicitly approved
+    by ID. Appends the proposed clarification to the target agent's
+    patch list and rebuilds that agent's cached prompt immediately.
+    """
+    global _SQL_AGENT_PROMPT, _NARRATOR_AGENT_PROMPT
+    proposal = next((p for p in _PENDING_PROPOSALS if p["id"] == proposal_id), None)
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found or already resolved.")
+    if not proposal["proposed_addition"]:
+        raise HTTPException(status_code=400, detail="This proposal has no safe fix to apply.")
+
+    if proposal["target_prompt"] == "narrator_agent":
+        _NARRATOR_AGENT_PATCHES.append(proposal["proposed_addition"])
+        _NARRATOR_AGENT_PROMPT = _build_narrator_agent_prompt()
+    else:
+        _SQL_AGENT_PATCHES.append(proposal["proposed_addition"])
+        _SQL_AGENT_PROMPT = _build_sql_agent_prompt()
+
+    proposal["status"] = "approved"
+    proposal["resolved_at"] = datetime.utcnow().isoformat()
+    _PENDING_PROPOSALS.remove(proposal)
+    _PROPOSAL_HISTORY.insert(0, proposal)
+    print(f"[PROPOSAL-APPROVED] {proposal_id} applied to {proposal['target_prompt']}")
+    return {"status": "approved", "applied_to": proposal["target_prompt"]}
+
+
+@app.post("/debug/proposals/{proposal_id}/reject")
+def reject_proposal(proposal_id: str):
+    """Discards a proposal without applying anything. No prompt is touched."""
+    proposal = next((p for p in _PENDING_PROPOSALS if p["id"] == proposal_id), None)
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found or already resolved.")
+    proposal["status"] = "rejected"
+    proposal["resolved_at"] = datetime.utcnow().isoformat()
+    _PENDING_PROPOSALS.remove(proposal)
+    _PROPOSAL_HISTORY.insert(0, proposal)
+    return {"status": "rejected"}
 
 
 @app.post("/refresh-schema")
