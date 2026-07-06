@@ -1,4 +1,3 @@
-
 import csv
 import io
 import json
@@ -173,10 +172,28 @@ _RULE_AUDIT_LOG: List[dict] = []   # most-recent-first, capped
 
 def _log_rule_audit(session_id: Optional[str], sql: str, violations: List[str],
                      stage: str, user_message: str):
+    # Tag every entry with the classified query pattern/metric type (not just
+    # which rule fired) so failure analysis can answer "which KIND of
+    # question fails most" not only "which RULE fires most". Best-effort:
+    # classification failing must never block logging the actual violation.
+    try:
+        intent = get_intent(user_message, sql=sql if sql != "summary_check" else "")
+        pattern_tag = (
+            intent.get("pattern_hint")
+            or intent.get("pattern")
+            or intent.get("metric")
+            or (f"stage_{intent['stage']}" if intent.get("stage") else None)
+            or (f"cohort_{intent['cohort_stage']}" if intent.get("cohort_stage") else None)
+            or "unclassified"
+        )
+    except Exception:
+        pattern_tag = "unclassified"
+
     entry = {
         "ts": datetime.utcnow().isoformat(),
         "session_id": session_id,
-        "stage": stage,                # "pre_execute" | "post_execute"
+        "stage": stage,                # "pre_execute" | "post_execute" | "post_summary"
+        "pattern": pattern_tag,
         "violations": violations,
         "sql_preview": sql[:300],
         "user_message": user_message[:200],
@@ -184,7 +201,50 @@ def _log_rule_audit(session_id: Optional[str], sql: str, violations: List[str],
     _RULE_AUDIT_LOG.insert(0, entry)
     del _RULE_AUDIT_LOG[200:]          # cap log size
     if violations:
-        print(f"[RULE-AUDIT][{stage}] session={session_id} violations={violations}")
+        print(f"[RULE-AUDIT][{stage}][{pattern_tag}] session={session_id} violations={violations}")
+
+
+def get_audit_metrics() -> dict:
+    """
+    Aggregates _RULE_AUDIT_LOG into a queryable success/failure report —
+    the "Tool Success Rate" and "Failure Analysis" metrics that were
+    previously entirely missing. The log was already capturing everything
+    needed; nothing ever added it up. This reads the log fresh each call,
+    so it always reflects the current in-memory window (last 200 events).
+    """
+    total = len(_RULE_AUDIT_LOG)
+    if total == 0:
+        return {
+            "total_events": 0, "clean": 0, "with_violations": 0,
+            "success_rate_pct": None, "by_rule_id": {}, "by_pattern": {},
+            "by_stage": {},
+        }
+
+    clean = sum(1 for e in _RULE_AUDIT_LOG if not e["violations"])
+    with_violations = total - clean
+
+    by_rule_id: Dict[str, int] = {}
+    by_pattern: Dict[str, int] = {}
+    by_stage: Dict[str, int] = {}
+
+    for e in _RULE_AUDIT_LOG:
+        by_stage[e["stage"]] = by_stage.get(e["stage"], 0) + 1
+        if e["violations"]:
+            by_pattern[e["pattern"]] = by_pattern.get(e["pattern"], 0) + 1
+            for v in e["violations"]:
+                # violation strings are formatted "[rule_id] §n ... : message"
+                rule_id = v.split("]")[0].lstrip("[") if v.startswith("[") else "unknown"
+                by_rule_id[rule_id] = by_rule_id.get(rule_id, 0) + 1
+
+    return {
+        "total_events": total,
+        "clean": clean,
+        "with_violations": with_violations,
+        "success_rate_pct": round(clean / total * 100, 1),
+        "by_rule_id": dict(sorted(by_rule_id.items(), key=lambda x: -x[1])),
+        "by_pattern": dict(sorted(by_pattern.items(), key=lambda x: -x[1])),
+        "by_stage": by_stage,
+    }
 
 # =============================================================================
 # ClickHouse HTTP proxy — base helpers
@@ -2563,6 +2623,20 @@ def debug_db():
         "active_sessions":   len(_SESSION_STORE),
         "tests":             tests,
     }
+
+
+@app.get("/debug/metrics")
+def debug_metrics():
+    """
+    Success rate and failure-pattern breakdown over the current in-memory
+    audit window (last 200 rule-check events). Previously this data was
+    logged but never aggregated anywhere — this is the first place it's
+    actually queryable as a number instead of a scrollback of print()
+    lines. NOTE: resets on server restart along with the rest of
+    _RULE_AUDIT_LOG — see the recommendation to move this to external
+    storage if that resolution becomes a real gap in practice.
+    """
+    return get_audit_metrics()
 
 
 @app.post("/refresh-schema")
