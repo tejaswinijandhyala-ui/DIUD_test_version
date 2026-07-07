@@ -1775,6 +1775,22 @@ NOTE — FOR BDR ATTAINMENT:
   Filter actuals WHERE deal_source_rollup = 'BDR' (after source mapping).
   Use the same Pattern C template with that additional source filter.
 
+NOTE — DO NOT BUILD THE ATTAINMENT COMPUTATION ONE CTE AT A TIME:
+  A quick value-check query (e.g. the §4 rule 6 diagnostic —
+  `SELECT DISTINCT fy, quarter FROM <target_table>` — used only to confirm
+  which fy/quarter string format is correct before a 0-row retry) is fine
+  on its own. That is NOT the same thing as submitting one half of the
+  real computation as if it were a complete answer. Once you begin
+  building the actual attainment query, do not call query_clickhouse with
+  only the targets CTE, or only the actuals CTE, or a bare aggregation
+  against the target table, and treat that as your attempt — assemble
+  BOTH the actuals CTE and the targets CTE, plus the LEFT JOIN between
+  them, before running it. A single-CTE query that aggregates a target
+  column (SUM/AVG/COUNT of amount_target_*, deals_target_*, mql_target,
+  or quota) without an accompanying actuals CTE in the SAME query is
+  always an incomplete attempt for an attainment question — even if you
+  intend to add the other CTE in a follow-up call.
+
 ═══════════════════════════════════════════════════════════════
 §9  FISCAL YEAR AND DATE RULES
 ═══════════════════════════════════════════════════════════════
