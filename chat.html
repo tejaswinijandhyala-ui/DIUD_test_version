@@ -483,6 +483,69 @@
     }
     .export-panel.open { width: var(--panel-w); min-width: var(--panel-w); }
 
+    /* ── Admin Panel (debug reports UI, replaces raw API browsing) ───────── */
+    .admin-panel {
+      width: 0; min-width: 0;
+      background: var(--white);
+      border-left: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+      transition: var(--panel-trans);
+      flex-shrink: 0; position: relative;
+      box-shadow: -4px 0 24px rgba(13,27,62,.07);
+    }
+    .admin-panel.open { width: var(--panel-w); min-width: var(--panel-w); }
+    .admin-header {
+      padding: 18px 20px 14px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      flex-shrink: 0; background: var(--white);
+    }
+    .admin-title { font-size: 14px; font-weight: 700; color: var(--navy); }
+    .admin-body { flex: 1; overflow-y: auto; padding: 16px 20px; }
+
+    .admin-token-gate { display: flex; flex-direction: column; gap: 10px; padding-top: 40px; }
+    .admin-token-gate p { font-size: 12px; color: var(--txt-dim); margin: 0 0 4px; }
+
+    .admin-tabs { display: flex; gap: 6px; padding: 0 20px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .admin-tab {
+      padding: 6px 12px; border-radius: 7px; border: 1px solid transparent;
+      background: transparent; font-size: 12px; font-weight: 600; color: var(--txt-dim);
+      cursor: pointer; font-family: inherit;
+    }
+    .admin-tab.active { background: var(--blue-lt); color: var(--accent); border-color: var(--accent); }
+    .admin-tab:hover:not(.active) { background: var(--bg); }
+
+    .admin-card {
+      border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+      margin-bottom: 10px; border-left-width: 4px;
+    }
+    .admin-card.sev-critical { border-left-color: #dc2626; }
+    .admin-card.sev-high { border-left-color: #f97316; }
+    .admin-card.sev-medium { border-left-color: #eab308; }
+    .admin-card.sev-none { border-left-color: var(--border); }
+    .admin-card-title { font-size: 12.5px; font-weight: 700; color: var(--txt-main); margin-bottom: 4px; }
+    .admin-card-detail { font-size: 12px; color: var(--txt-main); line-height: 1.5; margin-bottom: 6px; }
+    .admin-card-meta { font-size: 10.5px; color: var(--txt-dim); text-transform: uppercase; letter-spacing: .4px; margin-bottom: 6px; }
+    .admin-card-actions { display: flex; gap: 6px; margin-top: 8px; }
+    .admin-btn {
+      padding: 6px 12px; border-radius: 7px; font-size: 11.5px; font-weight: 600;
+      cursor: pointer; font-family: inherit; border: 1.5px solid transparent;
+    }
+    .admin-btn-approve { background: #f0fdf4; color: #16a34a; border-color: #bbf7d0; }
+    .admin-btn-approve:hover { background: #16a34a; color: white; }
+    .admin-btn-reject { background: #fef2f2; color: #dc2626; border-color: #fecaca; }
+    .admin-btn-reject:hover { background: #dc2626; color: white; }
+    .admin-btn-secondary { background: var(--bg); color: var(--txt-main); border-color: var(--border); width: 100%; margin-bottom: 12px; }
+    .admin-btn-secondary:hover { background: var(--blue-lt); border-color: var(--accent); color: var(--accent); }
+    .admin-btn:disabled { opacity: .5; cursor: default; }
+
+    .admin-stat-row { display: flex; gap: 10px; margin-bottom: 14px; }
+    .admin-stat { flex: 1; text-align: center; padding: 10px; border-radius: 9px; background: var(--bg); }
+    .admin-stat-num { font-size: 19px; font-weight: 700; color: var(--navy); }
+    .admin-stat-label { font-size: 10px; color: var(--txt-dim); text-transform: uppercase; letter-spacing: .4px; margin-top: 2px; }
+    .admin-empty { font-size: 12px; color: var(--txt-dim); text-align: center; padding: 30px 10px; }
+    .admin-loading { font-size: 12px; color: var(--txt-dim); text-align: center; padding: 30px 10px; }
+
     .ep-header {
       padding: 18px 20px 14px;
       border-bottom: 1px solid var(--border);
@@ -698,6 +761,7 @@
   </div>
   <div class="topbar-actions">
     <a href="/debug/db" target="_blank" class="debug-link" title="Test ClickHouse connectivity">🔌 Debug DB</a>
+    <button class="debug-link" style="cursor:pointer;" onclick="openAdminPanel()" title="View debug reports (metrics, feedback, alerts, proposals)">🛠 Admin</button>
     <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
   </div>
 </header>
@@ -942,6 +1006,29 @@
         </svg>
         <span id="ep-csv-label">Download CSV</span>
       </button>
+    </div>
+  </aside>
+
+  <aside class="admin-panel" id="admin-panel">
+    <div class="admin-header">
+      <div class="admin-title">🛠 Debug Reports</div>
+      <button class="ep-close" onclick="closeAdminPanel()" title="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="admin-tabs" id="admin-tabs" style="display:none;">
+      <button class="admin-tab active" data-tab="metrics" onclick="switchAdminTab('metrics')">Metrics</button>
+      <button class="admin-tab" data-tab="feedback" onclick="switchAdminTab('feedback')">Feedback</button>
+      <button class="admin-tab" data-tab="alerts" onclick="switchAdminTab('alerts')">Alerts</button>
+      <button class="admin-tab" data-tab="proposals" onclick="switchAdminTab('proposals')">Proposals</button>
+    </div>
+    <div class="admin-body" id="admin-body">
+      <div class="admin-token-gate" id="admin-token-gate">
+        <p>Enter the admin token to view DIUD's debug reports (rule metrics, user feedback, flagged issues, and fix proposals).</p>
+        <input class="ep-input" id="admin-token-input" type="password" placeholder="Admin token…" onkeydown="if(event.key==='Enter') unlockAdminPanel()">
+        <button class="ep-generate-btn" onclick="unlockAdminPanel()">Unlock</button>
+        <p id="admin-token-error" style="color:#dc2626;"></p>
+      </div>
     </div>
   </aside>
 </div>
@@ -1691,7 +1778,175 @@ async function generatePreview() {
     }
   }
 
+  /* ======================================================================
+     ADMIN PANEL — a real UI for the debug reports, instead of raw API calls
+     ====================================================================== */
+  let _adminToken = null; // held in memory only for this tab session, never persisted
+
+  function openAdminPanel() {
+    document.getElementById('admin-panel').classList.add('open');
+    if (_adminToken) { renderAdminTab('metrics'); }
+  }
+  function closeAdminPanel() {
+    document.getElementById('admin-panel').classList.remove('open');
+  }
+
+  async function unlockAdminPanel() {
+    const tokenInput = document.getElementById('admin-token-input');
+    const errEl = document.getElementById('admin-token-error');
+    const token = tokenInput.value.trim();
+    if (!token) { errEl.textContent = 'Enter a token.'; return; }
+
+    // Verify the token by hitting the lightest gated endpoint before
+    // committing to it — avoids silently "unlocking" the UI with a token
+    // that's actually wrong and only failing later on each individual tab.
+    try {
+      const res = await fetch('/debug/metrics', { headers: { 'X-Admin-Token': token } });
+      if (res.status === 401) { errEl.textContent = 'Invalid token.'; return; }
+      if (res.status === 503) { errEl.textContent = 'Admin surface not configured on the server (DEV_ADMIN_TOKEN unset).'; return; }
+      if (!res.ok) { errEl.textContent = 'Unexpected error checking token.'; return; }
+    } catch (e) {
+      errEl.textContent = 'Could not reach the server.'; return;
+    }
+
+    _adminToken = token;
+    errEl.textContent = '';
+    document.getElementById('admin-token-gate').style.display = 'none';
+    document.getElementById('admin-tabs').style.display = 'flex';
+    renderAdminTab('metrics');
+  }
+
+  function switchAdminTab(tab) {
+    document.querySelectorAll('.admin-tab').forEach(function(b) {
+      b.classList.toggle('active', b.dataset.tab === tab);
+    });
+    renderAdminTab(tab);
+  }
+
+  async function adminFetch(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({ 'X-Admin-Token': _adminToken }, opts.headers || {});
+    const res = await fetch(path, opts);
+    if (res.status === 401) {
+      _adminToken = null;
+      document.getElementById('admin-token-gate').style.display = 'flex';
+      document.getElementById('admin-tabs').style.display = 'none';
+      throw new Error('Token expired or invalid — please unlock again.');
+    }
+    return res.json();
+  }
+
+  async function renderAdminTab(tab) {
+    const body = document.getElementById('admin-body');
+    body.innerHTML = '<div class="admin-loading">Loading…</div>';
+    try {
+      if (tab === 'metrics') await renderAdminMetrics(body);
+      else if (tab === 'feedback') await renderAdminFeedback(body);
+      else if (tab === 'alerts') await renderAdminAlerts(body);
+      else if (tab === 'proposals') await renderAdminProposals(body);
+    } catch (e) {
+      body.innerHTML = `<div class="admin-empty">${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  async function renderAdminMetrics(body) {
+    const d = await adminFetch('/debug/metrics');
+    if (!d.total_events) { body.innerHTML = '<div class="admin-empty">No rule-check events logged yet.</div>'; return; }
+    let html = `<div class="admin-stat-row">
+      <div class="admin-stat"><div class="admin-stat-num">${d.success_rate_pct}%</div><div class="admin-stat-label">Success rate</div></div>
+      <div class="admin-stat"><div class="admin-stat-num">${d.total_events}</div><div class="admin-stat-label">Total checks</div></div>
+      <div class="admin-stat"><div class="admin-stat-num">${d.with_violations}</div><div class="admin-stat-label">Violations</div></div>
+    </div>`;
+    html += '<div class="admin-card-title">Failures by rule</div>';
+    const ruleEntries = Object.entries(d.by_rule_id || {});
+    if (!ruleEntries.length) html += '<div class="admin-empty">None yet.</div>';
+    ruleEntries.forEach(function([id, count]) {
+      html += `<div class="admin-card sev-none"><div class="admin-card-detail"><b>${escapeHtml(id)}</b> — ${count} time(s)</div></div>`;
+    });
+    body.innerHTML = html;
+  }
+
+  async function renderAdminFeedback(body) {
+    const d = await adminFetch('/debug/feedback');
+    if (!d.total_feedback) { body.innerHTML = '<div class="admin-empty">No feedback submitted yet.</div>'; return; }
+    let html = `<div class="admin-stat-row">
+      <div class="admin-stat"><div class="admin-stat-num">${d.positive_rate_pct}%</div><div class="admin-stat-label">Positive rate</div></div>
+      <div class="admin-stat"><div class="admin-stat-num">${d.thumbs_up}</div><div class="admin-stat-label">👍</div></div>
+      <div class="admin-stat"><div class="admin-stat-num">${d.thumbs_down}</div><div class="admin-stat-label">👎</div></div>
+    </div>`;
+    html += '<div class="admin-card-title">Recent comments</div>';
+    if (!d.recent_comments.length) html += '<div class="admin-empty">None yet.</div>';
+    d.recent_comments.forEach(function(c) {
+      html += `<div class="admin-card sev-none">
+        <div class="admin-card-meta">${escapeHtml(c.pattern)} · ${escapeHtml(c.issue_type || 'no category')}</div>
+        <div class="admin-card-detail">${escapeHtml(c.comment || '(no comment)')}</div>
+      </div>`;
+    });
+    body.innerHTML = html;
+  }
+
+  async function renderAdminAlerts(body) {
+    const d = await adminFetch('/debug/alerts');
+    if (!d.flag_count) { body.innerHTML = '<div class="admin-empty">No flagged issues right now.</div>'; return; }
+    let html = '';
+    d.flags.forEach(function(f) {
+      html += `<div class="admin-card sev-${f.severity}">
+        <div class="admin-card-meta">${f.severity.toUpperCase()} · ${escapeHtml(f.source)}</div>
+        <div class="admin-card-title">${escapeHtml(f.subject)}</div>
+        <div class="admin-card-detail">${escapeHtml(f.detail)}</div>
+        <div class="admin-card-detail" style="color:var(--txt-dim);font-style:italic;">${escapeHtml(f.suggested_action)}</div>
+      </div>`;
+    });
+    body.innerHTML = html;
+  }
+
+  async function renderAdminProposals(body) {
+    const d = await adminFetch('/debug/proposals');
+    let html = '<button class="admin-btn admin-btn-secondary" onclick="draftAdminProposals()">Draft proposals for current alerts</button>';
+    html += '<div id="admin-draft-status"></div>';
+    if (!d.pending.length) {
+      html += '<div class="admin-empty">No pending proposals. Click above to draft fixes for current alerts.</div>';
+    }
+    d.pending.forEach(function(p) {
+      const disabled = p.status === 'no_safe_fix' ? 'disabled' : '';
+      html += `<div class="admin-card sev-${p.flag.severity || 'none'}">
+        <div class="admin-card-meta">${escapeHtml(p.target_prompt)} · ${escapeHtml(p.flag.subject)}</div>
+        <div class="admin-card-detail"><b>Diagnosis:</b> ${escapeHtml(p.diagnosis)}</div>
+        ${p.proposed_addition ? `<div class="admin-card-detail"><b>Proposed addition:</b> ${escapeHtml(p.proposed_addition)}</div>` : '<div class="admin-card-detail" style="color:var(--txt-dim);">No safe fix proposed.</div>'}
+        <div class="admin-card-actions">
+          <button class="admin-btn admin-btn-approve" ${disabled} onclick="resolveAdminProposal('${p.id}','approve',this)">Approve</button>
+          <button class="admin-btn admin-btn-reject" onclick="resolveAdminProposal('${p.id}','reject',this)">Reject</button>
+        </div>
+      </div>`;
+    });
+    body.innerHTML = html;
+  }
+
+  async function draftAdminProposals() {
+    const statusEl = document.getElementById('admin-draft-status');
+    statusEl.innerHTML = '<div class="admin-loading">Drafting…</div>';
+    try {
+      const d = await adminFetch('/debug/proposals/draft', { method: 'POST' });
+      statusEl.innerHTML = '';
+      renderAdminTab('proposals');
+    } catch (e) {
+      statusEl.innerHTML = `<div class="admin-empty">${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  async function resolveAdminProposal(id, action, btnEl) {
+    const card = btnEl.closest('.admin-card');
+    card.querySelectorAll('button').forEach(function(b) { b.disabled = true; });
+    try {
+      await adminFetch(`/debug/proposals/${id}/${action}`, { method: 'POST' });
+      renderAdminTab('proposals');
+    } catch (e) {
+      card.insertAdjacentHTML('beforeend', `<div class="admin-empty">${escapeHtml(e.message)}</div>`);
+    }
+  }
+
   checkConn();
 </script>
+
 </body>
 </html>
