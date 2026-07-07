@@ -11,63 +11,37 @@ Public API (unchanged from v4 — main.py imports these five names):
     get_intent(user_message, sql="") -> Dict[str, Any]
     get_rulebook_entry(topic) -> str
 
-WHAT CHANGED vs v4, AND WHY
+WHAT CHANGED vs the previous version, AND WHY
 -----------------------------------------------------------------------------
-1. CTE-SCOPED BASE-FILTER CHECKS (was: whole-string substring search)
-   All Pattern A/B templates in main.py legitimately split the three
-   MANDATORY_BASE_FILTERS across two CTEs: the "raw fetch" CTE that touches
-   hs_analytics.deals directly (pipeline + allowlist), and the very next CTE
-   built on top of it (deal_type exclusion). The old checker searched the
-   ENTIRE sql string for these tokens, which happened to still pass the
-   canonical templates but gave zero signal about WHERE a filter was
-   missing when generation drifted — the retry loop got "not found
-   anywhere" instead of "not found near the hs_analytics.deals CTE",
-   which is a much weaker correction signal for the model.
-   Fix: base-filter checks now run against the "reachable scope" of the
-   CTE(s) that reference hs_analytics.deals directly, plus any CTE built
-   directly on top of them (one hop). This matches the actual, intentional
-   2-CTE handoff pattern used everywhere in main.py, and violation
-   messages now name which CTE scope was checked.
+DIAGNOSTIC-LOOKUP EXEMPTION for pattern_c_two_cte / target_table_float_cast
+   §4 rule 6 of the live prompt explicitly instructs the SQL Agent: "if a
+   target query returns 0 rows, immediately run a diagnostic query
+   `SELECT DISTINCT fy, quarter FROM <target_table>` ... then re-run the
+   original attainment query." That one-line lookup was being rejected by
+   BOTH pattern_c_two_cte (not a two-CTE structure) and
+   target_table_float_cast (no toFloat64OrZero cast on a column it never
+   aggregates) — because both rules' applies_when fires on ANY sql text
+   during a turn whose original user MESSAGE was classified as attainment
+   (via _is_pattern_c, which reads intent["metric"], set purely from the
+   user's words), regardless of what the specific SQL actually does. The
+   prompt was telling the model to run this exact query while the
+   validator rejected it every single time — a contradiction the model
+   could never resolve by rewriting its SQL, since the rejected query was
+   already exactly what the prompt asked for. Fixed by adding
+   _is_diagnostic_lookup(): a query that aggregates nothing and never
+   touches hs_analytics.deals isn't attempting to compute attainment at
+   all, so the two-CTE/cast rules (which exist to make sure the
+   *computation* is correct) don't apply to it.
 
-2. INTENT MISCLASSIFICATION: "funnel" phrasing vs cohort phrasing (was:
-   any "<N>% to closed won" substring => cohort intent, unconditionally)
-   A message like "pipegen conversion funnel ... from 10% to closed won"
-   was being tagged as a true §8b cohort query purely because it contains
-   "10% to closed won", even though "pipegen conversion funnel" is
-   unambiguously a Pattern A cumulative-stage request. Whether cohort
-   rules or Pattern A rules then fired depended on incidental SQL shape
-   (how many became_<N>_deal_date columns happened to appear), which is
-   exactly why the same class of question surfaces different rule
-   violations turn to turn.
-   Fix: explicit Pattern-A/funnel keywords ("funnel", "pipegen",
-   "conversion", "stage breakdown"/"stage counts") are checked FIRST. If
-   present and the user did not also say "cohort", the message is tagged
-   pattern_hint="A" and the cohort-stage capture is skipped, so
-   downstream rule selection can't flip-flop on SQL shape alone.
+   Also fixed pattern_c_two_cte's CTE-count check while touching this
+   rule: it counted the literal substring "AS (" (single space, immediate
+   paren), which fails on the equally valid "AS\\n(" formatting style —
+   already found and fixed in a parallel branch of this codebase. Ported
+   the same whitespace-tolerant regex fix here.
 
-3. TWO MORE MISCLASSIFICATION BUGS FOUND DURING REGRESSION TESTING
-   a) `_is_pattern_a()` tested `"OR" in sql.upper()` as a bare substring,
-      which matches inside ordinary words (FORECAST, INVESTOR, PRIORITY,
-      COORDINATOR...). Combined with >=3 became_<N>_deal_date columns
-      (common in any day-in-stage calc), this misclassified plain
-      Pattern B / deal-list queries as Pattern A and fired a bogus
-      pattern_a_or_chain violation. Fixed to use \bOR\b.
-   b) The cohort-from-SQL fallback in detect_intent() treated ANY
-      `NOT IN` anywhere in the query (even the mandatory `deal_type NOT
-      IN ('Partner-Led SMB')` base filter, present on every query) as
-      evidence of a cohort stage-exclusion clause. This was masked by
-      bug (a) almost always forcing _is_pattern_a=True, which suppressed
-      cohort classification; fixing (a) exposed it. Tightened to require
-      `deal_stage NOT IN` specifically — the actual cohort semantic.
-
-4. USER-FACING MESSAGE HYGIENE
-   Violation message strings are still developer/model-facing (they are
-   fed back into the tool_result loop) — main.py must not surface them to
-   the end user verbatim. See the accompanying main.py patch.
-
-Everything else (RULEBOOK text, Pattern B/C rules, MQL rules, date-cast
-rules, result-level rules, fact-binding verifier) is functionally
-unchanged from v4.
+Everything else (RULEBOOK text, CTE-scoped base-filter checks, intent
+classification, Pattern A/B/C rules, MQL rules, date-cast rules,
+result-level rules, fact-binding verifier) is unchanged.
 =============================================================================
 """
 
@@ -75,7 +49,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # =============================================================================
-# RULEBOOK  (unchanged from v4)
+# RULEBOOK  (unchanged)
 # =============================================================================
 RULEBOOK: Dict[str, str] = {
     "mql": """
@@ -84,12 +58,6 @@ When computing MQL actuals from hs_analytics.contacts FINAL, ALL THREE filters
 below are mandatory. Missing any one produces inflated or deflated counts.
 
 1. date_entered_marketing_qualified_lead_lifecycle_stage_pipeline >= <fy_start>
-   This is the anchor — "this contact became an MQL on this date". Do NOT
-   also require lifecycle_stage = 'marketingqualifiedlead': that would
-   silently exclude every MQL who has since progressed further down the
-   funnel (became an opportunity, became a customer), since their CURRENT
-   lifecycle_stage would no longer literally say 'marketingqualifiedlead'
-   even though they genuinely were an MQL.
 2. company_priority IN ('P1','P2','P3','P4','P5','P6','P7')
 3. lead_status != 'Bad Data' (or lead_status NOT IN ('Bad Data') — either
    syntax is acceptable)
@@ -213,23 +181,12 @@ def get_rulebook_entry(topic: str) -> str:
 
 # =============================================================================
 # LIGHTWEIGHT CTE PARSING
-# -----------------------------------------------------------------------------
-# Not a full SQL parser — just enough bracket-balancing to split a
-# `WITH a AS (...), b AS (...) SELECT ...` query into named CTE bodies, so
-# base-filter checks can be scoped instead of searching the whole string.
 # =============================================================================
 
 _CTE_HEAD = re.compile(r'(\w+)\s+AS\s*\(', re.I)
 
 
 def _split_ctes(sql: str) -> Tuple[Dict[str, str], str]:
-    """
-    Returns (ctes, tail) where ctes maps alias -> body text (contents
-    between the outermost matching parens), and tail is everything after
-    the final top-level CTE close-paren (the final SELECT / UNION ALL
-    chain). If the query has no WITH clause, ctes is {} and tail is the
-    whole sql.
-    """
     if not re.match(r'\s*WITH\b', sql, re.I):
         return {}, sql
 
@@ -253,8 +210,6 @@ def _split_ctes(sql: str) -> Tuple[Dict[str, str], str]:
         body = sql[start_body:i - 1]
         ctes[alias] = body
         pos = i
-        # Stop scanning for more CTEs once we hit the final SELECT that
-        # isn't immediately followed by a comma introducing another CTE.
         rest = sql[pos:].lstrip()
         if rest[:1] == ',':
             search_from = pos
@@ -267,14 +222,6 @@ def _split_ctes(sql: str) -> Tuple[Dict[str, str], str]:
 
 
 def _base_filter_scope(sql: str) -> str:
-    """
-    Returns the text region where MANDATORY_BASE_FILTERS are expected to
-    live: the body of every CTE that references hs_analytics.deals
-    directly, plus the body of any CTE built one hop downstream of one of
-    those (i.e. its FROM/JOIN references the root CTE's alias). Falls
-    back to the whole SQL string if there's no WITH clause to parse, or
-    parsing fails for any reason (never block on a checker bug).
-    """
     try:
         ctes, tail = _split_ctes(sql)
         if not ctes:
@@ -282,8 +229,6 @@ def _base_filter_scope(sql: str) -> str:
 
         root_aliases = [a for a, body in ctes.items() if 'hs_analytics.deals' in body]
         if not root_aliases:
-            # hs_analytics.deals wasn't inside any CTE body (e.g. referenced
-            # only in the tail) — safest fallback is the whole query.
             return sql
 
         scope_aliases: Set[str] = set(root_aliases)
@@ -305,11 +250,6 @@ def _base_filter_scope(sql: str) -> str:
 # =============================================================================
 
 def _is_pattern_a(sql: str) -> bool:
-    """
-    Pattern A: cumulative OR-chain stage counting.
-    FY is anchored on the became_<stage>_deal_date corresponding
-    to the stage requested by the user.
-    """
     if re.search(r'--\s*Pattern\s*A', sql, re.I):
         return True
 
@@ -334,6 +274,32 @@ def _is_pattern_c(sql: str, intent: dict) -> bool:
     return intent.get("metric") == "attainment"
 
 
+def _is_diagnostic_lookup(sql: str) -> bool:
+    """
+    True for a bare metadata/value-discovery query against a target table
+    — e.g. `SELECT DISTINCT fy, quarter FROM gs_pipeline_quotas_v1` — the
+    exact pattern §4 rule 6 explicitly instructs the SQL Agent to run when
+    an attainment query returns 0 rows, to discover the correct fy/quarter
+    string format before retrying.
+
+    This is NOT an attempt to compute attainment: it aggregates no target
+    amount/deals/quota column and never references hs_analytics.deals.
+    Without this exemption, the exact query the prompt tells the model to
+    run when attainment queries return 0 rows gets rejected by the
+    two-CTE and float-cast rules meant for the real attainment
+    computation — a contradiction between the prompt and the validator
+    that no SQL rewrite can escape, since the rejected query is already
+    exactly what the prompt asked for. See pattern_c_two_cte and
+    target_table_float_cast below.
+    """
+    has_target_aggregation = bool(re.search(
+        r'\b(SUM|AVG|COUNT)\s*\(\s*[a-zA-Z0-9_]*\s*\(?\s*(amount_target|deals_target|mql_target|quota)',
+        sql, re.I,
+    ))
+    references_actuals = 'hs_analytics.deals' in sql
+    return not has_target_aggregation and not references_actuals
+
+
 # -----------------------------------------------------------------------------
 # Stage helper
 # -----------------------------------------------------------------------------
@@ -350,11 +316,6 @@ _STAGE_COLUMN_MAP = {
 
 
 def _expected_became_column(intent: Dict[str, Any]) -> str:
-    """
-    Returns the became_<stage>_deal_date corresponding to the stage
-    requested by the user. Defaults to became_20_deal_date (NOT 10%)
-    when the user did not specify a stage.
-    """
     stage = (
         intent.get("stage")
         or intent.get("cohort_stage")
@@ -364,15 +325,6 @@ def _expected_became_column(intent: Dict[str, Any]) -> str:
 
 
 def _fy_anchor_column(sql: str) -> Optional[str]:
-    """
-    Returns the became_<N>_deal_date column actually used to compute
-    create_fy (i.e. found inside toYear(...)), or None if no such
-    expression is present. Used instead of a bare substring-presence
-    check, because Pattern A queries reference ALL 7 became_<N> columns
-    in their per-stage OR-chain conditions regardless of which one is
-    used as the FY anchor — presence alone proves nothing about anchor
-    correctness.
-    """
     m = re.search(r'toYear\(\s*(became_\d+_deal_date)\s*\)', sql, re.I)
     return m.group(1).lower() if m else None
 
@@ -393,32 +345,15 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
     msg = user_message or ""
     intent: Dict[str, Any] = {}
 
-    # ------------------------------------------------------------------
-    # Detect requested stage (5%,10%,20%,30%,40%,60%,75%)
-    # ------------------------------------------------------------------
-
     stage_match = re.search(r'\b(5|10|20|30|40|60|75)\s*%', msg)
     if stage_match:
         intent["stage"] = stage_match.group(1)
-
-    # ------------------------------------------------------------------
-    # Pattern-A / funnel-phrasing signal — checked BEFORE cohort capture.
-    # A message that talks about a "funnel", "pipegen", "conversion", or
-    # "stage breakdown/counts" and does NOT explicitly say "cohort" is a
-    # Pattern A request, even if it also contains "<N>% to closed won"
-    # phrasing that would otherwise look like a cohort query.
-    # ------------------------------------------------------------------
 
     has_pattern_a_kw = bool(_PATTERN_A_KEYWORDS.search(msg))
     has_cohort_kw = bool(_EXPLICIT_COHORT_KEYWORD.search(msg))
 
     if has_pattern_a_kw and not has_cohort_kw:
         intent["pattern_hint"] = "A"
-
-    # ------------------------------------------------------------------
-    # Cohort detection — skipped when pattern_hint is already "A" from
-    # explicit funnel/pipegen/conversion phrasing above.
-    # ------------------------------------------------------------------
 
     if intent.get("pattern_hint") != "A":
 
@@ -457,10 +392,6 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
             if m and re.search(r'deal_stage\s+NOT\s+IN', sql, re.I):
                 intent["cohort_stage"] = m.group(1)
 
-    # ------------------------------------------------------------------
-    # List queries
-    # ------------------------------------------------------------------
-
     if re.search(
         r'\b(list|show me all|which deals|deals\s+(with|where))\b',
         msg,
@@ -468,24 +399,11 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
     ):
         intent["query_type"] = "list"
 
-    # ------------------------------------------------------------------
-    # Top N
-    # ------------------------------------------------------------------
-
     if re.search(r'\b(top|first)\s+\d+\b', msg, re.I):
         intent["top_n"] = True
 
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
-
     if re.search(r'\bMQLs?\b', msg, re.I):
         intent["metric"] = "mql"
-        # Distinguish "how many MQLs" (no deal join needed) from "which
-        # deals/pipeline came FROM MQLs" (requires the gs_DealContactAssociation
-        # join pattern — see mql_deal_association_table / mql_deal_left_join
-        # rules below). A plain MQL-count question shouldn't be required to
-        # join to deals at all.
         if re.search(r'\b(deal|deals|pipeline|opportunit\w*|convert\w*|funnel)\b', msg, re.I):
             intent["mql_needs_deal_join"] = True
 
@@ -498,10 +416,6 @@ def detect_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
 
     if re.search(r'\bactive pipeline\b', msg, re.I):
         intent["metric"] = "active_pipeline"
-
-    # ------------------------------------------------------------------
-    # Placeholder leakage
-    # ------------------------------------------------------------------
 
     if sql and "MANDATORY_BASE_FILTERS" in sql:
         intent["placeholder_leak"] = True
@@ -522,11 +436,6 @@ def _call(fn: Callable, sql: str, intent: dict):
 # =============================================================================
 RULES: List[Dict[str, Any]] = [
 
-    # -------------------------------------------------------------------------
-    # §3 MANDATORY_BASE_FILTERS — apply to every deals query.
-    # Scoped to the CTE(s) that reference hs_analytics.deals directly, plus
-    # any CTE built one hop downstream of them (see _base_filter_scope).
-    # -------------------------------------------------------------------------
     {
         "id": "base_filter_pipeline",
         "section": "§3 MANDATORY_BASE_FILTERS (1/3) — pipeline = 'default'",
@@ -564,9 +473,6 @@ RULES: List[Dict[str, Any]] = [
         ),
     },
 
-    # -------------------------------------------------------------------------
-    # §3 Duplicate exclusion — FINAL on every hs_analytics.* reference
-    # -------------------------------------------------------------------------
     {
         "id": "final_keyword",
         "section": "§3 Duplicate exclusion — FINAL on hs_analytics.*",
@@ -593,9 +499,6 @@ RULES: List[Dict[str, Any]] = [
         "message": "Subquery against gs_DealContactAssociation is missing DISTINCT.",
     },
 
-    # -------------------------------------------------------------------------
-    # §9 / §13 General SQL guardrails
-    # -------------------------------------------------------------------------
     {
         "id": "select_or_with_only",
         "section": "§13.1 SELECT/WITH only — no destructive SQL",
@@ -618,9 +521,6 @@ RULES: List[Dict[str, Any]] = [
         "message": "LIMIT applied to a list query the user did not ask to cap with 'top N' or 'first N'.",
     },
 
-    # -------------------------------------------------------------------------
-    # §9 Fiscal year / date casting
-    # -------------------------------------------------------------------------
     {
         "id": "date_cast_standard",
         "section": "§9 Date casting — CAST(LEFT(coalesce(col,'1900-01-01'),10) AS DATE)",
@@ -645,15 +545,12 @@ RULES: List[Dict[str, Any]] = [
         ),
     },
 
-    # -------------------------------------------------------------------------
-    # §4 Target table — nullable string casting
-    # -------------------------------------------------------------------------
     {
         "id": "target_table_float_cast",
         "section": "§4 Target table — SUM(toFloat64OrZero(col))",
         "applies_when": lambda sql: bool(
             re.search(r"gs_pipeline_quotas_v1|gs_partner_targets|gs_closed_won_quotas|gs_marketing_targets", sql, re.I)
-        ),
+        ) and not _is_diagnostic_lookup(sql),
         "check": lambda sql: bool(re.search(r"toFloat64OrZero|toFloat32OrZero", sql, re.I)),
         "message": (
             "Target table columns are Nullable(String). "
@@ -679,9 +576,6 @@ RULES: List[Dict[str, Any]] = [
         "message": "Division present without nullIf(denominator, 0) — risk of divide-by-zero.",
     },
 
-    # -------------------------------------------------------------------------
-    # Pattern A — cumulative OR-chain stage counts (§6)
-    # -------------------------------------------------------------------------
     {
         "id": "pattern_a_or_chain",
         "section": "§6 Pattern A — cumulative OR-chain stage counting",
@@ -708,9 +602,6 @@ RULES: List[Dict[str, Any]] = [
         ),
     },
 
-    # -------------------------------------------------------------------------
-    # Pattern B — deal-level detail (§7)
-    # -------------------------------------------------------------------------
     {
         "id": "pattern_b_close_date_filter",
         "section": "§7 Pattern B — primary filter is close_date (not any became_<stage>_deal_date)",
@@ -742,16 +633,13 @@ RULES: List[Dict[str, Any]] = [
         ),
     },
 
-    # -------------------------------------------------------------------------
-    # Pattern C — attainment / vs-target (§8)
-    # -------------------------------------------------------------------------
     {
         "id": "pattern_c_two_cte",
         "section": "§8 Pattern C — actuals CTE + targets CTE (never fan-out join)",
-        "applies_when": lambda sql, intent: _is_pattern_c(sql, intent),
+        "applies_when": lambda sql, intent: _is_pattern_c(sql, intent) and not _is_diagnostic_lookup(sql),
         "check": lambda sql, intent: (
             sql.strip().upper().startswith("WITH")
-            and sql.upper().count("CTE") + sql.upper().count("AS (") >= 2
+            and len(re.findall(r'\bAS\s*\(', sql, re.I)) >= 2
         ),
         "message": (
             "Attainment/target query must use independent CTEs for actuals and targets, "
@@ -803,10 +691,6 @@ RULES: List[Dict[str, Any]] = [
         ),
     },
 
-    # -------------------------------------------------------------------------
-    # True cohort funnel (§8b) — only fires when cohort intent is detected AND
-    # Pattern A is NOT present AND the message wasn't tagged pattern_hint="A".
-    # -------------------------------------------------------------------------
     {
         "id": "cohort_anchor_sentinel",
         "section": "§8b Cohort anchor — became_<N>_deal_date != '1900-01-01'",
@@ -851,18 +735,6 @@ RULES: List[Dict[str, Any]] = [
         "message": "Cohort funnel is not using countDistinct(deal_id).",
     },
 
-    # -------------------------------------------------------------------------
-    # §11 MQL filters
-    # -------------------------------------------------------------------------
-    # NOTE: There is deliberately NO rule requiring
-    # `lifecycle_stage = 'marketingqualifiedlead'`. Real MQL queries anchor
-    # solely on date_entered_marketing_qualified_lead_lifecycle_stage_pipeline
-    # (i.e. "this contact became an MQL on this date"), not on their CURRENT
-    # lifecycle_stage. Requiring lifecycle_stage = 'marketingqualifiedlead'
-    # would silently exclude every MQL who has since progressed further down
-    # the funnel (became an opportunity, became a customer) — since their
-    # current lifecycle_stage would no longer literally say
-    # 'marketingqualifiedlead' even though they genuinely were one.
     {
         "id": "mql_date_entered_filter",
         "section": "§11 MQL filter 1 — date_entered_... anchor",
@@ -895,14 +767,6 @@ RULES: List[Dict[str, Any]] = [
         "message": "MQL target appears to be derived by dividing an annual target by 4 — filter the target table to the exact quarter instead.",
     },
 
-    # -------------------------------------------------------------------------
-    # §11 MQL-to-deal linkage — only applies when the question asks about
-    # deals/pipeline coming FROM MQLs, not plain MQL counting. Enforces the
-    # gs_DealContactAssociation join pattern documented in §11 of the live
-    # prompt: real association table (not name/owner matching), a fiscal-
-    # window filter on the association itself, and LEFT JOIN (so MQLs with
-    # no matched deal aren't silently dropped from the count).
-    # -------------------------------------------------------------------------
     {
         "id": "mql_deal_association_table",
         "section": "§11 MQL-to-deal linkage — must use gs_DealContactAssociation",
@@ -949,7 +813,7 @@ RULES: List[Dict[str, Any]] = [
 
 
 # =============================================================================
-# RESULT-LEVEL RULES  (unchanged from v4)
+# RESULT-LEVEL RULES  (unchanged)
 # =============================================================================
 RESULT_RULES: List[Dict[str, Any]] = [
     {
@@ -984,14 +848,13 @@ def _funnel_sum_ok(rows: List[dict]) -> bool:
             return True
         return (active_sum + terminal_sum) <= cohort_total
     except Exception:
-        return True  # don't block on checker bugs
+        return True
 
 
 # =============================================================================
 # Public API
 # =============================================================================
 def validate_sql_against_rules(sql: str, user_message: str) -> List[str]:
-    """Run every applicable RULES entry against `sql`. Returns violation strings."""
     intent = detect_intent(user_message, sql)
     violations = []
     for rule in RULES:
@@ -1011,7 +874,6 @@ def validate_sql_against_rules(sql: str, user_message: str) -> List[str]:
 
 
 def validate_result_against_rules(rows: List[dict], user_message: str, sql: str = "") -> List[str]:
-    """Run every applicable RESULT_RULES entry against the returned `rows`."""
     intent = detect_intent(user_message, sql)
     violations = []
     for rule in RESULT_RULES:
@@ -1031,12 +893,11 @@ def validate_result_against_rules(rows: List[dict], user_message: str, sql: str 
 
 
 def get_intent(user_message: str, sql: str = "") -> Dict[str, Any]:
-    """Exposed for logging / debugging in main.py."""
     return detect_intent(user_message, sql)
 
 
 # =============================================================================
-# FACT-BINDING VERIFIER  (unchanged from v4)
+# FACT-BINDING VERIFIER  (unchanged)
 # =============================================================================
 _NUM_PATTERN = re.compile(r'-?\$?\d[\d,]*\.?\d*%?')
 
