@@ -18,7 +18,7 @@ from charts import build_chart_html, reply_already_has_chart
 
 import httpx
 import anthropic
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
@@ -60,6 +60,27 @@ app.add_middleware(
 # Claude client
 # =============================================================================
 _ai_client    = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+_DEV_ADMIN_TOKEN = os.getenv("DEV_ADMIN_TOKEN")  # set this in your deployment env
+
+
+def _require_admin(x_admin_token: Optional[str] = Header(default=None)):
+    """
+    Real, server-side gate for every developer-only debug endpoint —
+    metrics, feedback, alerts, and the whole proposal system. Unlike the
+    chat login (a plain client-side JS check with zero backend
+    enforcement), this actually rejects the request on the server if the
+    token doesn't match. Fails closed if DEV_ADMIN_TOKEN isn't configured
+    at all, rather than silently leaving everything open.
+    """
+    if not _DEV_ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin surface is not configured. Set DEV_ADMIN_TOKEN in the environment to enable it.",
+        )
+    if not x_admin_token or x_admin_token != _DEV_ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing admin token.")
+
+
 _CLAUDE_MODEL = "claude-sonnet-4-6"
 ALLOWED_MODELS = {
     "sonnet": "claude-sonnet-4-6",
@@ -3200,7 +3221,7 @@ def debug_db():
 
 
 @app.get("/debug/metrics")
-def debug_metrics():
+def debug_metrics(_admin: None = Depends(_require_admin)):
     """
     Success rate and failure-pattern breakdown over the current in-memory
     audit window (last 200 rule-check events). Previously this data was
@@ -3209,6 +3230,8 @@ def debug_metrics():
     lines. NOTE: resets on server restart along with the rest of
     _RULE_AUDIT_LOG — see the recommendation to move this to external
     storage if that resolution becomes a real gap in practice.
+
+    Developer-only: requires the X-Admin-Token header.
     """
     return get_audit_metrics()
 
@@ -3229,18 +3252,22 @@ def submit_feedback(req: FeedbackRequest):
 
 
 @app.get("/debug/feedback")
-def debug_feedback():
+def debug_feedback(_admin: None = Depends(_require_admin)):
     """
     Thumbs up/down rate, broken down by question pattern, plus the most
     recent free-text comments. Sorted worst-first (by pattern) so the
     question type users are least happy with surfaces at the top rather
     than needing to be found by eye.
+
+    Developer-only: requires the X-Admin-Token header. (POST /feedback,
+    where users actually submit a rating, stays open to everyone —
+    only VIEWING the aggregated results and comments is gated.)
     """
     return get_feedback_metrics()
 
 
 @app.get("/debug/alerts")
-def debug_alerts():
+def debug_alerts(_admin: None = Depends(_require_admin)):
     """
     The actual answer to "does DIUD stop repeating its mistakes": not
     automatically, but this is where a repeated mistake becomes
@@ -3248,25 +3275,25 @@ def debug_alerts():
     across two separate endpoints. Cross-references /debug/metrics and
     /debug/feedback, flags anything crossing a repeat-failure threshold,
     and — this is the important part — never acts on any of it itself.
-    Sorted worst-first (critical > high > medium).
+    Sorted worst-first (critical > high > medium). Developer-only.
     """
     return get_flagged_issues()
 
 
 @app.get("/debug/proposals")
-def list_proposals():
-    """All pending proposals, plus the last 50 resolved (approved/rejected)."""
+def list_proposals(_admin: None = Depends(_require_admin)):
+    """All pending proposals, plus the last 50 resolved (approved/rejected). Developer-only."""
     return {"pending": _PENDING_PROPOSALS, "history": _PROPOSAL_HISTORY[:50]}
 
 
 @app.post("/debug/proposals/draft")
-def draft_proposals():
+def draft_proposals(_admin: None = Depends(_require_admin)):
     """
     Drafts a fix proposal for each currently-flagged issue that doesn't
     already have one pending or previously resolved. Each draft costs one
     Claude call — this is an explicit action a person triggers, never run
     automatically by /debug/alerts itself, so checking alerts never
-    silently spends API calls.
+    silently spends API calls. Developer-only.
     """
     flags = get_flagged_issues()["flags"]
     already_seen = {p["flag"]["subject"] for p in _PENDING_PROPOSALS + _PROPOSAL_HISTORY}
@@ -3284,13 +3311,14 @@ def draft_proposals():
 
 
 @app.post("/debug/proposals/{proposal_id}/approve")
-def approve_proposal(proposal_id: str):
+def approve_proposal(proposal_id: str, _admin: None = Depends(_require_admin)):
     """
     The ONLY endpoint in the entire system that changes a live agent
     prompt as a result of the audit/feedback/flag pipeline — and it only
     ever does so for the exact proposal a human just explicitly approved
     by ID. Appends the proposed clarification to the target agent's
     patch list and rebuilds that agent's cached prompt immediately.
+    Developer-only — the single most consequential endpoint here.
     """
     global _SQL_AGENT_PROMPT, _NARRATOR_AGENT_PROMPT
     proposal = next((p for p in _PENDING_PROPOSALS if p["id"] == proposal_id), None)
@@ -3315,7 +3343,7 @@ def approve_proposal(proposal_id: str):
 
 
 @app.post("/debug/proposals/{proposal_id}/reject")
-def reject_proposal(proposal_id: str):
+def reject_proposal(proposal_id: str, _admin: None = Depends(_require_admin)):
     """Discards a proposal without applying anything. No prompt is touched."""
     proposal = next((p for p in _PENDING_PROPOSALS if p["id"] == proposal_id), None)
     if not proposal:
