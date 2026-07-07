@@ -2316,10 +2316,17 @@ def _extract_filters_from_sql(sql: str) -> str:
         m = re.search(r"deal_stage\s+IN\s*\(([^)]+)\)", sql, re.IGNORECASE)
         if m:
             filters.append(f"Stage filter: {m.group(1)[:60]}")
-    if "REGION" in sql_upper:
-        m = re.search(r"region\s*=\s*'([^']+)'", sql, re.IGNORECASE)
-        if m:
-            filters.append(f"Region: {m.group(1)}")
+    # Only treat `region = '...'` as a REAL filter when it appears in a WHERE/AND/OR
+    # boolean-predicate position. The normalized-region CASE expression present in
+    # nearly every base query (e.g. "CASE WHEN region='japac' THEN 'JAPAC' ...")
+    # also matches a naive `region\s*=\s*'...'` search and was being misread as a
+    # user-applied filter on every query, producing a spurious "Region: japac"
+    # subtitle even when no region filter was applied.
+    region_filter_match = re.search(
+        r"(?:WHERE|AND|OR)\s+region\s*=\s*'([^']+)'", sql, re.IGNORECASE
+    )
+    if region_filter_match:
+        filters.append(f"Region: {region_filter_match.group(1)}")
     if "COMPANY_PRIORITY" in sql_upper:
         filters.append("Company Priority: P1–P7")
     if "LEAD_STATUS" in sql_upper and "BAD DATA" in sql_upper:
