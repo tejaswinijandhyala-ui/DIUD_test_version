@@ -921,6 +921,7 @@
               <option value="pdf">📄 PDF Report</option>
               <option value="pptx">📊 PowerPoint</option>
               <option value="csv">📋 CSV (raw data)</option>
+              <option value="xlsx">📊 Excel (formatted)</option>
             </select>
           </div>
           <div class="ep-input-group" id="ep-detail-group">
@@ -1005,6 +1006,13 @@
           <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
         </svg>
         <span id="ep-csv-label">Download CSV</span>
+      </button>
+      <button class="ep-download-btn btn-csv-dl" id="ep-dl-xlsx" onclick="downloadXLSX()" style="display:none;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        <span id="ep-xlsx-label">Download Excel</span>
       </button>
     </div>
   </aside>
@@ -1158,8 +1166,13 @@
      ====================================================================== */
   function detectExportFormat(text) {
     if (/pptx|powerpoint|presentation|slide|deck/i.test(text)) return 'pptx';
+    if (/\b(xlsx|excel|spreadsheet)\b/i.test(text)) return 'xlsx';
     if (/csv/i.test(text)) return 'csv';
     if (/pdf/i.test(text)) return 'pdf';
+    // Plain "give me the list of these deals" / "list all deals" style asks
+    // have no explicit format keyword — a formatted spreadsheet is the
+    // natural default for a flat list of records, not a narrative PDF.
+    if (/\blist\b.*\bdeals?\b|\bdeals?\b.*\blist\b/i.test(text)) return 'xlsx';
     return null;
   }
 
@@ -1520,7 +1533,7 @@ function openExportPanel(preselectedFormat) {
         
         // Show/hide detail group based on format
         document.getElementById('ep-detail-group').style.display = 
-            preselectedFormat === 'csv' ? 'none' : '';
+            (preselectedFormat === 'csv' || preselectedFormat === 'xlsx') ? 'none' : '';
     }
     
     showPanelState('empty');
@@ -1528,6 +1541,7 @@ function openExportPanel(preselectedFormat) {
     document.getElementById('ep-dl-pdf').style.display   = 'none';
     document.getElementById('ep-dl-pptx').style.display  = 'none';
     document.getElementById('ep-dl-csv').style.display   = 'none';
+    document.getElementById('ep-dl-xlsx').style.display  = 'none';
     document.getElementById('ep-progress-fill').style.width = '0%';
     document.getElementById('ep-steps').innerHTML = '';
 }
@@ -1558,8 +1572,9 @@ async function generatePreview() {
   const format = document.getElementById('ep-format').value;
   const detail = document.getElementById('ep-detail').value;
 
-  if (format === 'csv') {
+  if (format === 'csv' || format === 'xlsx') {
     if (!datasetRows || datasetRows === 0) { showToast('No dataset found. Run a query first, then export.', 'error'); return; }
+    const isXlsx = format === 'xlsx';
     showPanelState('preview');
     document.getElementById('ep-preview-content').innerHTML = `
       <div style="display:flex;flex-direction:column;gap:12px;padding:4px 0;">
@@ -1567,14 +1582,23 @@ async function generatePreview() {
           <svg viewBox="0 0 24 24" fill="none" stroke="#2E7D32" stroke-width="2.5" style="width:20px;height:20px;flex-shrink:0;"><polyline points="20 6 9 17 4 12"/></svg>
           <span style="color:#1B5E20;font-weight:600;font-size:14px;">${datasetRows.toLocaleString()} rows ready to export</span>
         </div>
-        <p style="color:#555;font-size:13px;line-height:1.6;margin:0;">The CSV will contain the raw data with the original column headers from the database — no AI summary or formatting added.</p>
+        <p style="color:#555;font-size:13px;line-height:1.6;margin:0;">${isXlsx
+          ? 'The Excel file will be formatted — bold header row, currency-formatted amount columns, auto-sized columns — with the complete dataset, not just what\'s shown on screen.'
+          : 'The CSV will contain the raw data with the original column headers from the database — no AI summary or formatting added.'}</p>
       </div>`;
-    document.getElementById('ep-preview-meta-text').textContent = `${datasetRows.toLocaleString()} rows · Raw data · No AI summary`;
+    document.getElementById('ep-preview-meta-text').textContent =
+      `${datasetRows.toLocaleString()} rows · ${isXlsx ? 'Formatted spreadsheet' : 'Raw data'} · No AI summary`;
     document.getElementById('ep-dl-pdf').style.display  = 'none';
     document.getElementById('ep-dl-pptx').style.display = 'none';
     const csvBtn = document.getElementById('ep-dl-csv');
-    if (csvBtn) {
-      csvBtn.style.display = 'flex';
+    const xlsxBtn = document.getElementById('ep-dl-xlsx');
+    if (csvBtn) csvBtn.style.display = isXlsx ? 'none' : 'flex';
+    if (xlsxBtn) {
+      xlsxBtn.style.display = isXlsx ? 'flex' : 'none';
+      const xlsxLabel = document.getElementById('ep-xlsx-label');
+      if (xlsxLabel) xlsxLabel.textContent = `Download All ${datasetRows.toLocaleString()} Rows (Excel)`;
+    }
+    if (csvBtn && !isXlsx) {
       const csvLabel = document.getElementById('ep-csv-label');
       if (csvLabel) csvLabel.textContent = `Download All ${datasetRows.toLocaleString()} Rows (CSV)`;
     }
@@ -1649,8 +1673,8 @@ async function generatePreview() {
 }
 
   document.getElementById('ep-format').addEventListener('change', function() {
-    const isCsv = this.value === 'csv';
-    document.getElementById('ep-detail-group').style.display = isCsv ? 'none' : '';
+    const isRawData = this.value === 'csv' || this.value === 'xlsx';
+    document.getElementById('ep-detail-group').style.display = isRawData ? 'none' : '';
     showPanelState('empty');
     hideFooter();
     previewContent = null;
@@ -1718,6 +1742,31 @@ async function generatePreview() {
       showToast('CSV export failed: ' + err.message, 'error');
     } finally {
       if (csvBtn) { csvBtn.innerHTML = orig; csvBtn.disabled = false; }
+    }
+  }
+
+  async function downloadXLSX() {
+    const title   = document.getElementById('ep-title').value.trim() || 'deals-export';
+    const xlsxBtn = document.getElementById('ep-dl-xlsx');
+    const orig    = xlsxBtn ? xlsxBtn.innerHTML : '';
+    if (xlsxBtn) xlsxBtn.disabled = true;
+    showToast(`Exporting ${datasetRows > 0 ? datasetRows.toLocaleString() + ' rows' : 'data'} as Excel…`, '');
+    try {
+      const res = await fetch('/export/download', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format: 'xlsx', title, session_id: SESSION_ID }),
+      });
+      if (!res.ok) throw new Error((await res.json().catch(()=>({}))).detail || `HTTP ${res.status}`);
+      const totalRows = res.headers.get('X-Total-Rows') || datasetRows;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(await res.blob());
+      a.download = `${title.replace(/\s+/g,'_')}.xlsx`;
+      a.click(); URL.revokeObjectURL(a.href);
+      showToast(`✅ Excel exported — all ${Number(totalRows).toLocaleString()} rows!`, 'success');
+    } catch(err) {
+      showToast('Excel export failed: ' + err.message, 'error');
+    } finally {
+      if (xlsxBtn) { xlsxBtn.innerHTML = orig; xlsxBtn.disabled = false; }
     }
   }
 
