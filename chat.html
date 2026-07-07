@@ -1519,7 +1519,10 @@
   /* ======================================================================
      EXPORT PANEL OPEN / CLOSE
      ====================================================================== */
+const _EXPORT_FORMAT_LABELS = { pdf: 'PDF', pptx: 'PowerPoint', csv: 'CSV', xlsx: 'Excel' };
+
 function openExportPanel(preselectedFormat) {
+    const wasAlreadyOpen = panelOpen;
     panelOpen = true;
     document.getElementById('export-panel').classList.add('open');
     document.getElementById('body-wrap').classList.add('panel-open');
@@ -1527,9 +1530,19 @@ function openExportPanel(preselectedFormat) {
     
     // Set format BEFORE resetting state so the change listener doesn't fight it
     if (preselectedFormat) {
-        // Temporarily disable the change listener while setting format
         const formatEl = document.getElementById('ep-format');
+        const switchedFormat = wasAlreadyOpen && formatEl.value !== preselectedFormat;
         formatEl.value = preselectedFormat;
+
+        // A follow-up message changing the format (e.g. "export into excel"
+        // after a CSV preview was already showing) resets the whole panel
+        // silently underneath the chat reply — easy to miss, and easy to
+        // mistake for "it didn't work". Make the switch visible. Gated on
+        // wasAlreadyOpen so the very first export in a session (comparing
+        // against the dropdown's default value) doesn't spuriously toast.
+        if (switchedFormat) {
+            showToast(`Switched export format to ${_EXPORT_FORMAT_LABELS[preselectedFormat] || preselectedFormat}`, '');
+        }
         
         // Show/hide detail group based on format
         document.getElementById('ep-detail-group').style.display = 
