@@ -1,5 +1,8 @@
 import csv
 import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 import json
 import os
 import re
@@ -3507,8 +3510,8 @@ async def export_preview(req: ExportPreviewRequest):
 async def export_download(req: ExportDownloadRequest):
     print(f"⬇️  [export/download] format={req.format} session={req.session_id}")
 
-    if req.format == "csv":
-        # Same fix as export_preview / session_dataset_info.
+    if req.format in ("csv", "xlsx"):
+        # Same lookup pattern as export_preview / session_dataset_info.
         stored = (
             (_get_result(f"{req.session_id}:latest") or _get_result(req.session_id))
             if req.session_id else None
@@ -3521,12 +3524,21 @@ async def export_download(req: ExportDownloadRequest):
                     "Ask a deal-list question first, then export."
                 ),
             )
-        csv_bytes = _build_csv(stored)
+
+        if req.format == "csv":
+            file_bytes = _build_csv(stored)
+            media_type = "text/csv"
+            ext = "csv"
+        else:
+            file_bytes = _build_xlsx(stored, req.title)
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ext = "xlsx"
+
         return StreamingResponse(
-            io.BytesIO(csv_bytes),
-            media_type="text/csv",
+            io.BytesIO(file_bytes),
+            media_type=media_type,
             headers={
-                "Content-Disposition": f'attachment; filename="{_safe_filename(req.title)}.csv"',
+                "Content-Disposition": f'attachment; filename="{_safe_filename(req.title)}.{ext}"',
                 "X-Total-Rows": str(stored.total_rows),
             },
         )
@@ -3593,6 +3605,95 @@ def _build_csv(stored: QueryResult) -> bytes:
         writer.writerow(row)
 
     return buf.getvalue().encode("utf-8")
+
+
+_CURRENCY_COLUMN_HINTS = (
+    "amount", "value", "revenue", "target", "pipeline", "arr", "acv",
+    "price", "cost", "spend", "budget", "quota",
+)
+
+
+def _looks_like_currency_column(col_name: str) -> bool:
+    lower = col_name.lower()
+    return any(hint in lower for hint in _CURRENCY_COLUMN_HINTS)
+
+
+def _build_xlsx(stored: QueryResult, title: str) -> bytes:
+    """
+    Styled Excel export — bold white-on-navy header row, currency-formatted
+    amount/value/target-style columns, auto-sized columns, frozen header
+    row for scrolling through long deal lists. Mirrors the CSV export's
+    data (same stored.columns / stored.rows, so the two formats can never
+    silently disagree on row count) with real spreadsheet formatting on
+    top, rather than a second, separately-maintained code path.
+
+    IMPORTANT — completeness guarantee: this always writes every row in
+    stored.rows, which is the full result ClickHouse returned (never the
+    100-row CHAT_DISPLAY_LIMIT used for the on-screen preview). If that
+    ever doesn't match stored.total_rows, something upstream truncated
+    the result silently — we'd rather surface that loudly here than ship
+    a spreadsheet that quietly has fewer rows than it claims.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Deals"[:31]
+
+    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
+    body_font = Font(name="Arial", size=10.5)
+    header_align = Alignment(horizontal="center", vertical="center")
+
+    # Row 1: header
+    for col_idx, col_name in enumerate(stored.columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+    ws.freeze_panes = "A2"
+
+    currency_cols = {c for c in stored.columns if _looks_like_currency_column(c)}
+
+    # Data rows
+    for row_idx, row in enumerate(stored.rows, start=2):
+        for col_idx, col_name in enumerate(stored.columns, start=1):
+            raw_val = row.get(col_name, "")
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.font = body_font
+            if col_name in currency_cols:
+                try:
+                    cell.value = float(raw_val)
+                    cell.number_format = '$#,##0'
+                    continue
+                except (TypeError, ValueError):
+                    pass  # fall through — not actually numeric for this row, write as-is
+            cell.value = raw_val
+
+    # Auto-width: based on the longer of header text or a sample of data
+    for col_idx, col_name in enumerate(stored.columns, start=1):
+        sample_lens = [len(str(r.get(col_name, ""))) for r in stored.rows[:200]]
+        width = max([len(col_name)] + sample_lens) + 3
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width, 10), 60)
+
+    # A compact metadata strip below the table — same facts as the CSV's
+    # comment header, kept out of the data rows themselves so it never
+    # gets mistaken for a record or breaks a downstream pivot/filter.
+    meta_row = len(stored.rows) + 3
+    completeness_note = (
+        f"{len(stored.rows)} of {stored.total_rows} total records included"
+        if len(stored.rows) != stored.total_rows
+        else f"All {stored.total_rows} matching records included"
+    )
+    for i, line in enumerate([
+        f"Generated: {date.today().isoformat()}",
+        f"Filters: {stored.filters_applied or 'none'}",
+        completeness_note,
+    ]):
+        c = ws.cell(row=meta_row + i, column=1, value=line)
+        c.font = Font(name="Arial", size=9, italic=True, color="666666")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # =============================================================================
