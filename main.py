@@ -241,6 +241,7 @@ def _log_feedback(session_id: Optional[str], user_question: str,
         pattern_tag = "unclassified"
 
     entry = {
+        "id": str(uuid.uuid4())[:8],
         "ts": datetime.utcnow().isoformat(),
         "session_id": session_id,
         "pattern": pattern_tag,
@@ -409,7 +410,7 @@ def get_flagged_issues(
     the decision of what to actually change stays with a person, every
     time. See /debug/alerts.
 
-    Flags come from five checks, escalating in what they mean:
+    Flags come from six checks, escalating in what they mean:
       1. A specific rule firing repeatedly (raw count) — the rule itself
          may be too strict, or the model keeps making the same mistake.
       2. A question pattern with a high RULE FAILURE RATE (not just a
@@ -420,6 +421,13 @@ def get_flagged_issues(
       5. CROSS-SIGNAL: a pattern flagged by BOTH the rule engine AND user
          feedback independently — two different signals agreeing is much
          stronger evidence than either alone, so this is always "critical".
+      6. EVERY individual piece of negative feedback, one flag each,
+         severity "low" — unlike checks 1-5, this doesn't wait for a
+         repeat threshold. A single thumbs-down is already a real,
+         human-confirmed signal; at low feedback volume (e.g. early
+         testing) almost nothing would ever cross the rate/count
+         thresholds above, so without this, real problems would sit
+         invisible indefinitely just because they hadn't repeated yet.
     """
     audit = get_audit_metrics()
     feedback = get_feedback_metrics()
@@ -486,6 +494,32 @@ def get_flagged_issues(
             "suggested_action": "Prioritize this one — it's the strongest signal the system can produce.",
         })
 
+    # 6. EVERY individual piece of negative feedback, one flag each — not
+    #    just ones that repeat into a pattern-level or issue-type-level
+    #    threshold above. A single thumbs-down is a real, human-confirmed
+    #    signal on its own; waiting for it to happen 3 times before it's
+    #    even reviewable means real, specific, fixable problems sit
+    #    invisible indefinitely in a low-volume period (e.g. early testing),
+    #    which is exactly when catching them individually matters most.
+    #    Deliberately NOT extended to rule violations — those fire far more
+    #    often per session by nature, and one flag per occurrence there
+    #    would be pure noise rather than signal.
+    for entry in _FEEDBACK_LOG:
+        if entry.get("rating") != "down":
+            continue
+        detail = f"\"{entry['user_question']}\""
+        if entry.get("issue_type"):
+            detail += f" — reported as: {entry['issue_type']}"
+        if entry.get("comment"):
+            detail += f" — comment: \"{entry['comment']}\""
+        flags.append({
+            "severity": "low",
+            "source": "individual_feedback",
+            "subject": entry["id"],
+            "detail": detail,
+            "suggested_action": "Review this specific reply; draft a fix if a clear, safe one exists.",
+        })
+
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     flags.sort(key=lambda f: severity_order.get(f["severity"], 4))
 
@@ -536,6 +570,20 @@ def _gather_evidence_for_flag(flag: dict) -> str:
                 f"  Rating: {e['rating']}"
                 + (f" ({e['issue_type']})" if e.get("issue_type") else "")
                 + (f"\n  Comment: {e['comment']}" if e.get("comment") else "")
+            )
+
+    if source == "individual_feedback":
+        # subject IS the feedback entry's own id here, not a pattern or
+        # issue type — pull that exact single entry, not a pattern-wide
+        # search, since the whole point of this flag is one specific reply.
+        entry = next((e for e in _FEEDBACK_LOG if e.get("id") == subject), None)
+        if entry:
+            lines.append(
+                f"- Question: {entry['user_question']!r}\n"
+                f"  Reply preview: {entry['assistant_reply_preview'][:300]!r}\n"
+                f"  Rating: {entry['rating']}"
+                + (f" ({entry['issue_type']})" if entry.get("issue_type") else "")
+                + (f"\n  Comment: {entry['comment']}" if entry.get("comment") else "")
             )
 
     return "\n".join(lines) if lines else "No detailed examples available — flag is based on aggregate counts only."
