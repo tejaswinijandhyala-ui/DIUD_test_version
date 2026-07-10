@@ -46,6 +46,7 @@ result-level rules, fact-binding verifier) is unchanged.
 """
 
 import re
+from datetime import date
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # =============================================================================
@@ -221,7 +222,44 @@ def _split_ctes(sql: str) -> Tuple[Dict[str, str], str]:
     return ctes, tail
 
 
-def _base_filter_scope(sql: str) -> str:
+def _current_fy_start_date() -> date:
+    """April 1 of the current fiscal year — used only to detect a stale
+    hardcoded close_date bound, never to generate SQL (that's main.py's
+    job). Kept as a separate small copy here rather than importing from
+    main.py, since rules.py is meant to stay a standalone, dependency-free
+    module the way it already is."""
+    today = date.today()
+    fy_start_year = today.year if today.month >= 4 else today.year - 1
+    return date(fy_start_year, 4, 1)
+
+
+def _has_stale_close_date_bound(sql: str) -> bool:
+    """
+    True if the SQL has a close_date >= 'YYYY-MM-DD' bound that's a
+    literal date more than ~13 months old — a real, confirmed failure
+    mode: the Pattern B template itself once had a hardcoded bound that
+    silently went a full year stale. A hardcoded date that's merely a
+    few weeks old is normal (FY start doesn't move every day); anything
+    over ~13 months means someone typed a specific date instead of using
+    the dynamic current-FY-start value.
+    """
+    m = re.search(r"close_date\s*>=\s*'(\d{4}-\d{2}-\d{2})'", sql, re.I)
+    if not m:
+        return False
+    try:
+        year, month, day = (int(x) for x in m.group(1).split("-"))
+        bound_date = date(year, month, day)
+    except ValueError:
+        return False
+    age_days = (_current_fy_start_date() - bound_date).days
+    return age_days > 45  # a live template regenerates this as "today's FY start"
+    # every time, so it should always read ~0 days old; anything more than
+    # a grace window of a month and a half means a specific date got typed
+    # or copy-pasted instead of computed, which is exactly how this bug
+    # happened the first time (a full year, 365 days, stale)
+
+
+
     try:
         ctes, tail = _split_ctes(sql)
         if not ctes:
@@ -610,10 +648,31 @@ RULES: List[Dict[str, Any]] = [
             and not _is_pattern_a(sql)
             and not _is_pattern_c(sql, intent)
         ),
-        "check": lambda sql, intent: bool(re.search(r"close_date\s*>=", sql, re.I)),
+        "check": lambda sql, intent: (
+            bool(re.search(r"close_date\s*>=", sql, re.I))
+            and not _has_stale_close_date_bound(sql)
+        ),
         "message": (
             "Pattern B (active pipeline / deal-level) must filter on close_date >= <date>, "
-            "not became_10_deal_date. See §7."
+            "not became_10_deal_date. See §7. If a close_date bound IS present, it also "
+            "looks stale (more than ~13 months old) — use the current fiscal year start, "
+            "not a hardcoded date copied from an old example."
+        ),
+    },
+    {
+        "id": "partner_non_hyperscaler_literal_filter",
+        "section": "§4 Target Query Rule #5 — 'Partner - Non Hyperscaler' never matches partner_team_type",
+        "applies_when": lambda sql, intent: bool(
+            re.search(r"gs_partner_targets", sql, re.I)
+        ),
+        "check": lambda sql, intent: not bool(
+            re.search(r"partner_team_type\s*(?:=|IN\s*\([^)]*)\s*'Partner\s*-\s*Non\s*Hyperscaler'", sql, re.I)
+        ),
+        "message": (
+            "partner_team_type is being filtered on the literal string 'Partner - Non Hyperscaler', "
+            "which never exists in that column and will silently return zero rows every time. "
+            "It maps to partner_team_type IN ('GSI/SI','Reseller/BPO/TSD') — everything except "
+            "'Hyperscaler'. See §4."
         ),
     },
     {
