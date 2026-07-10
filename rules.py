@@ -260,6 +260,7 @@ def _has_stale_close_date_bound(sql: str) -> bool:
 
 
 
+def _base_filter_scope(sql: str) -> str:
     try:
         ctes, tail = _split_ctes(sql)
         if not ctes:
