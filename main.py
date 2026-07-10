@@ -2006,8 +2006,7 @@ not also split by quarter unless that was asked too).
 §11  MQL RULES
 ═══════════════════════════════════════════════════════════════
 MQL actuals from hs_analytics.contacts FINAL require ALL THREE:
-  1. lifecycle_stage = 'marketingqualifiedlead'
-     AND date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
+  1. date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
   2. company_priority IN ('P1','P2','P3','P4','P5','P6','P7')
   3. lead_status != 'Bad Data'
 
@@ -2020,8 +2019,7 @@ MQL ACTUALS PATTERN:
     toYYYYMM(toDate(LEFT(date_entered_marketing_qualified_lead_lifecycle_stage_pipeline,10))) AS ym,
     countDistinct(contact_id) AS mql_count
   FROM hs_analytics.contacts FINAL
-  WHERE lifecycle_stage = 'marketingqualifiedlead'
-    AND date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
+  WHERE date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
     AND company_priority IN ('P1','P2','P3','P4','P5','P6','P7')
     AND lead_status != 'Bad Data'
     AND <date range filter on date_entered_... column>
@@ -2049,8 +2047,7 @@ and the association itself MUST be windowed by createdate:
   WITH mql_base AS (
     SELECT contact_id
     FROM hs_analytics.contacts FINAL
-    WHERE lifecycle_stage = 'marketingqualifiedlead'
-      AND date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
+    WHERE date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
       AND company_priority IN ('P1','P2','P3','P4','P5','P6','P7')
       AND lead_status != 'Bad Data'
       AND <date range filter on date_entered_... column>
@@ -2203,8 +2200,10 @@ never reorder them, even for a simple one-number answer:
 
 ---
 **Filters Applied:**
-- Pattern used: [A — Cumulative Funnel / B — Deal Detail / C — Attainment]
-- FY anchor column: [which became_N_deal_date or close_date was used]
+- Pattern used: [A — Cumulative Funnel / B — Deal Detail / C — Attainment / MQL]
+- FY anchor column: [became_N_deal_date, close_date, or — for MQL queries —
+  date_entered_marketing_qualified_lead_lifecycle_stage_pipeline; whichever
+  one the query actually filtered on]
 - [list all active filters: FY, quarter, region, source, stage, etc.]
 
 Please verify these filters match your expectation.
@@ -2611,8 +2610,6 @@ def _extract_filters_from_sql(sql: str) -> str:
         filters.append("Company Priority: P1–P7")
     if "LEAD_STATUS" in sql_upper and "BAD DATA" in sql_upper:
         filters.append("Lead Status: excludes 'Bad Data'")
-    if "LIFECYCLE_STAGE" in sql_upper and "MARKETINGQUALIFIEDLEAD" in sql_upper:
-        filters.append("Lifecycle: MQL only")
     return "; ".join(filters) if filters else "Standard base filters applied"
 
 def _is_numericish(v) -> bool:
