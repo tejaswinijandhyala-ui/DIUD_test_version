@@ -2265,7 +2265,7 @@ def _split_section_2(sec2: str) -> Tuple[str, str, str]:
     )
 
 
-def _build_sql_agent_prompt() -> str:
+def _build_sql_agent_prompt(pattern_filter: Optional[str] = None) -> str:
     """
     SQL Agent's prompt: everything needed to turn a question into
     validated SQL and retrieve data, plus the greeting/export fast paths
@@ -2274,16 +2274,35 @@ def _build_sql_agent_prompt() -> str:
     Narrator Agent. Includes the live schema; the Narrator Agent does not
     need it (it only ever sees already-labeled result rows, never raw
     columns it has to interpret against a schema).
+
+    pattern_filter: None (default) includes all three query patterns —
+    used as the safe fallback when the question's pattern can't be
+    confidently determined ahead of time. "A", "B", or "C" includes only
+    that one pattern's section (§6/§7/§8) and omits the other two — this
+    is the fix for a real, confirmed gap: every question used to load
+    the complete text of all three patterns regardless of which one
+    actually applied, adding real, unnecessary size and noise to every
+    single call. Sections 3, 4, 5, 9-13 are universal (mandatory
+    filters, dimension mappings, FY rules, etc.) and are always
+    included regardless of pattern_filter — only the three
+    pattern-specific templates are ever trimmed.
     """
     full = _build_system_prompt()
     sec1 = _extract_section(full, 1)
     sec2 = _extract_section(full, 2)
     tool_only, export_block, _chart_block = _split_section_2(sec2)
+
+    pattern_section_numbers = {"A": 6, "B": 7, "C": 8}
+    if pattern_filter in pattern_section_numbers:
+        omit = {n for n in (6, 7, 8) if n != pattern_section_numbers[pattern_filter]}
+    else:
+        omit = set()
+
     sections = "\n\n".join(
         s for s in (
             tool_only,
             export_block,
-            *[_extract_section(full, n) for n in range(3, 14)],
+            *[_extract_section(full, n) for n in range(3, 14) if n not in omit],
         ) if s
     )
     schema_start = full.find("LIVE DATABASE SCHEMA")
@@ -2379,20 +2398,51 @@ RULE PRIORITY ORDER (highest → lowest):
 """
 
 
-_SQL_AGENT_PROMPT = _build_sql_agent_prompt()
+def _rebuild_sql_agent_prompts() -> Dict[str, str]:
+    """
+    Resets the SQL Agent prompt cache to just the 'full' variant, built
+    eagerly — everything else is built LAZILY, on first actual use, by
+    _cached_sql_agent_prompt() below.
+
+    This used to eagerly build all four variants (full + A + B + C) right
+    here, which was a real regression: this function runs at MODULE
+    IMPORT time, before uvicorn even starts binding a port. Quadrupling
+    the synchronous work in that path pushed real startup past Render's
+    port-scan timeout — the deploy failed even though the app was
+    working, just too slow to prove it in time. Building only the one
+    variant that was always built before restores the original startup
+    speed; the other three cost nothing until a question actually needs
+    one, and are cached after that first build.
+    """
+    return {"full": _build_sql_agent_prompt(None)}
+
+
+_SQL_AGENT_PROMPTS = _rebuild_sql_agent_prompts()
 _NARRATOR_AGENT_PROMPT = _build_narrator_agent_prompt()
 
 
-def _cached_sql_agent_prompt() -> list:
+def _cached_sql_agent_prompt(pattern_hint: Optional[str] = None) -> list:
     """
     Prompt-caching wrapper for the SQL Agent's prompt. Reads the CURRENT
-    _SQL_AGENT_PROMPT global each call (not a stale copy), so it stays
-    correct after refresh_schema() or on_startup() reassign it.
+    _SQL_AGENT_PROMPTS global each call (not a stale copy), so it stays
+    correct after refresh_schema() or an approved proposal patch
+    reassign it. pattern_hint selects which trimmed variant to use —
+    "A"/"B"/"C" for a confidently-classified question, or None (default)
+    for the full, all-patterns variant when the question's pattern isn't
+    yet known.
+
+    Trimmed variants are built lazily, the first time each one is
+    actually needed, then cached in _SQL_AGENT_PROMPTS for every
+    subsequent request — so there's no repeated cost, and no risk of the
+    eager-build-at-import-time regression this replaced.
     """
+    key = pattern_hint if pattern_hint in ("A", "B", "C") else "full"
+    if key not in _SQL_AGENT_PROMPTS:
+        _SQL_AGENT_PROMPTS[key] = _build_sql_agent_prompt(pattern_hint)
     return [
         {
             "type": "text",
-            "text": _SQL_AGENT_PROMPT,
+            "text": _SQL_AGENT_PROMPTS[key],
             "cache_control": {"type": "ephemeral"},
         }
     ]
@@ -2739,10 +2789,10 @@ def _parse_rows_for_validation(query_result: str, session_id: Optional[str]) -> 
 # =============================================================================
 @app.on_event("startup")
 async def on_startup():
-    global _SQL_AGENT_PROMPT, _NARRATOR_AGENT_PROMPT
+    global _SQL_AGENT_PROMPTS, _NARRATOR_AGENT_PROMPT
     try:
         discover_schema()
-        _SQL_AGENT_PROMPT = _build_sql_agent_prompt()
+        _SQL_AGENT_PROMPTS = _rebuild_sql_agent_prompts()
         _NARRATOR_AGENT_PROMPT = _build_narrator_agent_prompt()
     except Exception as e:
         print(f"⚠️  Schema discovery failed: {e}")
@@ -3179,6 +3229,26 @@ Fill in <N> and the stage exclusion list from §8b, then resubmit.
     return query_result, False, latest_validated_result, None, False
 
 
+def _pattern_hint_from_message(user_message: str) -> Optional[str]:
+    """
+    Maps a user's raw question to "A"/"B"/"C" using the same intent
+    classification rules.py already uses for post-hoc validation — reused
+    here ahead of time to pick which trimmed SQL Agent prompt variant to
+    send, instead of always sending all three patterns' full text on
+    every question regardless of which one applies. Returns None when
+    the pattern can't be confidently determined ahead of time, which
+    correctly selects the full, untrimmed fallback rather than guessing.
+    """
+    intent = get_intent(user_message)
+    if intent.get("pattern_hint") == "A":
+        return "A"
+    if intent.get("metric") == "active_pipeline":
+        return "B"
+    if intent.get("metric") == "attainment":
+        return "C"
+    return None
+
+
 def _run_sql_agent(safe_messages: list, original_user_message: str, session_id: Optional[str],
                     selected_model: str, max_tokens: int):
     """
@@ -3195,9 +3265,10 @@ def _run_sql_agent(safe_messages: list, original_user_message: str, session_id: 
     Returns: (sql_agent_text, latest_validated_result, last_error,
     last_error_is_rule_violation, updated_safe_messages)
     """
+    pattern_hint = _pattern_hint_from_message(original_user_message)
     response = _ai_client.messages.create(
         model=selected_model,
-        system=_cached_sql_agent_prompt(),
+        system=_cached_sql_agent_prompt(pattern_hint),
         messages=safe_messages,
         tools=_SQL_AGENT_TOOLS,
         temperature=0,
@@ -3237,7 +3308,7 @@ def _run_sql_agent(safe_messages: list, original_user_message: str, session_id: 
         is_last_round = (round_num == MAX_ROUNDS - 1)
         response = _ai_client.messages.create(
             model=selected_model,
-            system=_cached_sql_agent_prompt(),
+            system=_cached_sql_agent_prompt(pattern_hint),
             messages=safe_messages,
             tools=[] if is_last_round else _SQL_AGENT_TOOLS,
             temperature=0,
@@ -3263,7 +3334,7 @@ def _run_sql_agent(safe_messages: list, original_user_message: str, session_id: 
         try:
             continue_response = _ai_client.messages.create(
                 model=selected_model,
-                system=_cached_sql_agent_prompt(),
+                system=_cached_sql_agent_prompt(pattern_hint),
                 messages=continue_messages,
                 tools=_SQL_AGENT_TOOLS,
                 temperature=0,
@@ -3292,7 +3363,7 @@ def _run_sql_agent(safe_messages: list, original_user_message: str, session_id: 
                     {"role": "user", "content": tool_result_blocks},
                 ]
                 continue_response = _ai_client.messages.create(
-                    model=selected_model, system=_cached_sql_agent_prompt(),
+                    model=selected_model, system=_cached_sql_agent_prompt(pattern_hint),
                     messages=continue_messages,
                     tools=_SQL_AGENT_TOOLS,
                     temperature=0, max_tokens=max_tokens,
@@ -3655,7 +3726,7 @@ def approve_proposal(proposal_id: str, _admin: None = Depends(_require_admin)):
     patch list and rebuilds that agent's cached prompt immediately.
     Developer-only — the single most consequential endpoint here.
     """
-    global _SQL_AGENT_PROMPT, _NARRATOR_AGENT_PROMPT
+    global _SQL_AGENT_PROMPTS, _NARRATOR_AGENT_PROMPT
     proposal = next((p for p in _PENDING_PROPOSALS if p["id"] == proposal_id), None)
     if not proposal:
         raise HTTPException(status_code=404, detail="Proposal not found or already resolved.")
@@ -3667,7 +3738,7 @@ def approve_proposal(proposal_id: str, _admin: None = Depends(_require_admin)):
         _NARRATOR_AGENT_PROMPT = _build_narrator_agent_prompt()
     else:
         _SQL_AGENT_PATCHES.append(proposal["proposed_addition"])
-        _SQL_AGENT_PROMPT = _build_sql_agent_prompt()
+        _SQL_AGENT_PROMPTS = _rebuild_sql_agent_prompts()
 
     proposal["status"] = "approved"
     proposal["resolved_at"] = datetime.utcnow().isoformat()
@@ -3692,9 +3763,9 @@ def reject_proposal(proposal_id: str, _admin: None = Depends(_require_admin)):
 
 @app.post("/refresh-schema")
 def refresh_schema():
-    global _SQL_AGENT_PROMPT, _NARRATOR_AGENT_PROMPT
+    global _SQL_AGENT_PROMPTS, _NARRATOR_AGENT_PROMPT
     schema = discover_schema()
-    _SQL_AGENT_PROMPT = _build_sql_agent_prompt()
+    _SQL_AGENT_PROMPTS = _rebuild_sql_agent_prompts()
     _NARRATOR_AGENT_PROMPT = _build_narrator_agent_prompt()
     return {"status": "refreshed", "tables": list(_LIVE_SCHEMA.keys())}
 
