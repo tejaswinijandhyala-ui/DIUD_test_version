@@ -2042,7 +2042,14 @@ question about the connection between the two. The join MUST go through
 gs_DealContactAssociation (never inferred from company_name, owner, or
 any other matching field), MUST use LEFT JOIN so MQLs with no matched
 deal are counted as "MQL without a deal" rather than silently dropped,
-and the association itself MUST be windowed by createdate:
+and the association itself MUST be windowed by createdate.
+
+⚠️ gs_DealContactAssociation.deal_id matches hs_analytics.deals.deal_id —
+NEVER record_id. A confirmed real bug: a generated query selected both
+deal_id (correctly cast) and a separate raw record_id column, then
+joined the association's deal_id against record_id instead — these are
+different fields, and joining against the wrong one produces wrong or
+incomplete matches even though the query runs without error.
 
   WITH mql_base AS (
     SELECT contact_id
@@ -2920,6 +2927,33 @@ def _extract_text(content_blocks) -> str:
     ).strip()
 
 
+def _is_thin_narrator_reply(reply: str) -> bool:
+    """
+    True if the Narrator's text reply is too thin to count as a real
+    answer — a confirmed real bug, and confirmed NOT fixed by the prompt
+    instruction alone: §14's "always write the full text answer, a chart
+    is never a substitute" was already live in the prompt and this still
+    happened, which is why this exists as a deterministic check instead
+    of trusting the instruction to be followed every time.
+
+    Two shapes both count as thin:
+      - Just plain too short to contain a direct answer + explanation
+        (a real answer is essentially never under ~40 characters).
+      - A bare lead-in phrase with nothing after it ("Here's the
+        breakdown:", "See the chart below.") — the exact pattern named
+        in §14 as the bug this check exists to catch.
+    """
+    stripped = reply.strip()
+    if len(stripped) < 40:
+        return True
+    if re.match(
+        r'^(here.?s|see|below is|shown below)\b.{0,60}[:.]?\s*$',
+        stripped, re.I,
+    ):
+        return True
+    return False
+
+
 # =============================================================================
 # Response Builder — Stage 3 of the target architecture.
 #
@@ -3346,6 +3380,36 @@ def _run_narrator_agent(original_user_message: str, latest_validated_result: "Qu
         )
 
     reply = _extract_text(response.content)
+
+    # Deterministic backstop for the confirmed "just gives a visual, no
+    # explanation" bug. The prompt already tells the Narrator never to
+    # do this (§14) — this exists because that instruction alone was
+    # confirmed NOT reliable enough on its own. One retry, not a loop:
+    # if it's still thin after being told explicitly, return it anyway
+    # rather than risk hanging indefinitely on a stuck model.
+    if _is_thin_narrator_reply(reply):
+        nudge_messages = narrator_messages + [
+            {"role": "assistant", "content": response.content},
+            {"role": "user", "content": (
+                "Your reply above is too thin to count as a real answer — it reads like "
+                "just a lead-in to the chart with no actual content. Rewrite it now: start "
+                "with a direct bolded answer to the question, then 1-3 sentences of real "
+                "explanation. The chart is not a substitute for this text."
+            )},
+        ]
+        retry_response = _ai_client.messages.create(
+            model=selected_model,
+            system=_cached_narrator_agent_prompt(),
+            messages=nudge_messages,
+            tools=[],
+            temperature=0,
+            max_tokens=max_tokens,
+        )
+        retry_reply = _extract_text(retry_response.content)
+        if retry_reply and not _is_thin_narrator_reply(retry_reply):
+            reply = retry_reply
+            narrator_messages = nudge_messages
+
     return reply, pending_chart_spec, narrator_messages
 
 
