@@ -292,9 +292,23 @@ def _is_pattern_a(sql: str) -> bool:
     if re.search(r'--\s*Pattern\s*A', sql, re.I):
         return True
 
-    dates = re.findall(r'became_(\d+)_deal_date', sql, re.I)
-
-    return len(set(dates)) >= 3 and bool(re.search(r'\bOR\b', sql, re.I))
+    # The real signature of Pattern A is the chained OR sequence itself —
+    # became_X != '1900-01-01' OR became_Y != '1900-01-01' OR ... — used
+    # as a filter condition. The previous version only checked "3+
+    # distinct became_X columns exist somewhere AND an OR keyword exists
+    # somewhere in the whole query", which misclassified Pattern B's own
+    # canonical template: Pattern B legitimately references many
+    # became_X columns for day-in-stage duration math (DATE_DIFF between
+    # consecutive stage dates), a completely different reason than
+    # Pattern A's cumulative OR-chain counting, and some OR keyword is
+    # nearly guaranteed to appear somewhere across a long real query
+    # regardless of pattern. Require at least 2 consecutive chained OR
+    # conditions (3+ total) matching the actual sentinel-check shape.
+    chain = re.findall(
+        r"became_\d+_deal_date\s*!=\s*'1900-01-01'\s*OR",
+        sql, re.I,
+    )
+    return len(chain) >= 2
 
 
 def _is_cohort_query(sql: str, intent: dict) -> bool:
@@ -470,6 +484,48 @@ def _call(fn: Callable, sql: str, intent: dict):
     return fn(sql, intent) if _arity(fn) == 2 else fn(sql)
 
 
+def _find_stale_hardcoded_dates(sql: str) -> list:
+    """
+    Finds every 'column >= 'YYYY-MM-DD'' style comparison anywhere in the
+    SQL where the literal date is more than ~13 months old — regardless
+    of which column it's on. The original staleness check
+    (_has_stale_close_date_bound) only ever looked at close_date, on the
+    theory that was the one place a hardcoded date could sneak in. A
+    real production query proved that wrong: the same stale
+    '2025-04-01' literal showed up on create_date, an MQL date_entered
+    filter, and a gs_DealContactAssociation createdate filter — three
+    completely different columns the close_date-only check would never
+    have seen.
+
+    Deliberately exempts a stale lower bound that has a matching upper
+    bound on the same column elsewhere in the query (e.g. `close_date >=
+    '2025-04-01' AND close_date <= '2026-03-31'`) — that shape is a
+    genuinely bounded historical range, exactly how a real "compare to
+    last fiscal year" question should be written, and flagging it would
+    punish someone for correctly answering a question about the past.
+    The bug this rule actually targets is the OPEN-ENDED case: a stale
+    lower bound with no upper bound at all, which almost always means
+    "today's fiscal-year start" got hardcoded instead of computed.
+
+    Returns the list of (column, date_string) pairs found.
+    """
+    stale = []
+    for m in re.finditer(r"(\w+)\s*(>=|>)\s*'(\d{4}-\d{2}-\d{2})'", sql, re.I):
+        col, op, date_str = m.group(1), m.group(2), m.group(3)
+        try:
+            year, month, day = (int(x) for x in date_str.split("-"))
+            bound_date = date(year, month, day)
+        except ValueError:
+            continue
+        age_days = (_current_fy_start_date() - bound_date).days
+        if age_days <= 45:
+            continue
+        has_upper_bound = bool(re.search(rf"\b{re.escape(col)}\b\s*(<=|<)\s*'\d{{4}}-\d{{2}}-\d{{2}}'", sql, re.I))
+        if not has_upper_bound:
+            stale.append((col, date_str))
+    return stale
+
+
 # =============================================================================
 # SQL-TEXT RULES
 # =============================================================================
@@ -477,31 +533,40 @@ def _call(fn: Callable, sql: str, intent: dict):
 
 def _mql_association_joined_via_left_join(sql: str) -> bool:
     """
-    True if gs_DealContactAssociation is joined with LEFT JOIN, whether
-    referenced directly or through a CTE alias.
+    True if gs_DealContactAssociation is joined with LEFT JOIN — covering
+    every valid way a real query actually does this, not just one:
 
-    The original check only matched the literal adjacent text "LEFT JOIN
-    ... gs_DealContactAssociation" — which breaks on the idiomatic
-    independent-CTE pattern this codebase requires everywhere else (see
-    Pattern C's actuals/target CTEs): the table name appears INSIDE a
-    CTE's own definition, which textually comes BEFORE the LEFT JOIN
-    that references it by alias, not after. A confirmed real gap, found
-    while writing a template that used exactly that pattern.
+    1. No CTEs at all — the table is referenced directly, check literal
+       adjacency in the raw SQL text.
+    2. The table is wrapped in its OWN dedicated CTE, and that CTE's
+       alias is later joined with LEFT JOIN from another CTE or the tail.
+    3. The table appears as an inline subquery INSIDE a larger CTE,
+       joined with LEFT JOIN right there in that same CTE body — a real,
+       correct pattern found in production SQL that the first version of
+       this fix didn't cover, because it only checked whether the
+       ENCLOSING CTE's alias got left-joined from outside, not whether
+       the join happened correctly inside the CTE that contains the
+       table in the first place.
     """
+    literal_adjacent = re.compile(
+        r'\bLEFT\s+JOIN\b(?:(?!\bJOIN\b).){0,300}?gs_DealContactAssociation',
+        re.I | re.S,
+    )
+
     ctes, tail = _split_ctes(sql)
     if not ctes:
-        return bool(re.search(
-            r'\bLEFT\s+JOIN\b(?:(?!\bJOIN\b).){0,300}?gs_DealContactAssociation',
-            sql, re.I | re.S,
-        ))
+        return bool(literal_adjacent.search(sql))
 
     assoc_aliases = [a for a, body in ctes.items() if 'gs_DealContactAssociation' in body]
     if not assoc_aliases:
-        return bool(re.search(
-            r'\bLEFT\s+JOIN\b(?:(?!\bJOIN\b).){0,300}?gs_DealContactAssociation',
-            sql, re.I | re.S,
-        ))
+        return bool(literal_adjacent.search(sql))
 
+    for alias in assoc_aliases:
+        # Case 3: correctly joined right inside the CTE that contains it.
+        if literal_adjacent.search(ctes[alias]):
+            return True
+
+    # Case 2: that CTE's alias is joined with LEFT JOIN from elsewhere.
     rest = tail + "\n" + "\n".join(b for a, b in ctes.items() if a not in assoc_aliases)
     for alias in assoc_aliases:
         if re.search(rf'\bLEFT\s+JOIN\s+{re.escape(alias)}\b', rest, re.I):
@@ -606,6 +671,19 @@ RULES: List[Dict[str, Any]] = [
             re.search(r"CAST\s*\(\s*LEFT\s*\(\s*coalesce\s*\(", sql, re.I)
         ),
         "message": "Raw date string comparison without the mandatory CAST(LEFT(coalesce(col,'1900-01-01'),10) AS DATE) cast.",
+    },
+    {
+        "id": "no_stale_hardcoded_dates",
+        "section": "Generation hygiene — no hardcoded stale dates on ANY column",
+        "applies_when": lambda sql: True,
+        "check": lambda sql: not _find_stale_hardcoded_dates(sql),
+        "message": (
+            "A hardcoded date more than ~13 months old was found in a filter. "
+            "Confirmed real bug: the same stale '2025-04-01'-style literal has shown up "
+            "on create_date, MQL date_entered filters, and association createdate filters "
+            "— not just close_date. Never type a specific date for 'current fiscal year "
+            "start' — compute it dynamically, or ask the user for the exact period if unsure."
+        ),
     },
     {
         "id": "sentinel_not_null_check",
