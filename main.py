@@ -781,6 +781,22 @@ def discover_schema() -> str:
 # =============================================================================
 # System prompt
 # =============================================================================
+def _current_fy_start() -> str:
+    """
+    April 1 of the current fiscal year, computed fresh every call — never
+    hardcode this. A hardcoded FY-start date goes stale every April 1st,
+    and that's not hypothetical: the Pattern B SQL template itself had a
+    hardcoded 'close_date >= 2025-04-01' that was already a full year
+    stale (should have been 2026-04-01) by the time the missing
+    close_date filter on active-pipeline questions was reported. Used
+    both in the prompt template itself and in the active_pipeline_total
+    deterministic metric further down this file.
+    """
+    today = datetime.utcnow().date()
+    fy_start_year = today.year if today.month >= 4 else today.year - 1
+    return f"{fy_start_year}-04-01"
+
+
 def _build_system_prompt() -> str:
     compact_lines = []
     for table_key, cols in _LIVE_SCHEMA.items():
@@ -1043,6 +1059,39 @@ COLUMNS (all Nullable(String) except id):
 
   NOTE: No Committed tier and no L1 Amount columns in this table.
 
+── T4 WORKED TEMPLATE — marketing-sourced deals vs funnel-stage target ──
+For "how many marketing-sourced deals reached 5%/10%/20% vs target"
+style questions: this joins ACTUALS from hs_analytics.deals (filtered to
+deal_source_rollup = 'Marketing') against TARGETS from T4 — two
+genuinely different tables, joined only on fy/quarter/region, never on
+any deal-level key. Use independent CTEs (per Target Query Rule #1) and
+cast every target column (per the mandatory casting rule above) — a
+missing cast here is the single most common cause of a target column
+silently reading as zero while the actual stays correct:
+
+WITH mkt_actuals AS (
+  SELECT deal_region, count(DISTINCT deal_id) AS deals_5
+  FROM hs_analytics.deals FINAL
+  WHERE deal_source_rollup = 'Marketing'
+    AND deal_stage IN (<5% and beyond, per the pattern being asked>)
+    AND <FY filter on the correct became_X_deal_date anchor>
+  GROUP BY deal_region
+),
+mkt_targets AS (
+  SELECT region,
+         SUM(toFloat64OrZero(deals_target_5))  AS target_deals_5,
+         SUM(toFloat64OrZero(amount_target_5)) AS target_amount_5
+  FROM kore_ai_hubspot.gs_marketing_targets
+  WHERE fy = 'FY27' AND quarter = 'Q1'
+  GROUP BY region
+)
+SELECT a.deal_region, a.deals_5, t.target_deals_5, t.target_amount_5
+FROM mkt_actuals a
+FULL OUTER JOIN mkt_targets t ON a.deal_region = t.region
+Repeat the same shape once per tier (5/10/20) — do not attempt to pull
+all three tiers' targets in a single un-cast SELECT list; cast each
+column individually as shown.
+
 ── T5: kore_ai_hubspot.gs_closed_won_quotas ───────────────────
 PURPOSE: Closed Won revenue quotas by AE.
 USE FOR: CW attainment %, AE-level quota tracking.
@@ -1067,6 +1116,15 @@ COLUMNS (all Nullable(String) except id):
 3. ALWAYS filter targets to the exact quarter: WHERE fy='FY27' AND quarter='Q1'
 4. Period grain must match: if actuals are Q1 FY27, filter target table to same.
 5. For partner tables: filter partner_team_type IN ('Hyperscaler','GSI/SI','Reseller/BPO/TSD').
+   ⚠️  'Partner - Non Hyperscaler' (the actuals-side deal_source_rollup
+   label) does NOT exist as a literal value in partner_team_type — it
+   never matches the target table directly. It maps to the COMBINATION
+   partner_team_type IN ('GSI/SI','Reseller/BPO/TSD') — i.e. everything
+   in that column except 'Hyperscaler'. Filtering the target side on the
+   literal string 'Partner - Non Hyperscaler' returns zero rows every
+   time, which is a confirmed real bug seen in year-over-year partnership
+   comparisons — the target isn't actually zero, the filter just never
+   matches anything.
 6. IF A TARGET QUERY RETURNS 0 ROWS: do not explain your plan in prose first.
    In the SAME tool-use round, immediately run a diagnostic query
      SELECT DISTINCT fy, quarter FROM <target_table>
@@ -1287,7 +1345,7 @@ WITH pipe_gen AS (
          AS is_this_a_deal_with_inception
   FROM hs_analytics.deals d FINAL
   LEFT JOIN hs_analytics.owners o FINAL ON d.deal_owner = CAST(o.id AS VARCHAR)
-  WHERE became_20_deal_date >= '2025-04-01'
+  WHERE became_20_deal_date >= '{_current_fy_start()}'
     AND deal_stage <> 'Duplicate Record'
     AND deal_stage IN (
       '10% - Discovery','20% - Solution','30% - Proof','40% - Proposal',
@@ -1303,7 +1361,7 @@ stage_base AS (
   -- ⚠️ MANDATORY FY/quarter/month anchor — this is NOT always 10%:
   --   • If the user's question names a stage (e.g. "40% funnel",
   --     "conversion from 30% to closed won"), the anchor column below
-  --     AND the WHERE filter above (became_20_deal_date >= '2025-04-01')
+  --     AND the WHERE filter above (became_20_deal_date >= current FY start)
   --     must BOTH use became_<that stage>_deal_date.
   --   • If the user did NOT name a stage, default to became_20_deal_date,
   --     as shown in this example — NOT became_10_deal_date.
@@ -1506,6 +1564,27 @@ GROUP BY 1,2,3,4,5,6,7,8,9
   Closed Won        → deal_stage IN ('90% - Deal Desk Review','Closed Won')
   Pre-Qualification → everything else
 
+── ACTIVE DEALS — CANONICAL DEFINITION (any "active"-flavored question) ──
+Active Deals = COUNT(DISTINCT deal_id) for deals meeting ALL of:
+  1. deal_stage IN the dashboard's configured active stages (default:
+     the Active Pipeline set above — 20%/30%/40%/60%/75% — unless the
+     specific dashboard in play defines a different active-stage set)
+  2. pipeline = 'default'
+  3. close_date falls within the dashboard's configured reporting period
+     (e.g. current fiscal year — never omit this even for a "right now"
+     snapshot; "active right now" still means "active AND expected to
+     close within the period we're reporting on", not "active, ever")
+  4. deal_type <> 'Partner-Led SMB'
+  5. Any additional dashboard-specific filters that apply (deal source,
+     partner mapping, region, AI for X, etc. — only the ones the
+     question or dashboard actually calls for, per the group-by rule above)
+  6. Always COUNT(DISTINCT deal_id), never plain COUNT(*) — a deal can
+     appear more than once across joins (owners, teams, partner rows)
+This is the full definition — a query missing any one of 1-4 is not
+answering "active deals", it's answering a different, looser question
+that happens to look similar. Do not drop the close_date bound just
+because the question says "right now" instead of naming a fiscal year.
+
 ── STAGE RANK (for sorting) ──────────────────────────────────
   1=5%, 2=10%, 3=20%, 4=30%, 5=40%, 6=60%, 7=75%, 8=90%,
   9=CW, 10=Deal on Hold, 11=Prospect Disengaged,
@@ -1564,7 +1643,7 @@ WITH active_pipe AS (
   FROM hs_analytics.deals d FINAL
   LEFT JOIN hs_analytics.owners o FINAL ON d.deal_owner = CAST(o.id AS VARCHAR)
   LEFT JOIN kore_ai_hubspot.gs_Teams t ON d.hubspot_team = t.team_id
-  WHERE close_date >= '2025-04-01'
+  WHERE close_date >= '{_current_fy_start()}'
     AND deal_stage IN (
       '1% - IQM Scheduled','5% - IQM Held','10% - Discovery','20% - Solution',
       '30% - Proof','40% - Proposal','60% - Price Negotiation','75% - Contract Review',
@@ -1762,7 +1841,7 @@ WITH actuals AS (
     AND toInt64(deal_id) IN (
       SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs
     )
-    AND became_10_deal_date >= '2025-04-01'
+    AND became_10_deal_date >= '{_current_fy_start()}'
     AND (became_10_deal_date != '1900-01-01'
          OR became_20_deal_date != '1900-01-01'
          OR became_30_deal_date != '1900-01-01'
@@ -1861,6 +1940,19 @@ Date column standard — ALWAYS:
 Sentinel '1900-01-01' = date was never set (NULL equivalent).
 Check: column != '1900-01-01'
 
+── CANONICAL ANCHOR FOR "GENERATED / CREATED" LANGUAGE ─────────
+"How many X% deals have we generated/created this FY" and similar
+phrasing ALWAYS anchors on became_X_deal_date (the date the deal first
+reached that specific stage) — NEVER create_date, and never close_date.
+This must be the same choice every time the same question is asked,
+in the same session or a new one. create_date reflects when the deal
+record was first created in the CRM, which is frequently earlier than
+when it reached the stage being asked about, and mixing the two anchors
+across repeat asks of the identical question is a confirmed real bug —
+if unsure which anchor a follow-up question should use, re-use whatever
+anchor the most recent equivalent question in this conversation used
+rather than re-deriving it from scratch.
+
 ═══════════════════════════════════════════════════════════════
 §10  DIMENSION MAPPINGS (consistent across all patterns)
 ═══════════════════════════════════════════════════════════════
@@ -1885,6 +1977,30 @@ ACCOUNT PRIORITY:
 
 INCEPTION DEALS:
   Only exclude if user explicitly asks. Default: include all deals.
+
+PARTNER NAME (Partnership dashboard — "which partner", "no partner assigned"):
+  COALESCE(reseller_partner_associated, referral_partner_associated, 'Not Available') AS partner_name
+  "Deals without a partner" / "no partner assigned" = partner_name = 'Not Available'
+  Never check only one of the two source columns — a deal with a referral
+  partner but no reseller partner (or vice versa) still has a real partner
+  and must NOT be counted as unassigned.
+
+── BREAKDOWN DIMENSIONS — ONLY GROUP BY WHAT WAS ASKED ────────
+A bare count/total/value question (no dimension named or clearly implied)
+must return ONE aggregate row/number — never GROUP BY region, source,
+industry, or any other dimension just because that column exists in the
+schema or was used in a recent turn. This applies even if the answer would
+"look nicer" broken down; a chart is generated automatically from
+whatever shape the query returns, so an ungrouped query is the only way
+to guarantee an ungrouped answer.
+  "How many X deals have we generated this FY?"        → ONE number, no GROUP BY
+  "How many X deals by region have we generated?"      → GROUP BY region
+  "Break down X by region"                              → GROUP BY region
+  "What's our attainment for X?"                        → ONE number, no GROUP BY
+When a breakdown IS asked for, use the exact dimension named (region,
+source, industry) — do not substitute a different one, and do not add a
+second, unrequested dimension on top of it (e.g. region was asked for; do
+not also split by quarter unless that was asked too).
 
 ═══════════════════════════════════════════════════════════════
 §11  MQL RULES
@@ -2007,7 +2123,38 @@ For Pattern A SQL, add a comment at the top of the query:
 - Format dollar amounts: round(sum(amount)/1e6, 1) as $M.
 - Always complete full response — never truncate mid-table.
 
-After every DB-backed answer, append:
+── MANDATORY RESPONSE STRUCTURE — every DB-backed answer, every time ──
+Four parts, always in this order, every time — never skip a part and
+never reorder them, even for a simple one-number answer:
+
+1. DIRECT ANSWER FIRST — one bolded sentence that answers exactly the
+   question asked, in the exact shape it was asked. This is the single
+   most important rule in this section, because getting it wrong is
+   what makes answers feel inconsistent from one question to the next:
+     "How many X deals this FY?"        → ONE bolded number, full stop.
+     "Break down X by region"           → the region breakdown, led with
+                                            the total if there is one.
+     "What's our attainment for X?"     → ONE bolded percentage.
+   Do not lead with a region/source/industry breakdown unless the
+   question actually named or clearly implied that dimension — see the
+   "only group by what was asked" rule in §10, which this mirrors at
+   the writing stage. Even if the underlying data happens to include
+   other dimensions, the opening sentence answers only what was asked.
+
+2. BRIEF EXPLANATION — 1-3 sentences of real context: what the number
+   means, anything notable about it, how it relates to a prior turn if
+   relevant. Not a restatement of the number in different words.
+
+3. VISUAL — charts render automatically from choose_chart_spec and
+   appear alongside your text; you never generate them yourself (§15).
+   Critical: a rendered chart is never a substitute for parts 1 and 2.
+   Write the full text answer exactly as if no chart were going to
+   appear at all — a chart existing is not a reason to write less.
+   If you find yourself writing only a lead-in sentence like "Here's
+   the breakdown:" and nothing else, that's the bug this rule exists
+   to prevent — stop and write the actual direct answer instead.
+
+4. FILTERS APPLIED — append this exact block, always:
 
 ---
 **Filters Applied:**
@@ -2462,17 +2609,32 @@ def _compute_deterministic_headline(stored: Optional["QueryResult"]) -> Optional
 
 
 _METRIC_FNS: Dict[str, Callable[[List[dict]], float]] = {
+    # Denominator = Closed Won + every "didn't convert" outcome, matching
+    # the same Fallen Out grouping already used in §7 (Prospect
+    # Disengaged and Didn't Qualify are real lost outcomes, not just
+    # Closed Lost — omitting them was a confirmed real bug: it made win
+    # rate look artificially high by shrinking the losses side).
     "win_rate": lambda rows: (
         sum(1 for r in rows if r.get("deal_stage") == "Closed Won")
-        / max(sum(1 for r in rows if r.get("deal_stage") in ("Closed Won", "Closed Lost")), 1)
+        / max(sum(1 for r in rows if r.get("deal_stage") in (
+            "Closed Won", "Closed Lost", "Prospect Disengaged", "Didn't Qualify",
+        )), 1)
         * 100
     ),
+    # Stage filter alone isn't enough — "active pipeline value" means
+    # active AND within the current reporting period, per the Active
+    # Deals definition in §7. If the query included close_date, enforce
+    # that bound here as a last defensive check; if it didn't (close_date
+    # missing from the row), fall back to stage-only rather than
+    # silently zeroing out every row, since we can't tell which of those
+    # rows would have passed a bound we have no data for.
     "active_pipeline_total": lambda rows: sum(
         _to_float(r.get("amount")) for r in rows
         if r.get("deal_stage") in (
             "20% - Solution", "30% - Proof", "40% - Proposal",
             "60% - Price Negotiation", "75% - Contract Review",
         )
+        and ("close_date" not in r or str(r.get("close_date", "")) >= _current_fy_start())
     ) / 1_000_000,
     "avg_deal_size": lambda rows: (
         sum(_to_float(r.get("amount")) for r in rows) / max(len(rows), 1)
