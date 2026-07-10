@@ -49,6 +49,13 @@ import re
 from datetime import date
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+try:
+    import sqlglot
+    from sqlglot import exp as sqlglot_exp
+    _SQLGLOT_AVAILABLE = True
+except ImportError:
+    _SQLGLOT_AVAILABLE = False
+
 # =============================================================================
 # RULEBOOK  (unchanged)
 # =============================================================================
@@ -258,6 +265,49 @@ def _has_stale_close_date_bound(sql: str) -> bool:
     # or copy-pasted instead of computed, which is exactly how this bug
     # happened the first time (a full year, 365 days, stale)
 
+
+
+def _table_join_sides(sql: str, table_name: str, dialect: str = "clickhouse") -> Optional[List[str]]:
+    """
+    For every place `table_name` actually gets pulled into the query via
+    a JOIN — directly, via an inline subquery, or via a CTE (bare
+    reference or explicitly aliased) that itself wraps the table —
+    return the join side ("LEFT", "RIGHT", "INNER", etc.) used to
+    introduce it. Returns None if the SQL can't be parsed at all, so the
+    caller can fall back to a text-based check rather than silently
+    treating a parse failure as "no join found".
+
+    This replaces text-proximity regex guessing with real structural
+    parsing via sqlglot. The regex version needed three separate rounds
+    of special-casing this session — one for a table wrapped in its own
+    CTE, one for an inline subquery inside a larger CTE, one for a bare
+    literal reference — because text order and CTE structure vary in
+    ways regex can't reliably distinguish from actual SQL semantics.
+    This function handles all of those uniformly, because it isn't
+    guessing from where text sits — it's reading the actual join tree.
+    """
+    if not _SQLGLOT_AVAILABLE:
+        return None
+    try:
+        tree = sqlglot.parse_one(sql, read=dialect)
+    except Exception:
+        return None
+
+    cte_wraps_table: Dict[str, bool] = {}
+    for cte in tree.find_all(sqlglot_exp.CTE):
+        tables_inside = {t.name.lower() for t in cte.this.find_all(sqlglot_exp.Table)}
+        cte_wraps_table[cte.alias.lower()] = table_name.lower() in tables_inside
+
+    sides: List[str] = []
+    for join in tree.find_all(sqlglot_exp.Join):
+        tables_here = {t.name.lower() for t in join.this.find_all(sqlglot_exp.Table)}
+        referenced_name = (getattr(join.this, "alias", "") or getattr(join.this, "name", "") or "").lower()
+
+        if table_name.lower() in tables_here:
+            sides.append(join.side or "INNER")
+        elif referenced_name in cte_wraps_table and cte_wraps_table[referenced_name]:
+            sides.append(join.side or "INNER")
+    return sides
 
 
 def _base_filter_scope(sql: str) -> str:
@@ -533,40 +583,34 @@ def _find_stale_hardcoded_dates(sql: str) -> list:
 
 def _mql_association_joined_via_left_join(sql: str) -> bool:
     """
-    True if gs_DealContactAssociation is joined with LEFT JOIN — covering
-    every valid way a real query actually does this, not just one:
+    True if gs_DealContactAssociation is joined with LEFT JOIN.
 
-    1. No CTEs at all — the table is referenced directly, check literal
-       adjacency in the raw SQL text.
-    2. The table is wrapped in its OWN dedicated CTE, and that CTE's
-       alias is later joined with LEFT JOIN from another CTE or the tail.
-    3. The table appears as an inline subquery INSIDE a larger CTE,
-       joined with LEFT JOIN right there in that same CTE body — a real,
-       correct pattern found in production SQL that the first version of
-       this fix didn't cover, because it only checked whether the
-       ENCLOSING CTE's alias got left-joined from outside, not whether
-       the join happened correctly inside the CTE that contains the
-       table in the first place.
+    Tries real structural parsing first (_table_join_sides) — this
+    handles every valid join structure uniformly (direct reference,
+    inline subquery, dedicated CTE) because it reads the actual join
+    tree instead of guessing from text position. Falls back to the
+    regex-based text-proximity check only if the SQL can't be parsed at
+    all, so a parser hiccup degrades gracefully instead of silently
+    rejecting a query that's actually fine.
     """
+    sides = _table_join_sides(sql, "gs_DealContactAssociation")
+    if sides is not None:
+        return "LEFT" in sides
+
+    # Fallback: regex-based text-proximity check (pre-sqlglot version).
     literal_adjacent = re.compile(
         r'\bLEFT\s+JOIN\b(?:(?!\bJOIN\b).){0,300}?gs_DealContactAssociation',
         re.I | re.S,
     )
-
     ctes, tail = _split_ctes(sql)
     if not ctes:
         return bool(literal_adjacent.search(sql))
-
     assoc_aliases = [a for a, body in ctes.items() if 'gs_DealContactAssociation' in body]
     if not assoc_aliases:
         return bool(literal_adjacent.search(sql))
-
     for alias in assoc_aliases:
-        # Case 3: correctly joined right inside the CTE that contains it.
         if literal_adjacent.search(ctes[alias]):
             return True
-
-    # Case 2: that CTE's alias is joined with LEFT JOIN from elsewhere.
     rest = tail + "\n" + "\n".join(b for a, b in ctes.items() if a not in assoc_aliases)
     for alias in assoc_aliases:
         if re.search(rf'\bLEFT\s+JOIN\s+{re.escape(alias)}\b', rest, re.I):
