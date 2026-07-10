@@ -7,3 +7,4 @@ python-pptx
 reportlab
 playwright>=1.40.0
 openpyxl
+sqlglot
