@@ -473,6 +473,42 @@ def _call(fn: Callable, sql: str, intent: dict):
 # =============================================================================
 # SQL-TEXT RULES
 # =============================================================================
+
+
+def _mql_association_joined_via_left_join(sql: str) -> bool:
+    """
+    True if gs_DealContactAssociation is joined with LEFT JOIN, whether
+    referenced directly or through a CTE alias.
+
+    The original check only matched the literal adjacent text "LEFT JOIN
+    ... gs_DealContactAssociation" — which breaks on the idiomatic
+    independent-CTE pattern this codebase requires everywhere else (see
+    Pattern C's actuals/target CTEs): the table name appears INSIDE a
+    CTE's own definition, which textually comes BEFORE the LEFT JOIN
+    that references it by alias, not after. A confirmed real gap, found
+    while writing a template that used exactly that pattern.
+    """
+    ctes, tail = _split_ctes(sql)
+    if not ctes:
+        return bool(re.search(
+            r'\bLEFT\s+JOIN\b(?:(?!\bJOIN\b).){0,300}?gs_DealContactAssociation',
+            sql, re.I | re.S,
+        ))
+
+    assoc_aliases = [a for a, body in ctes.items() if 'gs_DealContactAssociation' in body]
+    if not assoc_aliases:
+        return bool(re.search(
+            r'\bLEFT\s+JOIN\b(?:(?!\bJOIN\b).){0,300}?gs_DealContactAssociation',
+            sql, re.I | re.S,
+        ))
+
+    rest = tail + "\n" + "\n".join(b for a, b in ctes.items() if a not in assoc_aliases)
+    for alias in assoc_aliases:
+        if re.search(rf'\bLEFT\s+JOIN\s+{re.escape(alias)}\b', rest, re.I):
+            return True
+    return False
+
+
 RULES: List[Dict[str, Any]] = [
 
     {
@@ -798,21 +834,21 @@ RULES: List[Dict[str, Any]] = [
     {
         "id": "mql_date_entered_filter",
         "section": "§11 MQL filter 1 — date_entered_... anchor",
-        "applies_when": lambda sql, intent: intent.get("metric") == "mql",
+        "applies_when": lambda sql, intent: intent.get("metric") == "mql" and "hs_analytics.contacts" in sql,
         "check": lambda sql, intent: "date_entered_marketing_qualified_lead_lifecycle_stage_pipeline" in sql,
         "message": "MQL query missing `date_entered_marketing_qualified_lead_lifecycle_stage_pipeline` filter.",
     },
     {
         "id": "mql_company_priority_filter",
         "section": "§11 MQL filter 2 — company_priority IN ('P1'...'P7')",
-        "applies_when": lambda sql, intent: intent.get("metric") == "mql",
+        "applies_when": lambda sql, intent: intent.get("metric") == "mql" and "hs_analytics.contacts" in sql,
         "check": lambda sql, intent: bool(re.search(r"company_priority\s+IN", sql, re.I)),
         "message": "MQL query missing `company_priority IN ('P1',...,'P7')` filter.",
     },
     {
         "id": "mql_bad_data_filter",
         "section": "§11 MQL filter 3 — excludes 'Bad Data' lead status",
-        "applies_when": lambda sql, intent: intent.get("metric") == "mql",
+        "applies_when": lambda sql, intent: intent.get("metric") == "mql" and "hs_analytics.contacts" in sql,
         "check": lambda sql, intent: bool(
             re.search(r"lead_status\s*!=\s*'Bad Data'", sql, re.I)
             or re.search(r"lead_status\s+NOT\s+IN\s*\(\s*'Bad Data'", sql, re.I)
@@ -859,9 +895,7 @@ RULES: List[Dict[str, Any]] = [
         "applies_when": lambda sql, intent: (
             intent.get("mql_needs_deal_join") and "gs_DealContactAssociation" in sql
         ),
-        "check": lambda sql, intent: bool(re.search(
-            r'\bLEFT\s+JOIN\b(?:(?!\bJOIN\b).){0,300}?gs_DealContactAssociation', sql, re.I | re.S
-        )),
+        "check": lambda sql, intent: _mql_association_joined_via_left_join(sql),
         "message": (
             "MQL-to-deal query must use LEFT JOIN against the deal association — "
             "an INNER JOIN (or bare JOIN, which defaults to INNER) silently drops "
