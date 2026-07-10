@@ -2036,6 +2036,51 @@ MQL TARGET PATTERN — always filter by exact quarter, NEVER divide annual by 4:
   WHERE fy = 'FY27' AND quarter = 'Q1'
   GROUP BY region, original_source
 
+MQL-TO-DEAL LINKAGE PATTERN — required whenever a question connects MQLs
+to the deals they became ("MQL to deal conversion funnel", "deals from
+MQLs", "MQL win rate", etc.). Never answer this with only an MQL count OR
+only a deal count on their own — neither one, alone, can answer a
+question about the connection between the two. The join MUST go through
+gs_DealContactAssociation (never inferred from company_name, owner, or
+any other matching field), MUST use LEFT JOIN so MQLs with no matched
+deal are counted as "MQL without a deal" rather than silently dropped,
+and the association itself MUST be windowed by createdate:
+
+  WITH mql_base AS (
+    SELECT contact_id
+    FROM hs_analytics.contacts FINAL
+    WHERE lifecycle_stage = 'marketingqualifiedlead'
+      AND date_entered_marketing_qualified_lead_lifecycle_stage_pipeline IS NOT NULL
+      AND company_priority IN ('P1','P2','P3','P4','P5','P6','P7')
+      AND lead_status != 'Bad Data'
+      AND <date range filter on date_entered_... column>
+  ),
+  assoc AS (
+    SELECT DISTINCT contact_id, deal_id
+    FROM kore_ai_hubspot.gs_DealContactAssociation
+    WHERE createdate >= <same date range as the MQL filter above>
+  )
+  SELECT
+    countDistinct(m.contact_id)                                  AS mql_count,
+    countDistinct(d.deal_id)                                     AS mql_with_deal_count,
+    countDistinct(CASE WHEN d.deal_stage = 'Closed Won'
+                        THEN d.deal_id END)                       AS mql_closed_won_count
+  FROM mql_base m
+  LEFT JOIN assoc ON assoc.contact_id = m.contact_id
+  LEFT JOIN hs_analytics.deals d FINAL
+    ON toInt64(d.deal_id) = toInt64(assoc.deal_id)
+    AND d.pipeline = 'default'
+    AND CASE WHEN d.deal_type IS NULL THEN 'Not Assigned' ELSE d.deal_type END
+        NOT IN ('Partner-Led SMB')
+    AND toInt64(d.deal_id) IN (
+        SELECT DISTINCT toInt64(deal_id_hs) FROM kore_ai_hubspot.gs_deal_ids_hs
+    )
+
+If a question asks for a funnel across multiple deal stages (not just a
+single deal/no-deal split), add one more countDistinct(CASE WHEN
+d.deal_stage = '<stage>' THEN d.deal_id END) column per stage requested —
+do not attempt this as three separate queries.
+
 FILTER CONFIRMATION for MQL queries — include in Filters Applied block:
   - Company Priority: P1–P7 (excludes unranked contacts)
   - Lead Status: excludes 'Bad Data'
